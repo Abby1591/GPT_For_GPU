@@ -147,6 +147,8 @@ class MiniGPT:
         self.tokenizer = tokenizer
         input_size     = self.context_size * tokenizer.size  # flat one-hot dim
 
+
+
         self.nn = NeuralNetwork(
             input_size    = input_size,
             hidden_layers = self.hidden_layers,
@@ -158,6 +160,7 @@ class MiniGPT:
             context_size  = self.context_size,
             embed_dim     = 64,
         )
+        self.pos_embedding = np.random.randn(self.context_size, 64) * 0.01  # 64 = embed_dim
         self.nn.summary()
 
     # ------------------------------------------------------------------
