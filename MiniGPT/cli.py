@@ -94,6 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
     tg.add_argument("--simple_vocab", action="store_true",
                     help="Strip text to lowercase a-z + space + basic punctuation (~36 chars). "
                          "Makes learning much easier for small models.")
+    tg.add_argument("--save_every",  type=int, default=0,
+                    help="Save a checkpoint every N epochs. 0 = disabled. (default: 0)")
 
     # ── Generation ────────────────────────────────────────────────────────────
     gg = p.add_argument_group("Generation options")
@@ -147,10 +149,12 @@ def main() -> None:
         print(f"Resuming from '{args.resume}'...")
         model = MiniGPT.load(args.resume)
 
-        # Override learning rate if specified (useful for fine-tuning)
-        if args.lr != 0.001:   # user explicitly set a different lr
+        # Override learning rate only if no Adam state (fresh resume)
+        if args.lr != 0.001 and not model.nn._adam_init:
             model.nn.learning_rate = args.lr
             print(f"Learning rate overridden to {args.lr}")
+        elif args.lr != 0.001 and model.nn._adam_init:
+            print(f"Adam state restored — keeping saved lr, ignoring --lr {args.lr}")
 
         model.train(
             args.train,
@@ -158,6 +162,8 @@ def main() -> None:
             max_samples  = args.samples,
             max_chars    = args.max_chars,
             simple_vocab = args.simple_vocab,
+            save_every   = args.save_every,
+            save_path    = args.save,
         )
         model.save(args.save)
         print("\n── Sample generation ──────────────────────────────────────────")
@@ -178,6 +184,8 @@ def main() -> None:
             max_samples  = args.samples,
             max_chars    = args.max_chars,
             simple_vocab = args.simple_vocab,
+            save_every   = args.save_every,
+            save_path    = args.save,
         )
         model.save(args.save)
         print("\n── Sample generation ──────────────────────────────────────────")

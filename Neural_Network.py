@@ -76,7 +76,7 @@ class NeuralNetwork:
         output_size:   int,
         activation:    str   = "relu",
         learning_rate: float = 0.001,
-        batch_size:    int   = 2048,
+        batch_size:    int   = 512,
         use_embedding: bool  = True,
         vocab_size:    int   = 0,
         context_size:  int   = 0,
@@ -109,18 +109,19 @@ class NeuralNetwork:
             self.embedding     = None
             self.pos_embedding = None
 
+        # ── Precomputed constants ─────────────────────────────────────────────
+        self._scale = 1.0 / (embed_dim ** 0.5)   # attention scale, avoid recomputing
+
         # ── Per-block independent weights ─────────────────────────────────────
         D = embed_dim
         self.blocks = []
         for _ in range(self.num_blocks):
             self.blocks.append({
-                "Wq": np.random.randn(D, D) * 0.02,
-                "Wk": np.random.randn(D, D) * 0.02,
-                "Wv": np.random.randn(D, D) * 0.02,
-                "W1": np.random.randn(D, D * 4) * 0.02,
-                "b1": np.zeros(D * 4),
-                "W2": np.random.randn(D * 4, D) * 0.02,
-                "b2": np.zeros(D),
+                "Wqkv": np.random.randn(D, D * 3) * 0.02,   # fused Q,K,V projection
+                "W1":   np.random.randn(D, D * 4) * 0.02,
+                "b1":   np.zeros(D * 4),
+                "W2":   np.random.randn(D * 4, D) * 0.02,
+                "b2":   np.zeros(D),
             })
 
         # ── Output projection ─────────────────────────────────────────────────
@@ -170,9 +171,10 @@ class NeuralNetwork:
     # ── Causal mask ───────────────────────────────────────────────────────────
 
     def _causal_mask(self, T):
-        """Upper-triangular mask: position i cannot attend to j > i."""
-        mask = np.triu(np.ones((T, T)), k=1) * -1e9
-        return mask   # (T, T), added to scores before softmax
+        """Upper-triangular mask — cached per context size."""
+        if not hasattr(self, '_mask_cache') or self._mask_cache.shape[0] != T:
+            self._mask_cache = np.triu(np.ones((T, T)), k=1) * -1e9
+        return self._mask_cache
 
     # ── Transformer block ─────────────────────────────────────────────────────
 
@@ -182,65 +184,70 @@ class NeuralNetwork:
         Each position only attends to itself and earlier positions.
         """
         B, T, D = x.shape
-        scale = np.sqrt(float(D))
-        Wq, Wk, Wv = blk["Wq"], blk["Wk"], blk["Wv"]
         W1, b1, W2, b2 = blk["W1"], blk["b1"], blk["W2"], blk["b2"]
 
-        Q = x @ Wq                                             # (B, T, D)
-        K = x @ Wk
-        V = x @ Wv
+        # Fuse Q,K,V into one matmul then split — 1 kernel instead of 3
+        QKV = x.reshape(B * T, D) @ blk["Wqkv"]                  # (BT, 3D)
+        QKV = QKV.reshape(B, T, 3, D)
+        Q, K, V = QKV[:, :, 0, :], QKV[:, :, 1, :], QKV[:, :, 2, :]
 
-        scores  = np.matmul(Q, K.transpose(0, 2, 1)) / scale  # (B, T, T)
-        scores += self._causal_mask(T)                         # mask future
+        scores  = np.matmul(Q, K.transpose(0, 2, 1)) * self._scale  # (B, T, T)
+        scores += self._causal_mask(T)
         scores -= scores.max(axis=2, keepdims=True)
         exp_s   = np.exp(scores)
         A       = exp_s / exp_s.sum(axis=2, keepdims=True)
 
-        attn_out = np.matmul(A, V)                             # (B, T, D)
-        x_attn   = x + attn_out                                # residual
+        attn_out = np.matmul(A, V)                                 # (B, T, D)
+        x_attn   = x + attn_out
 
-        h      = np.maximum(0.0, x_attn @ W1 + b1)            # (B, T, 4D)
-        ff_out = h @ W2 + b2                                   # (B, T, D)
-        x_out  = x_attn + ff_out                               # residual
+        h      = np.maximum(0.0, x_attn @ W1 + b1)
+        ff_out = h @ W2 + b2
+        x_out  = x_attn + ff_out
 
-        cache = (x, Q, K, V, A, attn_out, x_attn, h, ff_out)
+        cache = (x, Q, K, V, A, attn_out, h, ff_out)              # x_attn removed
         return x_out, cache
 
     def _block_backward(self, d_out, cache, blk):
         """Vectorised backprop through causal block. d_out: (B, T, D)"""
-        x, Q, K, V, A, attn_out, x_attn, h, ff_out = cache
+        x, Q, K, V, A, attn_out, h, ff_out = cache              # no x_attn in cache
         B, T, D = x.shape
-        Wq, Wk, Wv = blk["Wq"], blk["Wk"], blk["Wv"]
         W1, W2 = blk["W1"], blk["W2"]
+        BT = B * T
+
+        x_attn = x + attn_out                                    # recompute, saves memory
 
         # Feed-forward backward
-        d_x_attn = d_out.copy()
-        dW2  = np.einsum('bti,btj->ij', h, d_out)
+        # d_out flows through residual AND ff — accumulate into d_x_res directly
+        dW2  = h.reshape(BT, -1).T @ d_out.reshape(BT, -1)
         db2  = d_out.sum(axis=(0, 1))
         d_h  = d_out @ W2.T
         d_h *= (h > 0)
-        dW1  = np.einsum('bti,btj->ij', x_attn, d_h)
+        dW1  = x_attn.reshape(BT, -1).T @ d_h.reshape(BT, -1)
         db1  = d_h.sum(axis=(0, 1))
-        d_x_attn += d_h @ W1.T
+        d_x_attn = d_out + d_h @ W1.T                            # no copy needed
 
-        # Attention backward (causal mask is baked into A so no extra step needed)
-        d_x_res = d_x_attn.copy()
+        # Attention backward
         d_A = np.matmul(d_x_attn, V.transpose(0, 2, 1))
         dV  = np.matmul(A.transpose(0, 2, 1), d_x_attn)
         dS  = A * (d_A - (d_A * A).sum(axis=2, keepdims=True))
-        dS /= np.sqrt(float(D))
+        dS  *= self._scale
         dQ  = np.matmul(dS, K)
         dK  = np.matmul(dS.transpose(0, 2, 1), Q)
-        dWq = np.einsum('bti,btj->ij', x, dQ)
-        dWk = np.einsum('bti,btj->ij', x, dK)
-        dWv = np.einsum('bti,btj->ij', x, dV)
-        d_x = (np.matmul(dQ, Wq.T) +
-               np.matmul(dK, Wk.T) +
-               np.matmul(dV, Wv.T) +
-               d_x_res)
+        d_x_res = d_x_attn                                       # no copy — reuse directly
 
-        grads = {"Wq": dWq, "Wk": dWk, "Wv": dWv,
-                 "W1": dW1, "b1": db1, "W2": dW2, "b2": db2}
+        # Fused Wqkv backward — concatenate dQ,dK,dV and do one matmul each way
+        x_r    = x.reshape(BT, D)
+        dQKV_r = np.concatenate([dQ.reshape(BT, D),
+                                  dK.reshape(BT, D),
+                                  dV.reshape(BT, D)], axis=1)      # (BT, 3D)
+        dWqkv  = x_r.T @ dQKV_r                                    # (D, 3D)
+        Wqkv   = blk["Wqkv"]
+        d_x    = (np.matmul(dQ, Wqkv[:, :D].T) +
+                  np.matmul(dK, Wqkv[:, D:2*D].T) +
+                  np.matmul(dV, Wqkv[:, 2*D:].T) +
+                  d_x_res)
+
+        grads = {"Wqkv": dWqkv, "W1": dW1, "b1": db1, "W2": dW2, "b2": db2}
         return d_x, grads
 
     # ── Forward pass ──────────────────────────────────────────────────────────
@@ -289,9 +296,11 @@ class NeuralNetwork:
 
     # ── Train ─────────────────────────────────────────────────────────────────
 
-    def train(self, data: List[Sample], epochs: int, log_every: int = 1) -> None:
+    def train(self, data: List[Sample], epochs: int, log_every: int = 1,
+              save_every: int = 0, save_path: str = "checkpoint.json") -> None:
         """
         All-positions causal training with adaptive LR.
+        save_every: checkpoint every N epochs (0 = disabled)
         """
         if not self._adam_init:
             self._init_adam()
@@ -338,9 +347,24 @@ class NeuralNetwork:
         plateau_count     = 0
         plateau_patience  = 5    # epochs without improvement before reducing
         plateau_factor    = 0.7  # lr multiplier on plateau
-        bounce_factor     = 0.7  # lr multiplier when loss goes UP (was 0.5, too aggressive)
+        bounce_factor     = 0.7  # lr multiplier when loss goes UP
+        bounce_count      = 0    # consecutive up-epochs
+        bounce_patience   = 2    # need 2 bad epochs in a row before reducing
         prev_loss         = float("inf")
         lr_change_msg     = ""
+
+        # ── Pre-allocate gradient buffers once — zero in-place each epoch ───────
+        blk_grad_acc = [{k: np.zeros_like(v) for k, v in blk.items()}
+                        for blk in self.blocks]
+        dWout_acc = np.zeros_like(self.Wout)
+        dbout_acc = np.zeros_like(self.bout)
+        de_acc    = np.zeros_like(self.embedding)     if self.use_embedding else None
+        dpe_acc   = np.zeros_like(self.pos_embedding) if self.use_embedding else None
+
+        # Hoist constants that never change across epochs/batches
+        T          = ctx_size
+        t_idx      = np.arange(T)[None, :]            # (1, T)
+        b_idx_full = np.arange(self.batch_size)[:, None]  # (B, 1) for full batches
 
         for epoch in range(epochs):
             # ── Warmup for first 5 epochs ─────────────────────────────────────
@@ -348,25 +372,21 @@ class NeuralNetwork:
                 epoch_lr = lr_max * (epoch + 1) / 5
                 lr_change_msg = ""
 
-            idx_np = np.random.permutation(n)  # shuffle on GPU directly
+            idx_np = np.random.permutation(n)
             X_shuf = X_idx[:, idx_np]
             Y_shuf = Y_idx[:, idx_np]
 
             total_loss = 0.0
             self._adam_t += 1
 
-            blk_grad_acc = [
-                {k: np.zeros_like(v) for k, v in blk.items()}
-                for blk in self.blocks
-            ]
-            dWout_acc = np.zeros_like(self.Wout)
-            dbout_acc = np.zeros_like(self.bout)
+            # Zero grad buffers in-place — no allocation
+            for acc in blk_grad_acc:
+                for a in acc.values(): a[...] = 0.0
+            dWout_acc[...] = 0.0
+            dbout_acc[...] = 0.0
             if self.use_embedding:
-                de_acc  = np.zeros_like(self.embedding)
-                dpe_acc = np.zeros_like(self.pos_embedding)
-
-            T     = ctx_size
-            t_idx = np.arange(T)[None, :]      # (1, T) — same every batch, hoist out
+                de_acc[...]  = 0.0
+                dpe_acc[...] = 0.0
 
             for start in range(0, n, self.batch_size):
                 end = min(start + self.batch_size, n)
@@ -376,27 +396,31 @@ class NeuralNetwork:
 
                 probs, (toks, x_out, block_caches) = self._transformer_forward(Xb)
 
-                Yb_T  = Yb.T                              # (B, T) target indices
-                b_idx = np.arange(bs)[:, None]            # (B, 1)
+                Yb_T  = Yb.T
+                b_idx = b_idx_full if bs == self.batch_size else np.arange(bs)[:, None]
 
                 # ── Loss: gather prob at correct index (no one-hot needed) ────
                 correct_probs = probs[b_idx, t_idx, Yb_T]
                 total_loss += float(-np.sum(np.log(correct_probs + 1e-9)))
+                del correct_probs
 
-                # ── Gradient: softmax grad = probs - one_hot ──────────────────
-                delta = probs.copy()
-                delta[b_idx, t_idx, Yb_T] -= 1.0
-                delta /= (bs * T)
+                # ── Gradient: reuse probs buffer in-place as delta ────────────
+                probs[b_idx, t_idx, Yb_T] -= 1.0
+                probs *= 1.0 / (bs * T)
+                delta  = probs                                    # alias, no copy
 
-                dWout_acc += np.einsum('bti,btj->ij', x_out, delta)
+                dWout_acc += x_out.reshape(bs * T, -1).T @ delta.reshape(bs * T, -1)
                 dbout_acc += delta.sum(axis=(0, 1))
-                d_x = delta @ self.Wout.T                         # (B, T, D)
+                d_x = delta @ self.Wout.T
+                del probs, x_out                                  # free immediately
 
                 for i, (cache, blk) in enumerate(zip(reversed(block_caches), reversed(self.blocks))):
                     d_x, grads = self._block_backward(d_x, cache, blk)
+                    del cache                                      # free as we go
                     acc = blk_grad_acc[self.num_blocks - 1 - i]
                     for k in grads:
                         acc[k] += grads[k]
+                del block_caches
 
                 if self.use_embedding:
                     dpe_acc += d_x.sum(axis=0)
@@ -413,29 +437,41 @@ class NeuralNetwork:
                         import numpy as _np
                         _np.add.at(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
 
-            # ── Adam updates with cosine lr ───────────────────────────────────
+            # ── Adam updates — precompute bias correction once per epoch ────────
+            t      = self._adam_t
+            bc1    = 1.0 - 0.9   ** t    # 1 - beta1^t
+            bc2    = 1.0 - 0.999 ** t    # 1 - beta2^t
+            lr_eff = epoch_lr * (bc2 ** 0.5) / bc1   # fused corrected lr
+
+            def _adam_step(param, grad, m, v):
+                m *= 0.9;  m += 0.1   * grad
+                v *= 0.999; v += 0.001 * grad * grad
+                param -= lr_eff * m / (np.sqrt(v) + 1e-8)
+
             for blk, acc, adam_buf in zip(self.blocks, blk_grad_acc, self._adam_blocks):
                 for k in blk:
-                    blk[k], adam_buf[k]["m"], adam_buf[k]["v"] = self._adam_update(
-                        blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"], lr=epoch_lr
-                    )
-            self.Wout, self._mWout, self._vWout = self._adam_update(self.Wout, dWout_acc, self._mWout, self._vWout, lr=epoch_lr)
-            self.bout, self._mbout, self._vbout = self._adam_update(self.bout, dbout_acc, self._mbout, self._vbout, lr=epoch_lr)
+                    _adam_step(blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"])
+            _adam_step(self.Wout, dWout_acc, self._mWout, self._vWout)
+            _adam_step(self.bout, dbout_acc, self._mbout, self._vbout)
             if self.use_embedding:
-                self.embedding,     self._me,  self._ve  = self._adam_update(self.embedding,     de_acc,  self._me,  self._ve,  lr=epoch_lr)
-                self.pos_embedding, self._mpe, self._vpe = self._adam_update(self.pos_embedding, dpe_acc, self._mpe, self._vpe, lr=epoch_lr)
+                _adam_step(self.embedding,     de_acc,  self._me,  self._ve)
+                _adam_step(self.pos_embedding, dpe_acc, self._mpe, self._vpe)
 
             # ── Adaptive LR: update for next epoch ────────────────────────────
             if epoch >= 5:
                 lr_change_msg = ""
                 if total_loss > prev_loss:
-                    # Loss went UP — bounce detected, reduce immediately
-                    new_lr = max(epoch_lr * bounce_factor, lr_min)
-                    if new_lr < epoch_lr:
-                        lr_change_msg = f"  ↓ bounce  {epoch_lr:.6f}→{new_lr:.6f}"
-                    epoch_lr = new_lr
+                    # Loss went UP — only reduce after bounce_patience consecutive bad epochs
+                    bounce_count += 1
                     plateau_count = 0
+                    if bounce_count >= bounce_patience:
+                        new_lr = max(epoch_lr * bounce_factor, lr_min)
+                        if new_lr < epoch_lr:
+                            lr_change_msg = f"  ↓ bounce×{bounce_count}  {epoch_lr:.6f}→{new_lr:.6f}"
+                        epoch_lr     = new_lr
+                        bounce_count = 0
                 else:
+                    bounce_count = 0
                     if total_loss < best_loss:
                         best_loss     = total_loss
                         plateau_count = 0
@@ -444,13 +480,18 @@ class NeuralNetwork:
                     if plateau_count >= plateau_patience:
                         new_lr = max(epoch_lr * plateau_factor, lr_min)
                         if new_lr < epoch_lr:
-                            lr_change_msg = f"  ↓ plateau {epoch_lr:.6f}→{new_lr:.6f}"
+                            lr_change_msg = f"  ↓ plateau  {epoch_lr:.6f}→{new_lr:.6f}"
                         epoch_lr      = new_lr
                         plateau_count = 0
                 prev_loss = total_loss
 
             if log_every and epoch % log_every == 0:
-                print(f"Epoch {epoch:>6} | Loss: {total_loss:.2f}  lr={epoch_lr:.6f}{lr_change_msg}")
+                equiv = total_loss / (n * ctx_size)
+                print(f"Epoch {epoch:>6} | Loss: {total_loss:.2f}  equiv: {equiv:.4f}  lr={epoch_lr:.6f}{lr_change_msg}", flush=True)
+
+            if save_every and epoch > 0 and epoch % save_every == 0:
+                self.save_weights(save_path)
+                print(f"  ✓ checkpoint saved → {save_path}", flush=True)
 
         print("Training complete.")
 
@@ -467,7 +508,7 @@ class NeuralNetwork:
 
     def summary(self) -> None:
         blk    = self.blocks[0]
-        attn_p = blk["Wq"].size + blk["Wk"].size + blk["Wv"].size
+        attn_p = blk["Wqkv"].size
         ff_p   = blk["W1"].size + blk["b1"].size + blk["W2"].size + blk["b2"].size
         out_p  = self.Wout.size + self.bout.size
         emb_p  = self.embedding.size + self.pos_embedding.size if self.use_embedding else 0
@@ -486,7 +527,7 @@ class NeuralNetwork:
             edim = f"{self.vocab_size} chars × {D}d  context={self.context_size}"
             print(f"║  {'Embedding':<16} │ {edim:<{width-22}}║")
         print(f"║  {'Blocks':<16} │ {str(self.num_blocks) + ' (independent)':<{width-22}}║")
-        print(f"║  {'Attention':<16} │ {'causal, Wq/Wk/Wv ' + str(D) + 'x' + str(D) + ' (' + str(attn_p) + ' params/block)':<{width-22}}║")
+        print(f"║  {'Attention':<16} │ {'causal, fused Wqkv ' + str(D) + 'x' + str(D*3) + ' (' + str(attn_p) + ' params/block)':<{width-22}}║")
         print(f"║  {'Feed-forward':<16} │ {str(D) + '->' + str(D*4) + '->' + str(D) + ' (' + str(ff_p) + ' params/block)':<{width-22}}║")
         print(f"║  {'Output':<16} │ {'all positions -> ' + str(self.output_size):<{width-22}}║")
         print(f"║  {'Vectorised':<16} │ {'ON (batch matmul)':<{width-22}}║")
@@ -541,18 +582,30 @@ class NeuralNetwork:
         self.pos_embedding = np.array(data["pos_embedding"]) if data.get("pos_embedding") else None
         self.Wout = np.array(data["Wout"]); self.bout = np.array(data["bout"])
         if "blocks" in data:
-            self.blocks = [{k: np.array(v) for k, v in blk.items()} for blk in data["blocks"]]
+            self.blocks = []
+            for blk in data["blocks"]:
+                b = {k: np.array(v) for k, v in blk.items()}
+                # Upgrade old Wq/Wk/Wv to fused Wqkv on load
+                if "Wq" in b and "Wqkv" not in b:
+                    import numpy as _np
+                    Wq = np.asnumpy(b.pop("Wq")) if _DEVICE == "gpu" else b.pop("Wq")
+                    Wk = np.asnumpy(b.pop("Wk")) if _DEVICE == "gpu" else b.pop("Wk")
+                    Wv = np.asnumpy(b.pop("Wv")) if _DEVICE == "gpu" else b.pop("Wv")
+                    b["Wqkv"] = np.array(_np.concatenate([Wq, Wk, Wv], axis=1))
+                self.blocks.append(b)
         else:
-            # Backwards compat: old single-weight format
+            # Very old single-weight format
             self.blocks = []
             for _ in range(self.num_blocks):
+                import numpy as _np
+                Wq = _np.array(data["Wq"]); Wk = _np.array(data["Wk"]); Wv = _np.array(data["Wv"])
                 self.blocks.append({
-                    "Wq": np.array(data["Wq"]), "Wk": np.array(data["Wk"]),
-                    "Wv": np.array(data["Wv"]), "W1": np.array(data["W1"]),
-                    "b1": np.array(data["b1"]), "W2": np.array(data["W2"]),
-                    "b2": np.array(data["b2"]),
+                    "Wqkv": np.array(_np.concatenate([Wq, Wk, Wv], axis=1)),
+                    "W1": np.array(data["W1"]), "b1": np.array(data["b1"]),
+                    "W2": np.array(data["W2"]), "b2": np.array(data["b2"]),
                 })
         self._adam_init = False
+        self._scale = 1.0 / (self.embed_dim ** 0.5)
         print(f"Weights loaded from '{filename}'.")
 
     def __repr__(self):

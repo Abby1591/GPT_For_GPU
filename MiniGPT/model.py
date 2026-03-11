@@ -174,6 +174,8 @@ class MiniGPT:
         max_chars:    int   = 500_000,
         log_every:    int   = 1,
         simple_vocab: bool  = False,
+        save_every:   int   = 0,
+        save_path:    str   = "checkpoint.json",
     ) -> None:
         """
         Train the model on a text string or a path to a ``.txt`` file.
@@ -254,7 +256,8 @@ class MiniGPT:
 
         print(f"\nTraining for {epochs} epoch(s)...\n")
         t0 = time.time()
-        self.nn.train(index_data, epochs=epochs, log_every=log_every)
+        self.nn.train(index_data, epochs=epochs, log_every=log_every,
+                      save_every=save_every, save_path=save_path)
         print(f"\nTraining finished in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
