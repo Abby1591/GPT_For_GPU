@@ -21,9 +21,15 @@ try:
     np.cuda.Device(0).use()
     _DEVICE = "gpu"
     print(f"✓ GPU detected — training on: {np.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
+    try:
+        import cupyx as _cupyx
+        _scatter_add = _cupyx.scatter_add
+    except Exception:
+        _scatter_add = None
 except Exception:
     import numpy as np
     _DEVICE = "cpu"
+    _scatter_add = None
     print("✗ CuPy not found — training on CPU (numpy)")
 
 ActivationName = Literal["sigmoid", "tanh", "relu", "leaky_relu"]
@@ -70,7 +76,7 @@ class NeuralNetwork:
         output_size:   int,
         activation:    str   = "relu",
         learning_rate: float = 0.001,
-        batch_size:    int   = 512,
+        batch_size:    int   = 2048,
         use_embedding: bool  = True,
         vocab_size:    int   = 0,
         context_size:  int   = 0,
@@ -297,7 +303,7 @@ class NeuralNetwork:
         vs       = self.vocab_size
         D        = self.embed_dim
         lr_max   = self.learning_rate
-        lr_min   = lr_max / 10.0
+        lr_min   = lr_max / 5.0
 
         print("  Loading dataset onto device...")
 
@@ -321,7 +327,7 @@ class NeuralNetwork:
 
         print(f"  {_DEVICE.upper()} ready — {n:,} samples | "
               f"batch={self.batch_size} | optimizer=Adam+adaptive | "
-              f"lr={lr_max:.5f} (bounce×0.5, plateau×0.6, min={lr_min:.5f}) | "
+              f"lr={lr_max:.5f} (bounce×0.7, plateau×0.7, min={lr_min:.5f}) | "
               f"embed={'ON' if self.use_embedding else 'OFF'} | "
               f"transformer=ON (blocks={self.num_blocks}, independent) | "
               f"causal=ON | all-positions=ON\n")
@@ -331,8 +337,8 @@ class NeuralNetwork:
         best_loss         = float("inf")
         plateau_count     = 0
         plateau_patience  = 5    # epochs without improvement before reducing
-        plateau_factor    = 0.6  # lr multiplier on plateau
-        bounce_factor     = 0.5  # lr multiplier when loss goes UP
+        plateau_factor    = 0.7  # lr multiplier on plateau
+        bounce_factor     = 0.7  # lr multiplier when loss goes UP (was 0.5, too aggressive)
         prev_loss         = float("inf")
         lr_change_msg     = ""
 
@@ -342,8 +348,7 @@ class NeuralNetwork:
                 epoch_lr = lr_max * (epoch + 1) / 5
                 lr_change_msg = ""
 
-            idx    = list(range(n)); random.shuffle(idx)
-            idx_np = np.array(idx)
+            idx_np = np.random.permutation(n)  # shuffle on GPU directly
             X_shuf = X_idx[:, idx_np]
             Y_shuf = Y_idx[:, idx_np]
 
@@ -360,6 +365,9 @@ class NeuralNetwork:
                 de_acc  = np.zeros_like(self.embedding)
                 dpe_acc = np.zeros_like(self.pos_embedding)
 
+            T     = ctx_size
+            t_idx = np.arange(T)[None, :]      # (1, T) — same every batch, hoist out
+
             for start in range(0, n, self.batch_size):
                 end = min(start + self.batch_size, n)
                 bs  = end - start
@@ -367,20 +375,16 @@ class NeuralNetwork:
                 Yb  = Y_shuf[:, start:end]     # (T, B)
 
                 probs, (toks, x_out, block_caches) = self._transformer_forward(Xb)
-                # probs: (B, T, vocab),  toks/Yb: (B,T) / (T,B)
 
-                T    = ctx_size
-                Yb_T = Yb.T                    # (B, T) target indices
+                Yb_T  = Yb.T                              # (B, T) target indices
+                b_idx = np.arange(bs)[:, None]            # (B, 1)
 
                 # ── Loss: gather prob at correct index (no one-hot needed) ────
-                b_idx = np.arange(bs)[:, None]
-                t_idx = np.arange(T)[None, :]
-                correct_probs = probs[b_idx, t_idx, Yb_T]        # (B, T)
+                correct_probs = probs[b_idx, t_idx, Yb_T]
                 total_loss += float(-np.sum(np.log(correct_probs + 1e-9)))
 
-                # ── Gradient: softmax grad = probs - one_hot, but computed ────
-                # directly without building the full one-hot matrix
-                delta = probs.copy()                              # (B, T, vocab)
+                # ── Gradient: softmax grad = probs - one_hot ──────────────────
+                delta = probs.copy()
                 delta[b_idx, t_idx, Yb_T] -= 1.0
                 delta /= (bs * T)
 
@@ -396,18 +400,15 @@ class NeuralNetwork:
 
                 if self.use_embedding:
                     dpe_acc += d_x.sum(axis=0)
-                    if _DEVICE == "gpu":
-                        # Stay on GPU — use cupyx.scatter_add instead of CPU roundtrip
-                        try:
-                            import cupyx
-                            cupyx.scatter_add(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
-                        except Exception:
-                            import numpy as _np
-                            d_x_cpu  = np.asnumpy(d_x)
-                            toks_cpu = np.asnumpy(toks)
-                            de_cpu   = np.asnumpy(de_acc)
-                            _np.add.at(de_cpu, toks_cpu.reshape(-1), d_x_cpu.reshape(-1, D))
-                            de_acc = np.array(de_cpu)
+                    if _DEVICE == "gpu" and _scatter_add is not None:
+                        _scatter_add(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
+                    elif _DEVICE == "gpu":
+                        import numpy as _np
+                        d_x_cpu  = np.asnumpy(d_x)
+                        toks_cpu = np.asnumpy(toks)
+                        de_cpu   = np.asnumpy(de_acc)
+                        _np.add.at(de_cpu, toks_cpu.reshape(-1), d_x_cpu.reshape(-1, D))
+                        de_acc = np.array(de_cpu)
                     else:
                         import numpy as _np
                         _np.add.at(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
