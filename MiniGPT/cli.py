@@ -27,6 +27,7 @@ All flags::
 from __future__ import annotations
 import argparse
 from model import MiniGPT
+from data import simplify_text
 
 _DEMO_TEXT = (
     "democracy is the foundation of freedom. "
@@ -76,18 +77,23 @@ def _build_parser() -> argparse.ArgumentParser:
     tg = p.add_argument_group("Training options")
     tg.add_argument("--epochs",     type=int,   default=100,
                     help="Training epochs. (default: 100)")
-    tg.add_argument("--samples",    type=int,   default=80_000,
-                    help="Max training samples. (default: 80000)")
-    tg.add_argument("--context",    type=int,   default=64,
-                    help="Context window size. (default: 64)")
-    tg.add_argument("--hidden",     type=int,   nargs="+", default=[768, 512, 256],
-                    help="Hidden layer sizes. E.g. --hidden 512 256 128\n(default: 768, 512, 256)")
+    tg.add_argument("--samples",    type=int,   default=20_000,
+                    help="Max training samples. (default: 20000)")
+    tg.add_argument("--context",    type=int,   default=12,
+                    help="Context window size. (default: 12)")
+    tg.add_argument("--hidden",     type=int,   nargs="+", default=[512, 256, 128],
+                    help="Hidden layer sizes. E.g. --hidden 512 256 128\n(default: 512 256 128)")
     tg.add_argument("--activation", type=str,   default="relu",
                     help="relu | tanh | sigmoid | leaky_relu (default: relu)")
     tg.add_argument("--lr",         type=float, default=0.001,
                     help="Learning rate. (default: 0.001)")
-    tg.add_argument("--max_chars",  type=int,   default=2_000_000,
-                    help="Max chars to read from file. (default: 2000000)")
+    tg.add_argument("--embed_dim",  type=int,   default=64,
+                    help="Embedding dimensions. 64/128/256 (default: 64)")
+    tg.add_argument("--max_chars",  type=int,   default=500_000,
+                    help="Max chars to read from file. (default: 500000)")
+    tg.add_argument("--simple_vocab", action="store_true",
+                    help="Strip text to lowercase a-z + space + basic punctuation (~36 chars). "
+                         "Makes learning much easier for small models.")
 
     # ── Generation ────────────────────────────────────────────────────────────
     gg = p.add_argument_group("Generation options")
@@ -148,9 +154,10 @@ def main() -> None:
 
         model.train(
             args.train,
-            epochs      = args.epochs,
-            max_samples = args.samples,
-            max_chars   = args.max_chars,
+            epochs       = args.epochs,
+            max_samples  = args.samples,
+            max_chars    = args.max_chars,
+            simple_vocab = args.simple_vocab,
         )
         model.save(args.save)
         print("\n── Sample generation ──────────────────────────────────────────")
@@ -163,12 +170,14 @@ def main() -> None:
             hidden_layers = args.hidden,
             activation    = args.activation,
             learning_rate = args.lr,
+            embed_dim     = args.embed_dim,
         )
         model.train(
             args.train,
-            epochs      = args.epochs,
-            max_samples = args.samples,
-            max_chars   = args.max_chars,
+            epochs       = args.epochs,
+            max_samples  = args.samples,
+            max_chars    = args.max_chars,
+            simple_vocab = args.simple_vocab,
         )
         model.save(args.save)
         print("\n── Sample generation ──────────────────────────────────────────")

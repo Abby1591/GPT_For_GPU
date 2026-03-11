@@ -1,25 +1,21 @@
 """
-Neural_Network.py  — Mini-Transformer edition
-==============================================
-Full transformer architecture with backprop through every layer:
-
-1. EMBEDDINGS + POSITIONAL ENCODING
-2. SELF-ATTENTION  (Wq, Wk, Wv)
-3. FEED-FORWARD BLOCK  (W1/b1 → ReLU → W2/b2)
-4. RESIDUAL CONNECTIONS
-5. STACKED TRANSFORMER BLOCKS  (num_blocks = 2)
-6. ADAM OPTIMIZER  (every parameter updated)
+Neural_Network.py  — Mini-Transformer edition (causal, all-positions training)
+===============================================================================
+Key upgrades vs previous version:
+  1. CAUSAL MASK — each token can only attend to previous tokens (real GPT behaviour)
+  2. ALL-POSITIONS TRAINING — every token position predicts the next one,
+     giving T x more gradient signal per sample instead of just the last token
+  3. PER-BLOCK INDEPENDENT WEIGHTS — each block learns different representations
+  4. FULLY VECTORISED — no Python loops over samples
 
 GPU SETUP:
-    pip install cupy-cuda12x   # CUDA 12 (Colab T4)
-    pip install cupy-cuda11x   # CUDA 11
+    pip install cupy-cuda12x
 """
 
 from __future__ import annotations
 import json, os, random
 from typing import List, Literal, Tuple
 
-# ── Backend ───────────────────────────────────────────────────────────────────
 try:
     import cupy as np
     np.cuda.Device(0).use()
@@ -33,13 +29,12 @@ except Exception:
 ActivationName = Literal["sigmoid", "tanh", "relu", "leaky_relu"]
 Sample         = Tuple[List[float], int]
 
-# ── Activations ───────────────────────────────────────────────────────────────
-def _relu(x):            return np.maximum(0.0, x)
-def _relu_d(x):          return (x > 0).astype(float)
-def _tanh(x):            return np.tanh(x)
-def _tanh_d(x):          return 1.0 - np.tanh(x) ** 2
-def _sigmoid(x):         return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
-def _sigmoid_d(x):       s = _sigmoid(x); return s * (1.0 - s)
+def _relu(x):                 return np.maximum(0.0, x)
+def _relu_d(x):               return (x > 0).astype(float)
+def _tanh(x):                 return np.tanh(x)
+def _tanh_d(x):               return 1.0 - np.tanh(x) ** 2
+def _sigmoid(x):              return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+def _sigmoid_d(x):            s = _sigmoid(x); return s * (1.0 - s)
 def _leaky_relu(x, a=0.01):   return np.where(x > 0, x, a * x)
 def _leaky_relu_d(x, a=0.01): return np.where(x > 0, 1.0, a)
 
@@ -53,18 +48,19 @@ _ACTIVATIONS = {
 
 class NeuralNetwork:
     """
-    Mini-transformer language model with full backprop through attention,
-    feed-forward, and embeddings.
+    Mini-GPT transformer with causal masking and all-positions training.
 
-    Architecture per forward pass:
-        tokens (context_size,)
-        → embedding lookup + positional encoding   → (context_size, embed_dim)
-        → transformer_block × num_blocks           → (context_size, embed_dim)
-        → last-token slice                         → (embed_dim,)
-        → Wout linear                              → (output_size,)
-        → softmax                                  → probabilities
+    Forward pass:
+        tokens (B, T)
+        -> embedding + positional encoding   (B, T, D)
+        -> transformer block x num_blocks    (B, T, D)   [causal mask applied]
+        -> linear projection at ALL positions (B, T, vocab)
+        -> softmax
 
-    All parameters are updated by Adam every batch.
+    Training:
+        Each sample is a sequence of T+1 tokens.
+        Positions 0..T-1 are inputs, positions 1..T are targets.
+        Loss computed over all T positions simultaneously.
     """
 
     def __init__(
@@ -97,10 +93,9 @@ class NeuralNetwork:
         self.embed_dim     = embed_dim
         self.device        = _DEVICE
         self.num_blocks    = 2
-
         self._act_fn, self._act_d = _ACTIVATIONS[activation]
 
-        # ── Embedding table ───────────────────────────────────────────────────
+        # ── Embeddings ────────────────────────────────────────────────────────
         if self.use_embedding:
             self.embedding     = np.random.randn(vocab_size, embed_dim) * 0.01
             self.pos_embedding = np.random.randn(context_size, embed_dim) * 0.01
@@ -108,21 +103,25 @@ class NeuralNetwork:
             self.embedding     = None
             self.pos_embedding = None
 
-        # ── Transformer weights (one set shared across blocks) ────────────────
-        # Attention
-        self.Wq = np.random.randn(embed_dim, embed_dim) * 0.02
-        self.Wk = np.random.randn(embed_dim, embed_dim) * 0.02
-        self.Wv = np.random.randn(embed_dim, embed_dim) * 0.02
-        # Feed-forward
-        self.W1 = np.random.randn(embed_dim, embed_dim * 4) * 0.02
-        self.b1 = np.zeros(embed_dim * 4)
-        self.W2 = np.random.randn(embed_dim * 4, embed_dim) * 0.02
-        self.b2 = np.zeros(embed_dim)
-        # Output projection
+        # ── Per-block independent weights ─────────────────────────────────────
+        D = embed_dim
+        self.blocks = []
+        for _ in range(self.num_blocks):
+            self.blocks.append({
+                "Wq": np.random.randn(D, D) * 0.02,
+                "Wk": np.random.randn(D, D) * 0.02,
+                "Wv": np.random.randn(D, D) * 0.02,
+                "W1": np.random.randn(D, D * 4) * 0.02,
+                "b1": np.zeros(D * 4),
+                "W2": np.random.randn(D * 4, D) * 0.02,
+                "b2": np.zeros(D),
+            })
+
+        # ── Output projection ─────────────────────────────────────────────────
         self.Wout = np.random.randn(embed_dim, output_size) * 0.02
         self.bout = np.zeros(output_size)
 
-        # ── Legacy dense weights (kept so save/load stays backward-compatible) ─
+        # ── Legacy dense weights (save/load compat) ───────────────────────────
         actual_input = context_size * embed_dim if self.use_embedding else input_size
         layer_sizes  = [actual_input] + hidden_layers + [output_size]
         self.weights = []
@@ -133,32 +132,25 @@ class NeuralNetwork:
             self.weights.append(np.random.randn(fan_out, fan_in) * scale)
             self.biases.append(np.zeros((fan_out, 1)))
 
-        # ── Adam moment buffers ───────────────────────────────────────────────
         self._adam_init = False
 
     # ── Adam ──────────────────────────────────────────────────────────────────
 
     def _init_adam(self):
-        """Initialise Adam first-moment (m) and second-moment (v) buffers."""
         z = np.zeros_like
-        self._mWq = z(self.Wq);  self._vWq = z(self.Wq)
-        self._mWk = z(self.Wk);  self._vWk = z(self.Wk)
-        self._mWv = z(self.Wv);  self._vWv = z(self.Wv)
-        self._mW1 = z(self.W1);  self._vW1 = z(self.W1)
-        self._mb1 = z(self.b1);  self._vb1 = z(self.b1)
-        self._mW2 = z(self.W2);  self._vW2 = z(self.W2)
-        self._mb2 = z(self.b2);  self._vb2 = z(self.b2)
+        self._adam_blocks = []
+        for blk in self.blocks:
+            self._adam_blocks.append({k: {"m": z(v), "v": z(v)} for k, v in blk.items()})
         self._mWout = z(self.Wout); self._vWout = z(self.Wout)
         self._mbout = z(self.bout); self._vbout = z(self.bout)
         if self.use_embedding:
-            self._me  = z(self.embedding);      self._ve  = z(self.embedding)
-            self._mpe = z(self.pos_embedding);  self._vpe = z(self.pos_embedding)
+            self._me  = z(self.embedding);     self._ve  = z(self.embedding)
+            self._mpe = z(self.pos_embedding); self._vpe = z(self.pos_embedding)
         self._adam_t    = 0
         self._adam_init = True
 
     def _adam_update(self, param, grad, m, v, lr=None,
                      beta1=0.9, beta2=0.999, eps=1e-8):
-        """Apply one Adam gradient update step."""
         if lr is None:
             lr = self.learning_rate
         t    = self._adam_t
@@ -169,206 +161,199 @@ class NeuralNetwork:
         param -= lr * m_hat / (np.sqrt(v_hat) + eps)
         return param, m, v
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Causal mask ───────────────────────────────────────────────────────────
 
-    def _softmax_rows(self, x):
-        """Row-wise softmax: x shape (batch, vocab)."""
-        e = np.exp(x - x.max(axis=1, keepdims=True))
-        return e / e.sum(axis=1, keepdims=True)
+    def _causal_mask(self, T):
+        """Upper-triangular mask: position i cannot attend to j > i."""
+        mask = np.triu(np.ones((T, T)), k=1) * -1e9
+        return mask   # (T, T), added to scores before softmax
 
-    def _softmax(self, x):
-        """Column-wise softmax: x shape (vocab, batch) — legacy compat."""
-        e = np.exp(x - x.max(axis=0, keepdims=True))
-        return e / e.sum(axis=0, keepdims=True)
+    # ── Transformer block ─────────────────────────────────────────────────────
 
-    # ── Single transformer block (forward + returns cache for backprop) ───────
-
-    def _block_forward(self, x):
+    def _block_forward(self, x, blk):
         """
-        One transformer block: attention → residual → feed-forward → residual.
-
-        x shape: (seq_len, embed_dim)
-        Returns x_out and intermediate values needed for backprop.
+        Causal transformer block. x: (B, T, D) -> (B, T, D)
+        Each position only attends to itself and earlier positions.
         """
-        # Self-attention
-        Q = x @ self.Wq          # (T, D)
-        K = x @ self.Wk
-        V = x @ self.Wv
-        scale   = np.sqrt(float(self.embed_dim))
-        scores  = Q @ K.T / scale                     # (T, T)
-        exp_s   = np.exp(scores - scores.max(axis=1, keepdims=True))
-        A       = exp_s / exp_s.sum(axis=1, keepdims=True)   # (T, T)
-        attn_out = A @ V                               # (T, D)
-        x_attn   = x + attn_out                       # residual
+        B, T, D = x.shape
+        scale = np.sqrt(float(D))
+        Wq, Wk, Wv = blk["Wq"], blk["Wk"], blk["Wv"]
+        W1, b1, W2, b2 = blk["W1"], blk["b1"], blk["W2"], blk["b2"]
 
-        # Feed-forward
-        h      = np.maximum(0.0, x_attn @ self.W1 + self.b1)   # (T, 4D)
-        ff_out = h @ self.W2 + self.b2                           # (T, D)
-        x_out  = x_attn + ff_out                                 # residual
+        Q = x @ Wq                                             # (B, T, D)
+        K = x @ Wk
+        V = x @ Wv
+
+        scores  = np.matmul(Q, K.transpose(0, 2, 1)) / scale  # (B, T, T)
+        scores += self._causal_mask(T)                         # mask future
+        scores -= scores.max(axis=2, keepdims=True)
+        exp_s   = np.exp(scores)
+        A       = exp_s / exp_s.sum(axis=2, keepdims=True)
+
+        attn_out = np.matmul(A, V)                             # (B, T, D)
+        x_attn   = x + attn_out                                # residual
+
+        h      = np.maximum(0.0, x_attn @ W1 + b1)            # (B, T, 4D)
+        ff_out = h @ W2 + b2                                   # (B, T, D)
+        x_out  = x_attn + ff_out                               # residual
 
         cache = (x, Q, K, V, A, attn_out, x_attn, h, ff_out)
         return x_out, cache
 
-    def _block_backward(self, d_out, cache):
-        """
-        Backprop through one transformer block.
-
-        d_out shape: (T, D)
-        Returns gradients for Wq, Wk, Wv, W1, b1, W2, b2 and d_x (gradient for input).
-        """
+    def _block_backward(self, d_out, cache, blk):
+        """Vectorised backprop through causal block. d_out: (B, T, D)"""
         x, Q, K, V, A, attn_out, x_attn, h, ff_out = cache
-        T = x.shape[0]
+        B, T, D = x.shape
+        Wq, Wk, Wv = blk["Wq"], blk["Wk"], blk["Wv"]
+        W1, W2 = blk["W1"], blk["W2"]
 
         # Feed-forward backward
-        d_ff  = d_out                     # gradient flows through residual
-        d_x_attn = d_out                  # residual branch
+        d_x_attn = d_out.copy()
+        dW2  = np.einsum('bti,btj->ij', h, d_out)
+        db2  = d_out.sum(axis=(0, 1))
+        d_h  = d_out @ W2.T
+        d_h *= (h > 0)
+        dW1  = np.einsum('bti,btj->ij', x_attn, d_h)
+        db1  = d_h.sum(axis=(0, 1))
+        d_x_attn += d_h @ W1.T
 
-        dW2   = h.T @ d_ff
-        db2   = d_ff.sum(axis=0)
-        d_h   = d_ff @ self.W2.T
-        d_h   = d_h * (h > 0)            # ReLU derivative
-        dW1   = x_attn.T @ d_h
-        db1   = d_h.sum(axis=0)
-        d_x_attn = d_x_attn + d_h @ self.W1.T
+        # Attention backward (causal mask is baked into A so no extra step needed)
+        d_x_res = d_x_attn.copy()
+        d_A = np.matmul(d_x_attn, V.transpose(0, 2, 1))
+        dV  = np.matmul(A.transpose(0, 2, 1), d_x_attn)
+        dS  = A * (d_A - (d_A * A).sum(axis=2, keepdims=True))
+        dS /= np.sqrt(float(D))
+        dQ  = np.matmul(dS, K)
+        dK  = np.matmul(dS.transpose(0, 2, 1), Q)
+        dWq = np.einsum('bti,btj->ij', x, dQ)
+        dWk = np.einsum('bti,btj->ij', x, dK)
+        dWv = np.einsum('bti,btj->ij', x, dV)
+        d_x = (np.matmul(dQ, Wq.T) +
+               np.matmul(dK, Wk.T) +
+               np.matmul(dV, Wv.T) +
+               d_x_res)
 
-        # Attention backward
-        d_attn_out = d_x_attn
-        d_x_res    = d_x_attn            # residual branch back to input
+        grads = {"Wq": dWq, "Wk": dWk, "Wv": dWv,
+                 "W1": dW1, "b1": db1, "W2": dW2, "b2": db2}
+        return d_x, grads
 
-        # d_A = d_attn_out @ V.T,  d_V = A.T @ d_attn_out
-        d_A = d_attn_out @ V.T           # (T, T)
-        dV  = A.T @ d_attn_out           # (T, D)
-
-        # Softmax backward through A
-        dS  = A * (d_A - (d_A * A).sum(axis=1, keepdims=True))  # (T, T)
-        dS /= np.sqrt(float(self.embed_dim))
-
-        dQ  = dS   @ K                   # (T, D)
-        dK  = dS.T @ Q                   # (T, D)
-
-        dWq = x.T @ dQ
-        dWk = x.T @ dK
-        dWv = x.T @ dV
-        d_x = dQ @ self.Wq.T + dK @ self.Wk.T + dV @ self.Wv.T + d_x_res
-
-        return d_x, dWq, dWk, dWv, dW1, db1, dW2, db2
-
-    # ── Full forward pass ─────────────────────────────────────────────────────
+    # ── Forward pass ──────────────────────────────────────────────────────────
 
     def _transformer_forward(self, token_idx_batch):
         """
-        Full batched transformer forward pass.
-
-        token_idx_batch: (context_size, batch_size) int array
-        Returns probs (batch_size, vocab) and per-sample caches for backprop.
+        Full forward pass over all positions.
+        token_idx_batch: (T, B) int
+        Returns probs (B, T, vocab) and cache.
         """
-        bs = token_idx_batch.shape[1]
-        all_probs  = []
-        all_caches = []  # list of (x_init, block_caches) per sample
+        toks = token_idx_batch.T                               # (B, T)
+        x    = self.embedding[toks] + self.pos_embedding       # (B, T, D)
 
-        # Process each sample individually (simple; vectorised later if needed)
-        for s in range(bs):
-            toks = token_idx_batch[:, s]     # (T,) int
+        block_caches = []
+        for blk in self.blocks:
+            x, cache = self._block_forward(x, blk)
+            block_caches.append(cache)
 
-            # Embedding + positional
-            x = self.embedding[toks] + self.pos_embedding   # (T, D)
+        # Project ALL positions: (B, T, D) -> (B, T, vocab)
+        logits  = x @ self.Wout + self.bout
+        logits -= logits.max(axis=2, keepdims=True)
+        e       = np.exp(logits)
+        probs   = e / e.sum(axis=2, keepdims=True)             # (B, T, vocab)
 
-            block_caches = []
-            for _ in range(self.num_blocks):
-                x, cache = self._block_forward(x)
-                block_caches.append(cache)
+        return probs, (toks, x, block_caches)
 
-            # Output: use last token
-            logits = x[-1] @ self.Wout + self.bout   # (vocab,)
-            e = np.exp(logits - logits.max())
-            probs = e / e.sum()
-            all_probs.append(probs)
-            all_caches.append((toks, x, block_caches))
-
-        # Stack probs: (vocab, batch) for cross-entropy compatibility
-        probs_batch = np.stack(all_probs, axis=1)   # (vocab, bs)
-        return probs_batch, all_caches
-
-    # ── Legacy _forward_batch (kept for predict / compat) ─────────────────────
-
-    def _forward_batch(self, X, token_idx_batch=None):
-        """Legacy interface — uses transformer path when embeddings active."""
-        if self.use_embedding and token_idx_batch is not None:
-            probs, _ = self._transformer_forward(token_idx_batch)
-            return None, None, probs
-        # Fallback dense path (no-embedding mode)
-        a = X
-        activations = [a]; zs = []
+    def forward(self, inputs):
+        """Single-sample forward for generation — returns last-position probs."""
+        if self.use_embedding:
+            arr  = np.array(inputs, dtype=float).reshape(self.context_size, self.vocab_size)
+            toks = np.array(arr.argmax(axis=1), dtype=int).reshape(self.context_size, 1)
+            probs, _ = self._transformer_forward(toks)         # (1, T, vocab)
+            if _DEVICE == "gpu":
+                probs = np.asnumpy(probs)
+            return None, None, probs[0, -1, :]                 # last position
+        X = np.array(inputs, dtype=float).reshape(-1, 1)
+        a = X; zs = []; activations = [a]
         for i in range(len(self.hidden_layers)):
             z = self.weights[i] @ a + self.biases[i]
             a = self._act_fn(z)
             zs.append(z); activations.append(a)
         z_out = self.weights[-1] @ a + self.biases[-1]
-        probs = self._softmax(z_out)
-        zs.append(z_out); activations.append(probs)
-        return zs, activations, probs
-
-    # ── Single-sample forward (for predict) ──────────────────────────────────
-
-    def forward(self, inputs):
-        """Single-sample forward pass used by predict()."""
-        if self.use_embedding:
-            arr  = np.array(inputs, dtype=float).reshape(self.context_size, self.vocab_size)
-            toks = np.array(arr.argmax(axis=1), dtype=int).reshape(self.context_size, 1)
-            probs, _ = self._transformer_forward(toks)
-            if _DEVICE == "gpu":
-                probs = np.asnumpy(probs)
-            return None, None, probs[:, 0]
-        X = np.array(inputs, dtype=float).reshape(-1, 1)
-        zs, activations, probs = self._forward_batch(X)
-        return zs, activations, probs[:, 0]
+        e     = np.exp(z_out - z_out.max(axis=0, keepdims=True))
+        p     = e / e.sum(axis=0, keepdims=True)
+        return zs, activations, p[:, 0]
 
     # ── Train ─────────────────────────────────────────────────────────────────
 
     def train(self, data: List[Sample], epochs: int, log_every: int = 1) -> None:
         """
-        Train with mini-batch Adam gradient descent.
-
-        Backpropagates through the full transformer:
-        softmax → Wout → transformer blocks (attention + ff) → embeddings.
+        All-positions causal training with adaptive LR.
         """
         if not self._adam_init:
             self._init_adam()
 
+        import math
+        import numpy as _np   # always CPU numpy for index ops
         n        = len(data)
         ctx_size = self.context_size
         vs       = self.vocab_size
+        D        = self.embed_dim
+        lr_max   = self.learning_rate
+        lr_min   = lr_max / 10.0
 
         print("  Loading dataset onto device...")
-        X_idx = np.zeros((ctx_size, n), dtype=int)
-        Y_all = np.zeros((self.output_size, n), dtype=float)
-        for j, (feat, label) in enumerate(data):
-            oh = np.array(feat).reshape(ctx_size, vs)
-            X_idx[:, j] = oh.argmax(axis=1)
-            Y_all[label, j] = 1.0
+
+        # ── Fast path: data is already index arrays (from make_index_arrays) ──
+        if isinstance(data, tuple) and len(data) == 2 and hasattr(data[0], 'shape'):
+            X_idx_cpu, Y_idx_cpu = data          # (T, N) numpy int arrays
+            n = X_idx_cpu.shape[1]
+        else:
+            # Legacy path: decode one-hot samples back to indices
+            X_idx_cpu = _np.zeros((ctx_size, n), dtype=_np.int32)
+            Y_idx_cpu = _np.zeros((ctx_size, n), dtype=_np.int32)
+            for j, (feat, label) in enumerate(data):
+                oh   = _np.array(feat).reshape(ctx_size, vs)
+                toks = oh.argmax(axis=1)
+                X_idx_cpu[:, j]   = toks
+                Y_idx_cpu[:-1, j] = toks[1:]
+                Y_idx_cpu[-1,  j] = label
+
+        X_idx = np.array(X_idx_cpu)   # move to GPU if CuPy
+        Y_idx = np.array(Y_idx_cpu)
 
         print(f"  {_DEVICE.upper()} ready — {n:,} samples | "
-              f"batch={self.batch_size} | optimizer=Adam | "
+              f"batch={self.batch_size} | optimizer=Adam+adaptive | "
+              f"lr={lr_max:.5f} (bounce×0.5, plateau×0.6, min={lr_min:.5f}) | "
               f"embed={'ON' if self.use_embedding else 'OFF'} | "
-              f"transformer=ON (blocks={self.num_blocks})\n")
+              f"transformer=ON (blocks={self.num_blocks}, independent) | "
+              f"causal=ON | all-positions=ON\n")
+
+        # ── Adaptive LR state ─────────────────────────────────────────────────
+        epoch_lr          = lr_max
+        best_loss         = float("inf")
+        plateau_count     = 0
+        plateau_patience  = 5    # epochs without improvement before reducing
+        plateau_factor    = 0.6  # lr multiplier on plateau
+        bounce_factor     = 0.5  # lr multiplier when loss goes UP
+        prev_loss         = float("inf")
+        lr_change_msg     = ""
 
         for epoch in range(epochs):
+            # ── Warmup for first 5 epochs ─────────────────────────────────────
+            if epoch < 5:
+                epoch_lr = lr_max * (epoch + 1) / 5
+                lr_change_msg = ""
+
             idx    = list(range(n)); random.shuffle(idx)
             idx_np = np.array(idx)
             X_shuf = X_idx[:, idx_np]
-            Y_shuf = Y_all[:, idx_np]
+            Y_shuf = Y_idx[:, idx_np]
 
-            total_loss  = 0.0
+            total_loss = 0.0
             self._adam_t += 1
 
-            # Accumulate gradients for transformer params over all batches
-            dWq_acc   = np.zeros_like(self.Wq)
-            dWk_acc   = np.zeros_like(self.Wk)
-            dWv_acc   = np.zeros_like(self.Wv)
-            dW1_acc   = np.zeros_like(self.W1)
-            db1_acc   = np.zeros_like(self.b1)
-            dW2_acc   = np.zeros_like(self.W2)
-            db2_acc   = np.zeros_like(self.b2)
+            blk_grad_acc = [
+                {k: np.zeros_like(v) for k, v in blk.items()}
+                for blk in self.blocks
+            ]
             dWout_acc = np.zeros_like(self.Wout)
             dbout_acc = np.zeros_like(self.bout)
             if self.use_embedding:
@@ -378,80 +363,99 @@ class NeuralNetwork:
             for start in range(0, n, self.batch_size):
                 end = min(start + self.batch_size, n)
                 bs  = end - start
-                Xb  = X_shuf[:, start:end]
-                Yb  = Y_shuf[:, start:end]
+                Xb  = X_shuf[:, start:end]     # (T, B)
+                Yb  = Y_shuf[:, start:end]     # (T, B)
 
-                probs, caches = self._transformer_forward(Xb)
-                total_loss   += float(-np.sum(Yb * np.log(probs + 1e-9)))
+                probs, (toks, x_out, block_caches) = self._transformer_forward(Xb)
+                # probs: (B, T, vocab),  toks/Yb: (B,T) / (T,B)
 
-                # Cross-entropy gradient: (probs - targets) / bs
-                delta = (probs - Yb) / bs   # (vocab, bs)
+                T    = ctx_size
+                Yb_T = Yb.T                    # (B, T) target indices
 
-                for s in range(bs):
-                    toks_s, x_last, block_caches = caches[s]
-                    d_s = delta[:, s]                  # (vocab,)
+                # ── Loss: gather prob at correct index (no one-hot needed) ────
+                b_idx = np.arange(bs)[:, None]
+                t_idx = np.arange(T)[None, :]
+                correct_probs = probs[b_idx, t_idx, Yb_T]        # (B, T)
+                total_loss += float(-np.sum(np.log(correct_probs + 1e-9)))
 
-                    # Output layer backward
-                    dWout_acc += np.outer(x_last[-1], d_s)
-                    dbout_acc += d_s
-                    d_x_last   = self.Wout @ d_s       # (D,)
+                # ── Gradient: softmax grad = probs - one_hot, but computed ────
+                # directly without building the full one-hot matrix
+                delta = probs.copy()                              # (B, T, vocab)
+                delta[b_idx, t_idx, Yb_T] -= 1.0
+                delta /= (bs * T)
 
-                    # Gradient flows only through last token position
-                    d_x = np.zeros((self.context_size, self.embed_dim))
-                    d_x[-1] = d_x_last
+                dWout_acc += np.einsum('bti,btj->ij', x_out, delta)
+                dbout_acc += delta.sum(axis=(0, 1))
+                d_x = delta @ self.Wout.T                         # (B, T, D)
 
-                    # Backprop through transformer blocks (reversed)
-                    for cache in reversed(block_caches):
-                        d_x, dWq, dWk, dWv, dW1, db1, dW2, db2 = \
-                            self._block_backward(d_x, cache)
-                        dWq_acc += dWq;  dWk_acc += dWk;  dWv_acc += dWv
-                        dW1_acc += dW1;  db1_acc += db1
-                        dW2_acc += dW2;  db2_acc += db2
+                for i, (cache, blk) in enumerate(zip(reversed(block_caches), reversed(self.blocks))):
+                    d_x, grads = self._block_backward(d_x, cache, blk)
+                    acc = blk_grad_acc[self.num_blocks - 1 - i]
+                    for k in grads:
+                        acc[k] += grads[k]
 
-                    # Embedding + positional encoding backward
-                    if self.use_embedding:
-                        dpe_acc += d_x
-                        if _DEVICE == "gpu":
+                if self.use_embedding:
+                    dpe_acc += d_x.sum(axis=0)
+                    if _DEVICE == "gpu":
+                        # Stay on GPU — use cupyx.scatter_add instead of CPU roundtrip
+                        try:
+                            import cupyx
+                            cupyx.scatter_add(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
+                        except Exception:
                             import numpy as _np
-                            d_x_cpu   = np.asnumpy(d_x)
-                            toks_cpu  = np.asnumpy(toks_s)
-                            de_cpu    = np.asnumpy(de_acc)
-                            _np.add.at(de_cpu, toks_cpu, d_x_cpu)
-                            de_acc    = np.array(de_cpu)
-                        else:
-                            import numpy as _np
-                            _np.add.at(de_acc, toks_s, d_x)
+                            d_x_cpu  = np.asnumpy(d_x)
+                            toks_cpu = np.asnumpy(toks)
+                            de_cpu   = np.asnumpy(de_acc)
+                            _np.add.at(de_cpu, toks_cpu.reshape(-1), d_x_cpu.reshape(-1, D))
+                            de_acc = np.array(de_cpu)
+                    else:
+                        import numpy as _np
+                        _np.add.at(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
 
-            # Adam updates for all transformer parameters
-            self.Wq,   self._mWq,  self._vWq  = self._adam_update(self.Wq,   dWq_acc,   self._mWq,  self._vWq)
-            self.Wk,   self._mWk,  self._vWk  = self._adam_update(self.Wk,   dWk_acc,   self._mWk,  self._vWk)
-            self.Wv,   self._mWv,  self._vWv  = self._adam_update(self.Wv,   dWv_acc,   self._mWv,  self._vWv)
-            self.W1,   self._mW1,  self._vW1  = self._adam_update(self.W1,   dW1_acc,   self._mW1,  self._vW1)
-            self.b1,   self._mb1,  self._vb1  = self._adam_update(self.b1,   db1_acc,   self._mb1,  self._vb1)
-            self.W2,   self._mW2,  self._vW2  = self._adam_update(self.W2,   dW2_acc,   self._mW2,  self._vW2)
-            self.b2,   self._mb2,  self._vb2  = self._adam_update(self.b2,   db2_acc,   self._mb2,  self._vb2)
-            self.Wout, self._mWout,self._vWout = self._adam_update(self.Wout, dWout_acc, self._mWout,self._vWout)
-            self.bout, self._mbout,self._vbout = self._adam_update(self.bout, dbout_acc, self._mbout,self._vbout)
+            # ── Adam updates with cosine lr ───────────────────────────────────
+            for blk, acc, adam_buf in zip(self.blocks, blk_grad_acc, self._adam_blocks):
+                for k in blk:
+                    blk[k], adam_buf[k]["m"], adam_buf[k]["v"] = self._adam_update(
+                        blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"], lr=epoch_lr
+                    )
+            self.Wout, self._mWout, self._vWout = self._adam_update(self.Wout, dWout_acc, self._mWout, self._vWout, lr=epoch_lr)
+            self.bout, self._mbout, self._vbout = self._adam_update(self.bout, dbout_acc, self._mbout, self._vbout, lr=epoch_lr)
             if self.use_embedding:
-                self.embedding,     self._me,  self._ve  = self._adam_update(self.embedding,     de_acc,  self._me,  self._ve)
-                self.pos_embedding, self._mpe, self._vpe = self._adam_update(self.pos_embedding, dpe_acc, self._mpe, self._vpe)
+                self.embedding,     self._me,  self._ve  = self._adam_update(self.embedding,     de_acc,  self._me,  self._ve,  lr=epoch_lr)
+                self.pos_embedding, self._mpe, self._vpe = self._adam_update(self.pos_embedding, dpe_acc, self._mpe, self._vpe, lr=epoch_lr)
+
+            # ── Adaptive LR: update for next epoch ────────────────────────────
+            if epoch >= 5:
+                lr_change_msg = ""
+                if total_loss > prev_loss:
+                    # Loss went UP — bounce detected, reduce immediately
+                    new_lr = max(epoch_lr * bounce_factor, lr_min)
+                    if new_lr < epoch_lr:
+                        lr_change_msg = f"  ↓ bounce  {epoch_lr:.6f}→{new_lr:.6f}"
+                    epoch_lr = new_lr
+                    plateau_count = 0
+                else:
+                    if total_loss < best_loss:
+                        best_loss     = total_loss
+                        plateau_count = 0
+                    else:
+                        plateau_count += 1
+                    if plateau_count >= plateau_patience:
+                        new_lr = max(epoch_lr * plateau_factor, lr_min)
+                        if new_lr < epoch_lr:
+                            lr_change_msg = f"  ↓ plateau {epoch_lr:.6f}→{new_lr:.6f}"
+                        epoch_lr      = new_lr
+                        plateau_count = 0
+                prev_loss = total_loss
 
             if log_every and epoch % log_every == 0:
-                print(f"Epoch {epoch:>6} | Loss: {total_loss:.2f}")
+                print(f"Epoch {epoch:>6} | Loss: {total_loss:.2f}  lr={epoch_lr:.6f}{lr_change_msg}")
 
         print("Training complete.")
 
     # ── Predict ───────────────────────────────────────────────────────────────
 
     def predict(self, inputs) -> Tuple[int, float, "np.ndarray"]:
-        """
-        Predict the most likely class for one sample.
-
-        :param inputs: Flat one-hot feature vector (same format as training data).
-        :type inputs: list[float]
-        :return: `(predicted_class, confidence, all_probs)
-        :rtype: tuple[int, float, np.ndarray]
-        """
         _, _, probs = self.forward(inputs)
         if _DEVICE == "gpu":
             probs = np.asnumpy(probs)
@@ -461,63 +465,51 @@ class NeuralNetwork:
     # ── Summary ───────────────────────────────────────────────────────────────
 
     def summary(self) -> None:
-        """Print architecture, device, optimizer, and embedding info."""
-        attn_params = self.Wq.size + self.Wk.size + self.Wv.size
-        ff_params   = self.W1.size + self.b1.size + self.W2.size + self.b2.size
-        out_params  = self.Wout.size + self.bout.size
-        emb_params  = self.embedding.size + self.pos_embedding.size if self.use_embedding else 0
-        total       = (attn_params + ff_params + out_params + emb_params) * self.num_blocks
-        width       = 52
-        device      = "GPU (CuPy)" if _DEVICE == "gpu" else "CPU (NumPy)"
+        blk    = self.blocks[0]
+        attn_p = blk["Wq"].size + blk["Wk"].size + blk["Wv"].size
+        ff_p   = blk["W1"].size + blk["b1"].size + blk["W2"].size + blk["b2"].size
+        out_p  = self.Wout.size + self.bout.size
+        emb_p  = self.embedding.size + self.pos_embedding.size if self.use_embedding else 0
+        total  = (attn_p + ff_p) * self.num_blocks + out_p + emb_p
+        width  = 52
+        device = "GPU (CuPy)" if _DEVICE == "gpu" else "CPU (NumPy)"
+        D      = self.embed_dim
 
         print("╔" + "═" * width + "╗")
         print("║" + " Mini-Transformer Summary".center(width) + "║")
         print("╠" + "═" * width + "╣")
-        print(f"║  {'Device':<16} │ {device:<{width - 22}}║")
-        print(f"║  {'Optimizer':<16} │ {'Adam':<{width - 22}}║")
-        print(f"║  {'Batch size':<16} │ {self.batch_size:<{width - 22}}║")
+        print(f"║  {'Device':<16} │ {device:<{width-22}}║")
+        print(f"║  {'Optimizer':<16} │ {'Adam + adaptive LR':<{width-22}}║")
+        print(f"║  {'Batch size':<16} │ {self.batch_size:<{width-22}}║")
         if self.use_embedding:
-            edim = f"{self.vocab_size} chars × {self.embed_dim}d  context={self.context_size}"
-            print(f"║  {'Embedding':<16} │ {edim:<{width - 22}}║")
-        print(f"║  {'Blocks':<16} │ {self.num_blocks:<{width - 22}}║")
-        print(f"║  {'Attention':<16} │ Wq/Wk/Wv {self.embed_dim}×{self.embed_dim} ({attn_params:,} params each block)║")
-        print(f"║  {'Feed-forward':<16} │ {self.embed_dim}→{self.embed_dim*4}→{self.embed_dim} ({ff_params:,} params each block)║")
-        print(f"║  {'Output':<16} │ {self.embed_dim}→{self.output_size} ({out_params:,} params)║")
+            edim = f"{self.vocab_size} chars × {D}d  context={self.context_size}"
+            print(f"║  {'Embedding':<16} │ {edim:<{width-22}}║")
+        print(f"║  {'Blocks':<16} │ {str(self.num_blocks) + ' (independent)':<{width-22}}║")
+        print(f"║  {'Attention':<16} │ {'causal, Wq/Wk/Wv ' + str(D) + 'x' + str(D) + ' (' + str(attn_p) + ' params/block)':<{width-22}}║")
+        print(f"║  {'Feed-forward':<16} │ {str(D) + '->' + str(D*4) + '->' + str(D) + ' (' + str(ff_p) + ' params/block)':<{width-22}}║")
+        print(f"║  {'Output':<16} │ {'all positions -> ' + str(self.output_size):<{width-22}}║")
+        print(f"║  {'Vectorised':<16} │ {'ON (batch matmul)':<{width-22}}║")
         print("╠" + "═" * width + "╣")
-        print(f"║  Total parameters: {total:,}{'':<{width - 23 - len(f'{total:,}')}}║")
+        print(f"║  Total parameters: {total:,}{'':<{width-23-len(f'{total:,}')}}║")
         print("╚" + "═" * width + "╝")
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
     def save_weights(self, filename: str = "weights.json") -> None:
-        """
-        Save full model state including embeddings and transformer weights to JSON.
-
-        :param filename: Output path. Default `"weights.json".
-        :type filename: str
-        """
         to_list = (lambda w: np.asnumpy(w).tolist()) if _DEVICE == "gpu" else (lambda w: w.tolist())
         data = {
-            "input_size":    self.input_size,
-            "hidden_layers": self.hidden_layers,
-            "output_size":   self.output_size,
-            "activation":    self.activation,
-            "learning_rate": self.learning_rate,
-            "batch_size":    self.batch_size,
-            "use_embedding": self.use_embedding,
-            "vocab_size":    self.vocab_size,
-            "context_size":  self.context_size,
-            "embed_dim":     self.embed_dim,
-            "num_blocks":    self.num_blocks,
-            "device":        _DEVICE,
-            "weights":       [to_list(w) for w in self.weights],
-            "biases":        [to_list(b) for b in self.biases],
+            "input_size": self.input_size, "hidden_layers": self.hidden_layers,
+            "output_size": self.output_size, "activation": self.activation,
+            "learning_rate": self.learning_rate, "batch_size": self.batch_size,
+            "use_embedding": self.use_embedding, "vocab_size": self.vocab_size,
+            "context_size": self.context_size, "embed_dim": self.embed_dim,
+            "num_blocks": self.num_blocks, "device": _DEVICE,
+            "weights": [to_list(w) for w in self.weights],
+            "biases":  [to_list(b) for b in self.biases],
             "embedding":     to_list(self.embedding)     if self.use_embedding else None,
             "pos_embedding": to_list(self.pos_embedding) if self.use_embedding else None,
-            "Wq":  to_list(self.Wq),  "Wk": to_list(self.Wk), "Wv": to_list(self.Wv),
-            "W1":  to_list(self.W1),  "b1": to_list(self.b1),
-            "W2":  to_list(self.W2),  "b2": to_list(self.b2),
-            "Wout":to_list(self.Wout),"bout":to_list(self.bout),
+            "Wout": to_list(self.Wout), "bout": to_list(self.bout),
+            "blocks": [{k: to_list(v) for k, v in blk.items()} for blk in self.blocks],
         }
         with open(filename, "w") as f:
             json.dump(data, f, indent=2)
@@ -526,17 +518,10 @@ class NeuralNetwork:
     # ── Load ──────────────────────────────────────────────────────────────────
 
     def load_weights(self, filename: str = "weights.json") -> None:
-        """
-        Restore model from JSON including transformer weights.
-
-        :param filename: Path to load. Default `"weights.json".
-        :type filename: str
-        """
         if not os.path.exists(filename):
             print(f"No weights file found at '{filename}'."); return
         with open(filename) as f:
             data = json.load(f)
-
         self.input_size    = data["input_size"]
         self.hidden_layers = data["hidden_layers"]
         self.output_size   = data["output_size"]
@@ -548,28 +533,28 @@ class NeuralNetwork:
         self.context_size  = data.get("context_size", 0)
         self.embed_dim     = data.get("embed_dim", 64)
         self.num_blocks    = data.get("num_blocks", 2)
-
         self._act_fn, self._act_d = _ACTIVATIONS[self.activation]
         self.weights   = [np.array(w) for w in data["weights"]]
         self.biases    = [np.array(b) for b in data["biases"]]
         self.embedding     = np.array(data["embedding"])     if data.get("embedding")     else None
         self.pos_embedding = np.array(data["pos_embedding"]) if data.get("pos_embedding") else None
-        self.Wq   = np.array(data["Wq"])
-        self.Wk   = np.array(data["Wk"])
-        self.Wv   = np.array(data["Wv"])
-        self.W1   = np.array(data["W1"])
-        self.b1   = np.array(data["b1"])
-        self.W2   = np.array(data["W2"])
-        self.b2   = np.array(data["b2"])
-        self.Wout = np.array(data["Wout"])
-        self.bout = np.array(data["bout"])
+        self.Wout = np.array(data["Wout"]); self.bout = np.array(data["bout"])
+        if "blocks" in data:
+            self.blocks = [{k: np.array(v) for k, v in blk.items()} for blk in data["blocks"]]
+        else:
+            # Backwards compat: old single-weight format
+            self.blocks = []
+            for _ in range(self.num_blocks):
+                self.blocks.append({
+                    "Wq": np.array(data["Wq"]), "Wk": np.array(data["Wk"]),
+                    "Wv": np.array(data["Wv"]), "W1": np.array(data["W1"]),
+                    "b1": np.array(data["b1"]), "W2": np.array(data["W2"]),
+                    "b2": np.array(data["b2"]),
+                })
         self._adam_init = False
         print(f"Weights loaded from '{filename}'.")
 
     def __repr__(self):
-        layers = " → ".join([str(self.input_size)] +
-                            [str(h) for h in self.hidden_layers] +
-                            [str(self.output_size)])
-        return (f"NeuralNetwork({layers}, act='{self.activation}', "
-                f"lr={self.learning_rate}, embed={'ON' if self.use_embedding else 'OFF'}, "
-                f"transformer=ON, device='{self.device}')")
+        return (f"NeuralNetwork(embed={self.embed_dim}, blocks={self.num_blocks}, "
+                f"causal=True, all_positions=True, "
+                f"lr={self.learning_rate}, device='{self.device}')")

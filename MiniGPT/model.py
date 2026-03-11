@@ -37,7 +37,7 @@ except ImportError:
     sys.exit(1)
 
 from tokenizer import CharTokenizer
-from data import load_text, make_samples
+from data import load_text, make_samples, simplify_text, make_index_arrays
 
 
 class MiniGPT:
@@ -119,11 +119,13 @@ class MiniGPT:
         hidden_layers: Optional[List[int]] = None,
         activation:    str             = "relu",
         learning_rate: float           = 0.005,
+        embed_dim:     int             = 64,
     ) -> None:
         self.context_size  = context_size
         self.hidden_layers = hidden_layers if hidden_layers is not None else [256, 128]
         self.activation    = activation
         self.learning_rate = learning_rate
+        self.embed_dim     = embed_dim
 
         self.tokenizer: Optional[CharTokenizer] = None
         self.nn:        Optional[NeuralNetwork] = None
@@ -145,9 +147,7 @@ class MiniGPT:
         :type tokenizer: CharTokenizer
         """
         self.tokenizer = tokenizer
-        input_size     = self.context_size * tokenizer.size  # flat one-hot dim
-
-
+        input_size     = self.context_size * tokenizer.size
 
         self.nn = NeuralNetwork(
             input_size    = input_size,
@@ -158,9 +158,8 @@ class MiniGPT:
             use_embedding = True,
             vocab_size    = tokenizer.size,
             context_size  = self.context_size,
-            embed_dim     = 64,
+            embed_dim     = self.embed_dim,
         )
-        self.pos_embedding = np.random.randn(self.context_size, 64) * 0.01  # 64 = embed_dim
         self.nn.summary()
 
     # ------------------------------------------------------------------
@@ -174,6 +173,7 @@ class MiniGPT:
         max_samples:  int   = 20_000,
         max_chars:    int   = 500_000,
         log_every:    int   = 1,
+        simple_vocab: bool  = False,
     ) -> None:
         """
         Train the model on a text string or a path to a ``.txt`` file.
@@ -231,28 +231,30 @@ class MiniGPT:
         else:
             text = text_or_path
 
+        if simple_vocab:
+            before = len(set(text))
+            text   = simplify_text(text)
+            after  = len(set(text))
+            print(f"Simple vocab: reduced from {before} → {after} unique chars")
+
         print("\nTokenizing corpus...")
         tokenizer = CharTokenizer(text)
-
-        # Only build the network if it does not already exist
-        if self.nn is None:
-            self._build(tokenizer)
-        else:
-            self.tokenizer = tokenizer
+        self._build(tokenizer)
 
         encoded = tokenizer.encode(text)
         print(f"Vocab size : {tokenizer.size} characters")
         print(f"Corpus     : {len(encoded):,} tokens")
 
         print(f"\nBuilding up to {max_samples:,} training samples...")
-        samples = make_samples(encoded, self.context_size, tokenizer, max_samples)
-        print(f"Training samples : {len(samples):,}")
+        index_data = make_index_arrays(encoded, self.context_size, max_samples)
+        N = index_data[0].shape[1]
+        print(f"Training samples : {N:,}")
         print(f"Input dimension  : {self.context_size} × {tokenizer.size} = "
               f"{self.context_size * tokenizer.size}")
 
         print(f"\nTraining for {epochs} epoch(s)...\n")
         t0 = time.time()
-        self.nn.train(samples, epochs=epochs, log_every=log_every)
+        self.nn.train(index_data, epochs=epochs, log_every=log_every)
         print(f"\nTraining finished in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
@@ -352,12 +354,7 @@ class MiniGPT:
                 probs /= probs.sum()
 
             # Sample next character
-            k = 40
-            top_indices = np.argsort(probs)[-k:]
-            top_probs = probs[top_indices]
-            top_probs = top_probs / top_probs.sum()
-
-            next_idx = int(np.random.choice(top_indices, p=top_probs))
+            next_idx = int(np.random.choice(len(probs), p=probs))
             generated.append(tok.idx2ch[next_idx])
 
             # Slide the context window one step to the right
@@ -413,6 +410,7 @@ class MiniGPT:
                 "hidden_layers": self.hidden_layers,
                 "activation":    self.activation,
                 "learning_rate": self.learning_rate,
+                "embed_dim":     self.embed_dim,
             }, f, indent=2)
         print(f"Config saved to '{cfg_path}'.")
 
@@ -459,6 +457,7 @@ class MiniGPT:
             hidden_layers = cfg["hidden_layers"],
             activation    = cfg["activation"],
             learning_rate = cfg["learning_rate"],
+            embed_dim     = cfg.get("embed_dim", 64),
         )
         model.tokenizer = CharTokenizer.load(tok_path)
 
@@ -472,7 +471,7 @@ class MiniGPT:
             use_embedding = True,
             vocab_size    = model.tokenizer.size,
             context_size  = model.context_size,
-            embed_dim     = 64,
+            embed_dim     = model.embed_dim,
         )
         model.nn.load_weights(weights_path)
         print("miniGPT loaded successfully.")
