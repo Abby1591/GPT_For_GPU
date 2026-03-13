@@ -76,7 +76,7 @@ class NeuralNetwork:
         output_size:   int,
         activation:    str   = "relu",
         learning_rate: float = 0.001,
-        batch_size:    int   = 512,
+        batch_size:    int   = 1024,
         use_embedding: bool  = True,
         vocab_size:    int   = 0,
         context_size:  int   = 0,
@@ -341,8 +341,9 @@ class NeuralNetwork:
               f"transformer=ON (blocks={self.num_blocks}, independent) | "
               f"causal=ON | all-positions=ON\n")
 
-        # ── Adaptive LR state ─────────────────────────────────────────────────
-        epoch_lr          = lr_max
+        # Skip warmup and use correct starting lr if resuming with Adam state
+        _resuming = self._adam_init and self._adam_t > 0
+        epoch_lr  = lr_max if not _resuming else self.learning_rate
         best_loss         = float("inf")
         plateau_count     = 0
         plateau_patience  = 5    # epochs without improvement before reducing
@@ -367,8 +368,8 @@ class NeuralNetwork:
         b_idx_full = np.arange(self.batch_size)[:, None]  # (B, 1) for full batches
 
         for epoch in range(epochs):
-            # ── Warmup for first 5 epochs ─────────────────────────────────────
-            if epoch < 5:
+            # ── Warmup for first 5 epochs (fresh training only) ───────────────
+            if not _resuming and epoch < 5:
                 epoch_lr = lr_max * (epoch + 1) / 5
                 lr_change_msg = ""
 
@@ -539,6 +540,12 @@ class NeuralNetwork:
 
     def save_weights(self, filename: str = "weights.json") -> None:
         to_list = (lambda w: np.asnumpy(w).tolist()) if _DEVICE == "gpu" else (lambda w: w.tolist())
+        # Save Adam buffers so resume continues smoothly
+        adam_blocks = []
+        if self._adam_init:
+            for buf in self._adam_blocks:
+                adam_blocks.append({k: {"m": to_list(v["m"]), "v": to_list(v["v"])}
+                                    for k, v in buf.items()})
         data = {
             "input_size": self.input_size, "hidden_layers": self.hidden_layers,
             "output_size": self.output_size, "activation": self.activation,
@@ -552,6 +559,17 @@ class NeuralNetwork:
             "pos_embedding": to_list(self.pos_embedding) if self.use_embedding else None,
             "Wout": to_list(self.Wout), "bout": to_list(self.bout),
             "blocks": [{k: to_list(v) for k, v in blk.items()} for blk in self.blocks],
+            # Adam state
+            "adam_t":       self._adam_t if self._adam_init else 0,
+            "adam_mWout":   to_list(self._mWout)  if self._adam_init else None,
+            "adam_vWout":   to_list(self._vWout)  if self._adam_init else None,
+            "adam_mbout":   to_list(self._mbout)  if self._adam_init else None,
+            "adam_vbout":   to_list(self._vbout)  if self._adam_init else None,
+            "adam_me":      to_list(self._me)     if (self._adam_init and self.use_embedding) else None,
+            "adam_ve":      to_list(self._ve)     if (self._adam_init and self.use_embedding) else None,
+            "adam_mpe":     to_list(self._mpe)    if (self._adam_init and self.use_embedding) else None,
+            "adam_vpe":     to_list(self._vpe)    if (self._adam_init and self.use_embedding) else None,
+            "adam_blocks":  adam_blocks,
         }
         with open(filename, "w") as f:
             json.dump(data, f, indent=2)
@@ -606,6 +624,24 @@ class NeuralNetwork:
                 })
         self._adam_init = False
         self._scale = 1.0 / (self.embed_dim ** 0.5)
+        # Restore Adam state if present (enables smooth resume)
+        if data.get("adam_t") and data["adam_t"] > 0:
+            self._init_adam()   # allocate buffers with correct shapes
+            self._adam_t = data["adam_t"]
+            self._mWout  = np.array(data["adam_mWout"])
+            self._vWout  = np.array(data["adam_vWout"])
+            self._mbout  = np.array(data["adam_mbout"])
+            self._vbout  = np.array(data["adam_vbout"])
+            if self.use_embedding and data.get("adam_me") is not None:
+                self._me  = np.array(data["adam_me"])
+                self._ve  = np.array(data["adam_ve"])
+                self._mpe = np.array(data["adam_mpe"])
+                self._vpe = np.array(data["adam_vpe"])
+            for i, buf in enumerate(data.get("adam_blocks", [])):
+                for k, mv in buf.items():
+                    self._adam_blocks[i][k]["m"] = np.array(mv["m"])
+                    self._adam_blocks[i][k]["v"] = np.array(mv["v"])
+            print(f"  Adam state restored (t={self._adam_t})")
         print(f"Weights loaded from '{filename}'.")
 
     def __repr__(self):

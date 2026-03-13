@@ -241,7 +241,11 @@ class MiniGPT:
 
         print("\nTokenizing corpus...")
         tokenizer = CharTokenizer(text)
-        self._build(tokenizer)
+        if self.nn is None:
+            self._build(tokenizer)
+        else:
+            self.tokenizer = tokenizer
+            self.nn.summary()
 
         encoded = tokenizer.encode(text)
         print(f"Vocab size : {tokenizer.size} characters")
