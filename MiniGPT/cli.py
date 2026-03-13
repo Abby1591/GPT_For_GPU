@@ -89,8 +89,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Learning rate. (default: 0.001)")
     tg.add_argument("--embed_dim",  type=int,   default=64,
                     help="Embedding dimensions. 64/128/256 (default: 64)")
+    tg.add_argument("--batch_size", type=int,   default=1024,
+                    help="Samples per gradient step. (default: 1024)")
+    tg.add_argument("--num_blocks", type=int,   default=2,
+                    help="Number of transformer blocks. (default: 2)")
     tg.add_argument("--max_chars",  type=int,   default=500_000,
                     help="Max chars to read from file. (default: 500000)")
+    tg.add_argument("--log_every",  type=int,   default=1,
+                    help="Print loss every N epochs. 0=silent. (default: 1)")
     tg.add_argument("--simple_vocab", action="store_true",
                     help="Strip text to lowercase a-z + space + basic punctuation (~36 chars). "
                          "Makes learning much easier for small models.")
@@ -164,12 +170,13 @@ def main() -> None:
             simple_vocab = args.simple_vocab,
             save_every   = args.save_every,
             save_path    = args.save,
+            log_every    = args.log_every,
         )
         model.save(args.save)
-        print("\n── Sample generation ──────────────────────────────────────────")
+        print("\n-- Sample generation --------------------------------------------------")
         print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature))
 
-    # ── Train from scratch ────────────────────────────────────────────────────
+    # ---- Train from scratch -------------------------------------------------
     elif args.train:
         model = MiniGPT(
             context_size  = args.context,
@@ -177,6 +184,8 @@ def main() -> None:
             activation    = args.activation,
             learning_rate = args.lr,
             embed_dim     = args.embed_dim,
+            batch_size    = args.batch_size,
+            num_blocks    = args.num_blocks,
         )
         model.train(
             args.train,
@@ -186,6 +195,7 @@ def main() -> None:
             simple_vocab = args.simple_vocab,
             save_every   = args.save_every,
             save_path    = args.save,
+            log_every    = args.log_every,
         )
         model.save(args.save)
         print("\n── Sample generation ──────────────────────────────────────────")

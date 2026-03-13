@@ -89,31 +89,46 @@ def make_index_arrays(
     max_samples:  int = 20_000,
 ):
     """
-    Build X_idx (T, N) and Y_idx (T, N) integer arrays directly from the
-    encoded corpus — no one-hot vectors, no Python sample list.
+    Build X_idx (T, N) and Y_idx (T, N) integer arrays from the encoded corpus.
 
-    This is 10-50x faster than make_samples() for large datasets because
-    it never allocates one-hot floats that train() would immediately decode
-    back to indices anyway.
+    No one-hot vectors, no Python sample loop — uses numpy stride tricks to
+    build all windows at once. 10-50x faster than make_samples() for large
+    datasets.
+
+    How it works
+    ------------
+    A sliding window of size context_size+1 moves through the corpus.
+    numpy's as_strided() creates a view of ALL windows simultaneously with
+    zero extra memory (just a different stride pattern over the same buffer).
+    We then sample evenly-spaced rows up to max_samples.
 
     :return: Tuple of (X_idx, Y_idx) as numpy int32 arrays, shape (T, N).
     """
     import numpy as _np
-    n              = len(encoded)
-    total_possible = n - context_size - 1
-    step           = max(1, total_possible // max_samples)
-    indices        = list(range(0, total_possible, step))[:max_samples]
-    N              = len(indices)
+    from numpy.lib.stride_tricks import as_strided
 
-    arr    = _np.array(encoded, dtype=_np.int32)
-    X_idx  = _np.zeros((context_size, N), dtype=_np.int32)
-    Y_idx  = _np.zeros((context_size, N), dtype=_np.int32)
+    arr = _np.array(encoded, dtype=_np.int32)
+    n   = len(arr)
+    W   = context_size + 1          # window width: T inputs + 1 target
 
-    for col, i in enumerate(indices):
-        window         = arr[i : i + context_size + 1]   # T+1 tokens
-        X_idx[:, col]  = window[:context_size]
-        Y_idx[:-1, col] = window[1:context_size]
-        Y_idx[-1,  col] = window[context_size]
+    # Build ALL windows via stride trick (zero-copy view)
+    # Shape: (n - W + 1, W)  -- each row is one sliding window
+    total_windows = n - W + 1
+    windows = as_strided(
+        arr,
+        shape   = (total_windows, W),
+        strides = (arr.strides[0], arr.strides[0]),
+    )
+
+    # Subsample evenly up to max_samples
+    step    = max(1, total_windows // max_samples)
+    windows = windows[::step][:max_samples]   # (N, W)
+    N       = len(windows)
+
+    # Split into inputs (first T cols) and targets (shifted by 1)
+    # Transpose to (T, N) layout expected by the training loop
+    X_idx = _np.ascontiguousarray(windows[:, :context_size].T)  # (T, N)
+    Y_idx = _np.ascontiguousarray(windows[:, 1:].T)              # (T, N)
 
     return X_idx, Y_idx
 

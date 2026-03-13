@@ -38,16 +38,17 @@ A character-level language model built on top of ``Neural_Network.py``.
     print(model.generate("Democracy is", length=200, temperature=0.7))
 """
 
-from model     import MiniGPT
-from tokenizer import CharTokenizer
-from data      import load_text, make_samples
+from .model     import MiniGPT
+from .tokenizer import CharTokenizer
+from .data      import load_text, make_samples, make_index_arrays
 
 __all__ = [
     "MiniGPT",
     "CharTokenizer",
     "load_text",
     "make_samples",
+    "make_index_arrays",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__  = "miniGPT project"

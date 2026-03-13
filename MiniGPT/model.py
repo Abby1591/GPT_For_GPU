@@ -50,20 +50,20 @@ class MiniGPT:
     .. code-block:: text
 
         Raw text
-            │
-            ▼
-        CharTokenizer          (character → integer index)
-            │
-            ▼
-        One-hot encoding       (index → flat binary vector)
-            │  context_size × vocab_size floats
-            ▼
+            |
+            v
+        CharTokenizer          (character -> integer index)
+            |
+            v
+        One-hot encoding       (index -> flat binary vector)
+            |  context_size x vocab_size floats
+            v
         NeuralNetwork          (your feedforward net)
-            │  hidden_layers with chosen activation
-            ▼
+            |  hidden_layers with chosen activation
+            v
         Softmax output         (probability over vocab_size characters)
-            │
-            ▼
+            |
+            v
         Sampled next character
 
     The model is trained as a multi-class classifier: given the last
@@ -73,7 +73,7 @@ class MiniGPT:
     :param context_size: How many preceding characters the model sees
         before predicting the next one.  Larger = more coherent output
         but slower training (input size grows linearly).
-        Good values: ``6`` (fast) – ``16`` (better quality).
+        Good values: ``6`` (fast) - ``16`` (better quality).
     :type context_size: int
 
     :param hidden_layers: Neuron counts for each hidden layer of the
@@ -88,11 +88,11 @@ class MiniGPT:
     :type activation: str
 
     :param learning_rate: Step size for each gradient update.
-        Too high → unstable training.  Too low → very slow learning.
+        Too high -> unstable training.  Too low -> very slow learning.
         Default: ``0.005``.
     :type learning_rate: float
 
-    **Quick example — train and generate:**
+    **Quick example -- train and generate:**
 
     .. code-block:: python
 
@@ -105,7 +105,7 @@ class MiniGPT:
         text = model.generate(prompt="Science is", length=200)
         print(text)
 
-    **Quick example — load and generate:**
+    **Quick example -- load and generate:**
 
     .. code-block:: python
 
@@ -120,12 +120,16 @@ class MiniGPT:
         activation:    str             = "relu",
         learning_rate: float           = 0.005,
         embed_dim:     int             = 64,
+        batch_size:    int             = 1024,
+        num_blocks:    int             = 2,
     ) -> None:
         self.context_size  = context_size
         self.hidden_layers = hidden_layers if hidden_layers is not None else [256, 128]
         self.activation    = activation
         self.learning_rate = learning_rate
         self.embed_dim     = embed_dim
+        self.batch_size    = batch_size
+        self.num_blocks    = num_blocks
 
         self.tokenizer: Optional[CharTokenizer] = None
         self.nn:        Optional[NeuralNetwork] = None
@@ -159,6 +163,8 @@ class MiniGPT:
             vocab_size    = tokenizer.size,
             context_size  = self.context_size,
             embed_dim     = self.embed_dim,
+            batch_size    = self.batch_size,
+            num_blocks    = self.num_blocks,
         )
         self.nn.summary()
 
@@ -178,9 +184,7 @@ class MiniGPT:
         save_path:    str   = "checkpoint.json",
     ) -> None:
         """
-        Train the model on a text string or a path to a ``.txt`` file.
-
-        Pass either raw text or a file path — the method detects which
+        Pass either raw text or a file path -- the method detects which
         you mean automatically (if the string ends in ``.txt`` and the
         file exists, it is loaded from disk).
 
@@ -195,8 +199,8 @@ class MiniGPT:
         :type text_or_path: str
 
         :param epochs: Full passes over the training samples.
-            More epochs → lower loss → better quality output, but slower.
-            Start with ``3–5`` and increase if output is incoherent.
+            More epochs -> lower loss -> better quality output, but slower.
+            Start with ``3-5`` and increase if output is incoherent.
         :type epochs: int
 
         :param max_samples: Maximum number of training examples to
@@ -213,14 +217,14 @@ class MiniGPT:
             Set to ``0`` to silence all output.
         :type log_every: int
 
-        **Example — train from file:**
+        **Example -- train from file:**
 
         .. code-block:: python
 
             model = MiniGPT(context_size=8, hidden_layers=[256, 128])
             model.train("wiki_dataset.txt", epochs=5, max_samples=30_000)
 
-        **Example — train from a string:**
+        **Example -- train from a string:**
 
         .. code-block:: python
 
@@ -237,13 +241,16 @@ class MiniGPT:
             before = len(set(text))
             text   = simplify_text(text)
             after  = len(set(text))
-            print(f"Simple vocab: reduced from {before} → {after} unique chars")
+            print(f"Simple vocab: reduced from {before} -> {after} unique chars")
 
         print("\nTokenizing corpus...")
         tokenizer = CharTokenizer(text)
         if self.nn is None:
+            # Fresh training: build a new NeuralNetwork with the known vocab size
             self._build(tokenizer)
         else:
+            # Resuming: keep the existing nn (weights + Adam state intact),
+            # just update the tokenizer reference and reprint the summary.
             self.tokenizer = tokenizer
             self.nn.summary()
 
@@ -255,7 +262,7 @@ class MiniGPT:
         index_data = make_index_arrays(encoded, self.context_size, max_samples)
         N = index_data[0].shape[1]
         print(f"Training samples : {N:,}")
-        print(f"Input dimension  : {self.context_size} × {tokenizer.size} = "
+        print(f"Input dimension  : {self.context_size} x {tokenizer.size} = "
               f"{self.context_size * tokenizer.size}")
 
         print(f"\nTraining for {epochs} epoch(s)...\n")
@@ -300,13 +307,13 @@ class MiniGPT:
 
         :param temperature: Controls how random the output is.
 
-            - ``< 1.0`` (e.g. ``0.5``) — more focused and repetitive.
+            - ``< 1.0`` (e.g. ``0.5``) -- more focused and repetitive.
               The model favours its top predictions strongly.
-            - ``1.0`` — unmodified probabilities.
-            - ``> 1.0`` (e.g. ``1.5``) — more diverse and creative, but
+            - ``1.0`` -- unmodified probabilities.
+            - ``> 1.0`` (e.g. ``1.5``) -- more diverse and creative, but
               also more likely to produce nonsense.
 
-            A value of ``0.7–0.9`` is usually a good starting point.
+            A value of ``0.7-0.9`` is usually a good starting point.
         :type temperature: float
 
         :return: The prompt (if any) followed by ``length`` generated
@@ -325,7 +332,7 @@ class MiniGPT:
             # Creative / varied output
             print(model.generate("Science", length=300, temperature=1.2))
 
-            # No seed — starts from a random character
+            # No seed -- starts from a random character
             print(model.generate(length=200))
         """
         if self.nn is None or self.tokenizer is None:
@@ -351,7 +358,7 @@ class MiniGPT:
             for idx in ctx:
                 features.extend(tok.one_hot(idx))
 
-            # Forward pass → raw probabilities
+            # Forward pass -> raw probabilities
             _, _, probs = self.nn.predict(features)
 
             # Temperature scaling
@@ -379,9 +386,9 @@ class MiniGPT:
 
         The three files saved are:
 
-        - ``<weights_path>``               — NeuralNetwork weights & biases.
-        - ``<weights_path>_tokenizer.json``— vocabulary list.
-        - ``<weights_path>_config.json``   — MiniGPT hyper-parameters.
+        - ``<weights_path>``               -- NeuralNetwork weights & biases.
+        - ``<weights_path>_tokenizer.json``-- vocabulary list.
+        - ``<weights_path>_config.json``   -- MiniGPT hyper-parameters.
 
         All three files are required to reload the model with
         :meth:`load`.
@@ -401,7 +408,7 @@ class MiniGPT:
             #          my_model_config.json
         """
         if self.nn is None:
-            print("Nothing to save — model has not been trained.")
+            print("Nothing to save -- model has not been trained.")
             return
 
         self.nn.save_weights(weights_path)
