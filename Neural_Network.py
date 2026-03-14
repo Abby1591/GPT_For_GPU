@@ -712,7 +712,10 @@ class NeuralNetwork:
                 self.save_weights(save_path)
                 print(f"  checkpoint saved -> {save_path}", flush=True)
 
-        print("Training complete.")
+        # Persist the final adaptive lr so the next resume starts exactly
+        # where this run left off instead of jumping back to the original lr.
+        self.learning_rate = epoch_lr
+        print(f"Training complete. (final lr={epoch_lr:.6f})")
 
     # ---- Predict ------------------------------------------------------------
 
