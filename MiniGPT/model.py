@@ -122,6 +122,10 @@ class MiniGPT:
         embed_dim:     int             = 64,
         batch_size:    int             = 1024,
         num_blocks:    int             = 2,
+        num_heads:     int             = 4,
+        dropout:       float           = 0.0,
+        weight_tying:  bool            = True,
+        grad_clip:     float           = 1.0,
     ) -> None:
         self.context_size  = context_size
         self.hidden_layers = hidden_layers if hidden_layers is not None else [256, 128]
@@ -130,6 +134,10 @@ class MiniGPT:
         self.embed_dim     = embed_dim
         self.batch_size    = batch_size
         self.num_blocks    = num_blocks
+        self.num_heads     = num_heads
+        self.dropout       = dropout
+        self.weight_tying  = weight_tying
+        self.grad_clip     = grad_clip
 
         self.tokenizer: Optional[CharTokenizer] = None
         self.nn:        Optional[NeuralNetwork] = None
@@ -165,6 +173,10 @@ class MiniGPT:
             embed_dim     = self.embed_dim,
             batch_size    = self.batch_size,
             num_blocks    = self.num_blocks,
+            num_heads     = self.num_heads,
+            dropout       = self.dropout,
+            weight_tying  = self.weight_tying,
+            grad_clip     = self.grad_clip,
         )
         self.nn.summary()
 
@@ -425,6 +437,11 @@ class MiniGPT:
                 "activation":    self.activation,
                 "learning_rate": self.learning_rate,
                 "embed_dim":     self.embed_dim,
+                "num_blocks":    self.num_blocks,
+                "num_heads":     self.num_heads,
+                "dropout":       self.dropout,
+                "weight_tying":  self.weight_tying,
+                "grad_clip":     self.grad_clip,
             }, f, indent=2)
         print(f"Config saved to '{cfg_path}'.")
 
@@ -471,7 +488,12 @@ class MiniGPT:
             hidden_layers = cfg["hidden_layers"],
             activation    = cfg["activation"],
             learning_rate = cfg["learning_rate"],
-            embed_dim     = cfg.get("embed_dim", 64),
+            embed_dim     = cfg.get("embed_dim",    64),
+            num_blocks    = cfg.get("num_blocks",   2),
+            num_heads     = cfg.get("num_heads",    1),
+            dropout       = cfg.get("dropout",      0.0),
+            weight_tying  = cfg.get("weight_tying", False),
+            grad_clip     = cfg.get("grad_clip",    1.0),
         )
         model.tokenizer = CharTokenizer.load(tok_path)
 

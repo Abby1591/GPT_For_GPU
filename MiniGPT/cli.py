@@ -93,6 +93,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Samples per gradient step. (default: 1024)")
     tg.add_argument("--num_blocks", type=int,   default=2,
                     help="Number of transformer blocks. (default: 2)")
+    tg.add_argument("--num_heads",  type=int,   default=4,
+                    help="Attention heads. embed_dim must be divisible by this. (default: 4)")
+    tg.add_argument("--dropout",    type=float, default=0.0,
+                    help="Dropout rate 0.0-0.5. 0=disabled. (default: 0.0)")
+    tg.add_argument("--no_weight_tying", action="store_true",
+                    help="Disable weight tying (separate Wout). Default: tying ON.")
+    tg.add_argument("--grad_clip",  type=float, default=1.0,
+                    help="Gradient clipping norm. 0=disabled. (default: 1.0)")
     tg.add_argument("--max_chars",  type=int,   default=500_000,
                     help="Max chars to read from file. (default: 500000)")
     tg.add_argument("--log_every",  type=int,   default=1,
@@ -102,6 +110,15 @@ def _build_parser() -> argparse.ArgumentParser:
                          "Makes learning much easier for small models.")
     tg.add_argument("--save_every",  type=int, default=0,
                     help="Save a checkpoint every N epochs. 0 = disabled. (default: 0)")
+    tg.add_argument("--force_lr",   type=float, default=None,
+                    help="Force learning rate to this value on resume, even if Adam state\n"
+                         "is present. Useful to restart from a higher lr after plateauing.\n"
+                         "WARNING: pair with --reset_adam if boosting lr by more than ~2x.\n"
+                         "E.g. --force_lr 0.0003")
+    tg.add_argument("--reset_adam", action="store_true",
+                    help="Wipe Adam momentum state on resume and start fresh.\n"
+                         "Use with --force_lr when boosting lr significantly.\n"
+                         "Without this, old momentum built at low lr causes loss spikes.")
 
     # ── Generation ────────────────────────────────────────────────────────────
     gg = p.add_argument_group("Generation options")
@@ -155,12 +172,26 @@ def main() -> None:
         print(f"Resuming from '{args.resume}'...")
         model = MiniGPT.load(args.resume)
 
-        # Override learning rate only if no Adam state (fresh resume)
-        if args.lr != 0.001 and not model.nn._adam_init:
+        # -- Learning rate override logic ------------------------------------
+        # --force_lr: hard override regardless of Adam state (intentional restart)
+        # --lr:       only applied if no Adam state (safe default behaviour)
+        if args.force_lr is not None:
+            old_lr = model.nn.learning_rate
+            model.nn.learning_rate = args.force_lr
+            print(f"Learning rate force-overridden: {old_lr:.6f} -> {args.force_lr:.6f}")
+        elif args.lr != 0.001 and not model.nn._adam_init:
             model.nn.learning_rate = args.lr
             print(f"Learning rate overridden to {args.lr}")
         elif args.lr != 0.001 and model.nn._adam_init:
-            print(f"Adam state restored — keeping saved lr, ignoring --lr {args.lr}")
+            print(f"Adam state restored -- keeping saved lr={model.nn.learning_rate:.6f}, ignoring --lr {args.lr}")
+
+        # --reset_adam: wipe momentum state so old gradients don't cause spikes.
+        # Critical when boosting lr by more than ~2x -- without this, momentum
+        # built at the old (low) lr gets applied at the new (high) lr, making
+        # the first few steps far too large and spiking the loss badly.
+        if args.reset_adam and model.nn._adam_init:
+            model.nn._adam_init = False  # forces _init_adam() on next train()
+            print(f"Adam state reset -- fresh momentum at lr={model.nn.learning_rate:.6f}")
 
         model.train(
             args.train,
@@ -186,6 +217,10 @@ def main() -> None:
             embed_dim     = args.embed_dim,
             batch_size    = args.batch_size,
             num_blocks    = args.num_blocks,
+            num_heads     = args.num_heads,
+            dropout       = args.dropout,
+            weight_tying  = not args.no_weight_tying,
+            grad_clip     = args.grad_clip,
         )
         model.train(
             args.train,

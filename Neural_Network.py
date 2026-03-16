@@ -1,20 +1,38 @@
 """
-Neural_Network.py  —  Mini-Transformer (causal, all-positions training)
-========================================================================
+Neural_Network.py  --  Mini-Transformer (GPT-2 inspired, character-level)
+=========================================================================
 
-Architecture
-------------
-tokens (B, T)
-  -> token embedding + positional encoding        (B, T, D)
-  -> N x transformer block (independent weights)  (B, T, D)   <- causal mask
-  -> linear projection at ALL positions           (B, T, vocab)
-  -> softmax -> probabilities
+New in this version vs the previous one
+----------------------------------------
+  - LayerNorm        : pre-norm before attention AND feed-forward per block,
+                       plus a final LayerNorm before the output projection.
+                       Stabilises training, especially with more blocks.
+  - Multi-head attn  : splits the embedding into H independent heads.
+                       Each head specialises on different patterns.
+  - Dropout          : randomly zeroes activations during training.
+                       Reduces overfitting on small datasets.
+  - Weight tying     : output projection Wout shares weights with the token
+                       embedding (embedding.T). Halves those parameter counts.
+  - Residual scaling : W2 (FF output) init scaled by 1/sqrt(2*num_blocks).
+                       Prevents the residual stream growing too large.
+  - Gradient clipping: caps global gradient norm before Adam update.
+                       Prevents a single bad batch from blowing up weights.
 
-Training signal
----------------
-Every token position predicts the next token simultaneously.
-A context window of length T produces T (input, target) pairs per sample,
-giving Tx more gradient signal than predicting only the final position.
+Architecture (one block)
+------------------------
+  x
+  |-- LayerNorm 1 --> multi-head attention --> dropout --> (+) --> x
+  |-- LayerNorm 2 --> feed-forward MLP     --> dropout --> (+) --> x
+
+Full stack
+----------
+  tokens (B, T)
+    -> token embedding + positional embedding         (B, T, D)
+    -> embedding dropout
+    -> N x transformer block (each with LN+MHA+FF)    (B, T, D)
+    -> final LayerNorm                                 (B, T, D)
+    -> output projection at ALL positions              (B, T, vocab)
+    -> softmax -> probabilities
 
 GPU setup
 ---------
@@ -27,11 +45,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
-# ---- GPU / CPU backend selection --------------------------------------------
-# We import CuPy as `np` so the rest of the code is device-agnostic.
-# If CuPy is unavailable we fall back to NumPy silently.
+# ---- GPU / CPU backend -------------------------------------------------------
+# Import CuPy as `np` so all array code is device-agnostic.
+# Falls back to NumPy silently if CuPy is not installed.
 try:
     import cupy as np
     np.cuda.Device(0).use()
@@ -40,20 +58,19 @@ try:
         f"GPU detected -- training on: "
         f"{np.cuda.runtime.getDeviceProperties(0)['name'].decode()}"
     )
-    # cupyx.scatter_add is the GPU equivalent of numpy.add.at used to
-    # accumulate embedding gradients without leaving the GPU.
+    # cupyx.scatter_add accumulates embedding gradients entirely on the GPU,
+    # avoiding the CPU round-trip that numpy.add.at would require.
     try:
         from cupyx import scatter_add as _scatter_add
     except Exception:
         _scatter_add = None
-
 except Exception:
     import numpy as np
     _DEVICE = "cpu"
     _scatter_add = None
     print("CuPy not found -- falling back to CPU (NumPy)")
 
-# CPU numpy is always needed for index operations that CuPy does not support.
+# CPU numpy is always needed for index operations CuPy does not support.
 import numpy as _np_cpu
 
 
@@ -62,9 +79,9 @@ ActivationName = Literal["sigmoid", "tanh", "relu", "leaky_relu"]
 Sample         = Tuple[List[float], int]
 
 
-# ---- Activation functions and their derivatives -----------------------------
-# Stored as (forward, derivative) pairs looked up by name.
-# All functions accept and return arrays (CuPy or NumPy).
+# ---- Activation functions and derivatives ------------------------------------
+# Each entry is (forward_fn, derivative_fn).
+# Derivative receives the PRE-activation value z (not the output a).
 
 def _relu(x):                  return np.maximum(0.0, x)
 def _relu_d(x):                return (x > 0).astype(float)
@@ -86,37 +103,51 @@ _ACTIVATIONS: Dict[str, tuple] = {
 }
 
 
-# ---- Main class --------------------------------------------------------------
+# ==============================================================================
+#  Main class
+# ==============================================================================
 
 class NeuralNetwork:
     """
-    Mini-GPT character-level transformer.
+    Character-level GPT-2-inspired transformer.
 
     Parameters
     ----------
     input_size : int
-        Flat input size (context_size x vocab_size when using embeddings).
+        Legacy flat input size. Ignored in the transformer path.
     hidden_layers : list[int]
-        Legacy dense hidden-layer widths (kept for save/load compatibility only).
+        Legacy dense widths. Kept for save/load backward compatibility.
     output_size : int
-        Vocabulary size -- number of classes in the softmax output.
+        Vocabulary size -- number of softmax output classes.
     activation : str
-        Activation for legacy dense layers. One of relu/tanh/sigmoid/leaky_relu.
+        Legacy activation name. One of relu/tanh/sigmoid/leaky_relu.
     learning_rate : float
-        Peak learning rate for Adam. The adaptive scheduler may reduce this.
+        Peak Adam learning rate. The adaptive scheduler may reduce this.
     batch_size : int
-        Samples processed per gradient step. Larger = faster on GPU, more VRAM.
+        Samples per gradient step.
     use_embedding : bool
-        If True, use a learned token + positional embedding layer.
+        Use learned token + positional embeddings (always True in practice).
     vocab_size : int
-        Number of unique tokens (characters). Required when use_embedding=True.
+        Characters in vocabulary.
     context_size : int
-        Sequence length T -- how many previous tokens the model sees at once.
+        Sequence length T.
     embed_dim : int
-        Width D of the embedding and all transformer hidden states.
+        Hidden dimension D. Must be divisible by num_heads.
     num_blocks : int
-        Number of transformer blocks stacked. Each block has independent weights
-        (no weight sharing). Default 2.
+        Transformer blocks stacked in series.
+    num_heads : int
+        Attention heads. D must be divisible by num_heads.
+        Each head works in a D/num_heads dimensional subspace.
+    dropout : float
+        Dropout rate (0 = disabled). Applied after attention and FF outputs,
+        and after the initial embedding. Ignored during generation.
+    weight_tying : bool
+        If True, the output projection reuses the token embedding matrix
+        (Wout = embedding.T). Halves those parameters and often improves
+        quality because the embedding and output spaces are aligned.
+    grad_clip : float
+        Max global gradient L2 norm before Adam update (0 = disabled).
+        Prevents a bad batch from taking a destructively large step.
     """
 
     def __init__(
@@ -132,6 +163,10 @@ class NeuralNetwork:
         context_size:  int   = 0,
         embed_dim:     int   = 64,
         num_blocks:    int   = 2,
+        num_heads:     int   = 4,
+        dropout:       float = 0.0,
+        weight_tying:  bool  = True,
+        grad_clip:     float = 1.0,
     ) -> None:
         if activation not in _ACTIVATIONS:
             raise ValueError(
@@ -140,7 +175,12 @@ class NeuralNetwork:
             )
         if not hidden_layers:
             raise ValueError("hidden_layers must have at least one entry.")
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
+            )
 
+        # Store all hyperparameters -- also written to save files.
         self.input_size    = input_size
         self.hidden_layers = hidden_layers
         self.output_size   = output_size
@@ -152,15 +192,23 @@ class NeuralNetwork:
         self.context_size  = context_size
         self.embed_dim     = embed_dim
         self.num_blocks    = num_blocks
+        self.num_heads     = num_heads
+        self.dropout       = dropout
+        self.weight_tying  = weight_tying
+        self.grad_clip     = grad_clip
         self.device        = _DEVICE
         self._act_fn, self._act_d = _ACTIVATIONS[activation]
 
+        # Head dimension: each head attends in a d_h-dimensional subspace.
+        # Scale for attention scores: 1/sqrt(d_h) keeps dot products from
+        # growing too large as d_h increases (prevents softmax saturation).
+        self._head_dim   = embed_dim // num_heads
+        self._scale_head = 1.0 / (self._head_dim ** 0.5)
+
         # ---- Token + positional embeddings ----------------------------------
-        # Token embedding: maps each vocab index to a D-dimensional vector.
-        #   Shape (vocab_size, D) -- one row per character.
-        # Positional embedding: adds position-specific info to each slot.
-        #   Shape (context_size, D) -- one row per position 0..T-1.
-        # Both are learned parameters updated by Adam like any other weight.
+        # Token embedding:    (vocab_size, D)  -- one row per character.
+        # Positional embedding: (context_size, D) -- one row per position.
+        # Both are learned and updated by Adam just like any weight matrix.
         if self.use_embedding:
             self.embedding     = np.random.randn(vocab_size, embed_dim) * 0.01
             self.pos_embedding = np.random.randn(context_size, embed_dim) * 0.01
@@ -168,252 +216,495 @@ class NeuralNetwork:
             self.embedding     = None
             self.pos_embedding = None
 
-        # ---- Attention scale factor -----------------------------------------
-        # Scaled dot-product attention divides Q.K^T by sqrt(D) before softmax.
-        # Without this, dot products grow large as D increases, pushing softmax
-        # into saturation and killing gradients. Precomputed to avoid recomputing
-        # every forward pass.
-        self._scale = 1.0 / (embed_dim ** 0.5)
-
         # ---- Transformer blocks ---------------------------------------------
-        # Each block:
-        #   Wqkv -- fused Q, K, V projection  (D, 3D)
-        #   W1,b1 -- feed-forward layer 1     (D, 4D) + bias (4D,)
-        #   W2,b2 -- feed-forward layer 2     (4D, D) + bias (D,)
+        # Each block holds its own independent weights -- no sharing across
+        # blocks. This allows each block to specialise on different patterns.
         #
-        # WHY FUSED Wqkv?
-        #   Separate Wq, Wk, Wv = 3 matmul kernel launches.
-        #   One (D, 3D) matrix = 1 launch -- ~3x faster on GPU where kernel
-        #   launch overhead dominates for these matrix sizes.
+        # Per block:
+        #   Wqkv     -- fused Q,K,V projection  (D, 3D)
+        #   W1, b1   -- FF layer 1              (D, 4D) + (4D,)
+        #   W2, b2   -- FF layer 2              (4D, D) + (D,)
+        #   ln1_g/b  -- LayerNorm 1 params      (D,) each
+        #   ln2_g/b  -- LayerNorm 2 params      (D,) each
         #
-        # WHY 4D IN FEED-FORWARD?
-        #   GPT-2 convention: D -> 4D -> D bottleneck lets the network combine
-        #   features in a high-dimensional space before projecting back.
-        #
-        # INITIALISATION: 0.02 std (GPT-2 convention, keeps activations scaled).
-        D = embed_dim
+        # W2 is scaled by 1/sqrt(2*num_blocks) on init (GPT-2 residual
+        # scaling). With N residual paths each adding variance, this keeps
+        # the total residual stream variance under control.
+        D            = embed_dim
+        resid_scale  = 0.02 / (2 * num_blocks) ** 0.5
         self.blocks: List[Dict] = []
-        for _ in range(self.num_blocks):
+        for _ in range(num_blocks):
             self.blocks.append({
                 "Wqkv": np.random.randn(D, D * 3) * 0.02,
                 "W1":   np.random.randn(D, D * 4) * 0.02,
                 "b1":   np.zeros(D * 4),
-                "W2":   np.random.randn(D * 4, D) * 0.02,
+                "W2":   np.random.randn(D * 4, D) * resid_scale,
                 "b2":   np.zeros(D),
+                # LayerNorm params: gamma (scale) init to 1, beta (shift) to 0.
+                # At init this is an identity transform -- the model learns
+                # to deviate from identity as training progresses.
+                "ln1_g": np.ones(D),
+                "ln1_b": np.zeros(D),
+                "ln2_g": np.ones(D),
+                "ln2_b": np.zeros(D),
             })
 
+        # ---- Final LayerNorm (GPT-2 style) ----------------------------------
+        # Applied once after all transformer blocks, before output projection.
+        # Ensures the final representations are well-scaled before the linear
+        # output layer reads them.
+        self.ln_f_g = np.ones(D)
+        self.ln_f_b = np.zeros(D)
+
         # ---- Output projection ----------------------------------------------
-        # Maps final hidden states (B, T, D) -> logits (B, T, vocab_size).
-        # Applied at ALL token positions so every position trains simultaneously.
-        self.Wout = np.random.randn(embed_dim, output_size) * 0.02
+        # Maps (B, T, D) -> (B, T, vocab) at ALL token positions.
+        #
+        # WEIGHT TYING: if enabled, Wout is not a separate matrix -- the
+        # forward pass computes x @ embedding.T instead of x @ Wout.
+        # Gradients from the output path accumulate into embedding's Adam
+        # buffers alongside gradients from the embedding lookup path.
+        # This works well because both mappings want similar directions:
+        # "character c" in input space and "predict character c" in output
+        # space are naturally related.
+        if weight_tying:
+            self.Wout = None    # no separate matrix; embedding.T used
+        else:
+            self.Wout = np.random.randn(D, output_size) * 0.02
         self.bout = np.zeros(output_size)
 
-        # ---- Legacy dense weights (backward compatibility ONLY) -------------
-        # Pre-transformer versions trained a plain MLP. These arrays are kept
-        # so old weight files can still be loaded. They are NOT used in the
-        # transformer forward/backward pass.
+        # ---- Legacy dense weights (backward compatibility only) -------------
+        # Old weight files contain these arrays. They are never trained or
+        # used in the transformer path -- only saved/loaded for compatibility.
         actual_input = context_size * embed_dim if self.use_embedding else input_size
         layer_sizes  = [actual_input] + hidden_layers + [output_size]
         self.weights = []
         self.biases  = []
         for i in range(len(layer_sizes) - 1):
             fan_in, fan_out = layer_sizes[i], layer_sizes[i + 1]
-            # Xavier/Glorot init: keeps variance ~1 across layers
-            scale = np.sqrt(2.0 / (fan_in + fan_out))
+            scale = np.sqrt(2.0 / (fan_in + fan_out))   # Xavier/Glorot
             self.weights.append(np.random.randn(fan_out, fan_in) * scale)
             self.biases.append(np.zeros((fan_out, 1)))
 
-        # Adam not initialised until first train() or load_weights() call
+        # Adam not initialised until first train() or load_weights() call.
         self._adam_init = False
 
-    # ---- Adam optimiser -----------------------------------------------------
+    # ==========================================================================
+    #  Adam optimiser
+    # ==========================================================================
 
     def _init_adam(self) -> None:
         """
-        Allocate zeroed momentum buffers for every learnable parameter.
+        Allocate zeroed first-moment (m) and second-moment (v) buffers for
+        every learnable parameter.
 
-        Adam keeps two running averages per parameter:
-          m -- first moment  (exponential moving average of gradient)
-          v -- second moment (exponential moving average of gradient^2)
+        Adam update rule (per parameter):
+            m  = beta1*m + (1-beta1)*grad          -- smoothed gradient
+            v  = beta2*v + (1-beta2)*grad^2        -- smoothed squared grad
+            theta -= lr * m_hat / (sqrt(v_hat)+eps)
 
-        These adapt the effective lr per-parameter: large-gradient parameters
-        get smaller steps; noisy/small-gradient ones get larger steps.
-
-        Calling this resets _adam_t to 0. When resuming, load_weights() calls
-        this first for allocation, then overwrites the buffers from the file.
+        m and v together form the "Adam state". Saving and restoring them
+        on resume means the optimizer does NOT forget the momentum it built
+        up over hundreds of epochs -- a clean resume with no warmup needed.
         """
         z = np.zeros_like
+
+        # Per-block buffers (includes LN params since they are in blk dict)
         self._adam_blocks = []
         for blk in self.blocks:
             self._adam_blocks.append(
                 {k: {"m": z(v), "v": z(v)} for k, v in blk.items()}
             )
-        self._mWout = z(self.Wout);  self._vWout = z(self.Wout)
+
+        # Final LayerNorm buffers
+        self._m_ln_f_g = z(self.ln_f_g);  self._v_ln_f_g = z(self.ln_f_g)
+        self._m_ln_f_b = z(self.ln_f_b);  self._v_ln_f_b = z(self.ln_f_b)
+
+        # Output projection buffers (only when NOT weight-tying)
+        if not self.weight_tying:
+            self._mWout = z(self.Wout);  self._vWout = z(self.Wout)
         self._mbout = z(self.bout);  self._vbout = z(self.bout)
+
+        # Embedding buffers
         if self.use_embedding:
             self._me  = z(self.embedding);      self._ve  = z(self.embedding)
             self._mpe = z(self.pos_embedding);  self._vpe = z(self.pos_embedding)
-        self._adam_t    = 0     # global step counter (for bias correction)
+
+        self._adam_t    = 0     # global step counter -- used for bias correction
         self._adam_init = True
 
-    # ---- Causal mask ---------------------------------------------------------
+    # ==========================================================================
+    #  LayerNorm
+    # ==========================================================================
+
+    def _ln_forward(self, x, gamma, beta, eps=1e-5):
+        """
+        Layer Normalisation forward pass.
+
+        Normalises the LAST axis (the embedding dimension D) independently
+        for each (batch, position) pair, then applies learned scale (gamma)
+        and shift (beta).
+
+        Formula:
+            x_norm = (x - mean) / sqrt(var + eps)
+            out    = gamma * x_norm + beta
+
+        WHY LAYERNORM?
+        Without normalisation, activations can grow or shrink as they
+        pass through blocks, making the loss landscape spiky and hard to
+        optimise. LayerNorm keeps each token's representation on a
+        consistent scale regardless of the input magnitude.
+
+        WHY PRE-NORM (before attention/FF)?
+        Post-norm (GPT-1 style) normalises the residual stream AFTER adding
+        back. Pre-norm (GPT-2 style) normalises BEFORE, leaving the residual
+        connection clean. Pre-norm trains more stably at larger depth.
+
+        Cache stores what backward needs:
+            x_norm -- normalised input (needed for d_gamma, d_x)
+            gamma  -- scale parameter (needed for d_x_norm)
+            rstd   -- 1/sqrt(var+eps) (needed for d_x rescaling)
+            N      -- last dimension size (D)
+        """
+        mean   = x.mean(axis=-1, keepdims=True)      # (B, T, 1)
+        var    = x.var(axis=-1, keepdims=True)        # (B, T, 1) biased
+        rstd   = 1.0 / np.sqrt(var + eps)             # (B, T, 1)
+        x_norm = (x - mean) * rstd                   # (B, T, D)
+        out    = gamma * x_norm + beta               # (B, T, D)
+        return out, (x_norm, gamma, rstd, x.shape[-1])
+
+    def _ln_backward(self, d_out, cache):
+        """
+        Layer Normalisation backward pass.
+
+        Derivation (normalising over last axis of size N):
+            d_gamma = sum(d_out * x_norm, over B and T dims)
+            d_beta  = sum(d_out,          over B and T dims)
+            d_x_norm = d_out * gamma
+            d_x = rstd/N * (N*d_x_norm
+                            - sum(d_x_norm, axis=-1, keepdims=True)
+                            - x_norm * sum(d_x_norm * x_norm, axis=-1, keepdims=True))
+
+        The last formula is the standard Jacobian-vector product for the
+        normalisation step. It accounts for the fact that changing any x_i
+        affects the mean and variance used to normalise ALL x_j in that row.
+        """
+        x_norm, gamma, rstd, N = cache
+
+        # Parameter gradients: sum over batch and time dims
+        d_gamma = (d_out * x_norm).sum(axis=(0, 1))    # (D,)
+        d_beta  = d_out.sum(axis=(0, 1))               # (D,)
+
+        # Gradient through normalisation
+        d_x_norm = d_out * gamma                       # (B, T, D)
+        d_x = (rstd / N) * (
+            N * d_x_norm
+            - d_x_norm.sum(axis=-1, keepdims=True)
+            - x_norm * (d_x_norm * x_norm).sum(axis=-1, keepdims=True)
+        )                                               # (B, T, D)
+        return d_x, d_gamma, d_beta
+
+    # ==========================================================================
+    #  Dropout
+    # ==========================================================================
+
+    def _apply_dropout(self, x, training: bool):
+        """
+        Inverted dropout: zero out random activations during training,
+        then SCALE UP the survivors by 1/(1-rate) so the expected sum
+        is unchanged.
+
+        At inference (training=False) or if dropout=0, returns x unchanged
+        and mask=None.
+
+        WHY INVERTED SCALING?
+        Without scaling, the average activation magnitude at inference is
+        (1-rate) times what it was during training. Inverted dropout fixes
+        this by scaling during training, so inference needs no adjustment.
+        """
+        if not training or self.dropout == 0.0:
+            return x, None
+        # Bernoulli mask: 1 with probability (1-dropout), 0 otherwise
+        mask = (np.random.rand(*x.shape) > self.dropout).astype(float)
+        mask /= (1.0 - self.dropout)   # inverted scaling
+        return x * mask, mask
+
+    # ==========================================================================
+    #  Causal mask
+    # ==========================================================================
 
     def _causal_mask(self, T: int):
         """
-        Upper-triangular mask: prevents each position from attending to future
-        positions. Shape (T, T). Entry [i,j] = -1e9 if j > i, else 0.
+        Upper-triangular mask of shape (T, T).
+        Entry [i, j] = -1e9 if j > i (future position), else 0.
 
-        Adding to attention scores before softmax zeroes out future weights --
-        the "causal" property required for autoregressive generation.
-        Cached per T: rebuilt only when context size changes (never in practice).
+        Adding this to attention scores before softmax drives attention to
+        future positions to ~0, enforcing the "causal" property:
+        position i can only attend to positions 0..i.
+
+        This is what allows autoregressive generation -- the model is
+        trained to never see future tokens, so it cannot at generation time.
+
+        Cached: only rebuilt when T changes (never in practice).
         """
         if not hasattr(self, "_mask_cache") or self._mask_cache.shape[0] != T:
-            # triu(k=1) gives the strict upper triangle (diagonal excluded)
             self._mask_cache = np.triu(np.ones((T, T)), k=1) * -1e9
         return self._mask_cache
 
-    # ---- Transformer block: forward -----------------------------------------
+    # ==========================================================================
+    #  Transformer block: forward
+    # ==========================================================================
 
-    def _block_forward(self, x, blk):
+    def _block_forward(self, x, blk, training: bool = False):
         """
-        One causal transformer block. Input/output shape: (B, T, D).
+        One causal transformer block with pre-norm and multi-head attention.
 
-        Steps
-        -----
-        1. Fused QKV projection     x @ Wqkv -> split into Q, K, V
-        2. Scaled dot-product attn  softmax(QK^T/sqrt(D) + mask) * V
-        3. Residual add             x = x + attn_out
-        4. Feed-forward             h = ReLU(x @ W1 + b1); ff = h @ W2 + b2
-        5. Residual add             x = x + ff
+        Shape throughout: (B, T, D)
 
-        WHY RESIDUALS?
-        Without them gradients must flow through every layer in full, causing
-        vanishing gradients in deep networks. Residuals provide a direct
-        gradient highway from the loss back to each block's input.
+        Flow
+        ----
+        x
+        |--> LN1 --> multi-head attention --> dropout --> (+) --> x
+        |--> LN2 --> feed-forward MLP     --> dropout --> (+) --> x
 
-        NOTE: x_attn is NOT stored in cache -- it is recomputed cheaply in
-        backward (x + attn_out) to save VRAM.
+        Multi-head attention
+        --------------------
+        Instead of one big attention over D dimensions, we run H smaller
+        attentions each over D/H dimensions (called d_h).
+
+        WHY MULTIPLE HEADS?
+        Each head can learn a different "what to attend to" pattern.
+        Head 0 might learn word boundaries, head 1 might learn repeated
+        characters, head 2 might track vowel/consonant alternation, etc.
+        With a single head, all of this must be crammed into one pattern.
+
+        The scale is now 1/sqrt(d_h), NOT 1/sqrt(D). This is important:
+        with D=256, H=4, d_h=64, scale = 1/8 instead of 1/16.
+
+        What is saved in cache
+        ----------------------
+        Everything needed by backward. x_attn is NOT saved -- recomputed
+        cheaply from x + attn_out to save VRAM.
         """
-        B, T, D = x.shape
-        W1, b1, W2, b2 = blk["W1"], blk["b1"], blk["W2"], blk["b2"]
+        B, T, D  = x.shape
+        H        = self.num_heads
+        d_h      = D // H                  # dimension per head
+        BT       = B * T
 
-        # Fused QKV: one matmul instead of three kernel launches
-        QKV = x.reshape(B * T, D) @ blk["Wqkv"]          # (BT, 3D)
-        QKV = QKV.reshape(B, T, 3, D)
-        Q   = QKV[:, :, 0, :]                             # (B, T, D)
-        K   = QKV[:, :, 1, :]
-        V   = QKV[:, :, 2, :]
+        # ---- Pre-norm 1: normalise before attention -------------------------
+        ln1_out, ln1_cache = self._ln_forward(x, blk["ln1_g"], blk["ln1_b"])
 
-        # Scaled dot-product attention with numerical stability (subtract max)
-        scores  = np.matmul(Q, K.transpose(0, 2, 1)) * self._scale  # (B, T, T)
-        scores += self._causal_mask(T)
-        scores -= scores.max(axis=2, keepdims=True)
+        # ---- Fused multi-head QKV projection --------------------------------
+        # One (D, 3D) matmul produces all of Q, K, V for all heads at once.
+        # Reshape to (B, T, 3, H, d_h) then move heads axis forward.
+        QKV = (ln1_out.reshape(BT, D) @ blk["Wqkv"]).reshape(B, T, 3, H, d_h)
+        Q = QKV[:, :, 0].transpose(0, 2, 1, 3)    # (B, H, T, d_h)
+        K = QKV[:, :, 1].transpose(0, 2, 1, 3)
+        V = QKV[:, :, 2].transpose(0, 2, 1, 3)
+
+        # ---- Scaled dot-product attention (per head) ------------------------
+        # scores[b, h, i, j] = how much position i in head h attends to j
+        scores  = Q @ K.transpose(0, 1, 3, 2) * self._scale_head  # (B, H, T, T)
+        scores += self._causal_mask(T)                              # block future
+        scores -= scores.max(axis=-1, keepdims=True)                # stable softmax
         exp_s   = np.exp(scores)
-        A       = exp_s / exp_s.sum(axis=2, keepdims=True)          # (B, T, T)
+        A       = exp_s / exp_s.sum(axis=-1, keepdims=True)         # (B, H, T, T)
 
-        attn_out = np.matmul(A, V)                                   # (B, T, D)
-        x_attn   = x + attn_out                                      # residual
+        # Weighted sum of values, then merge heads back to (B, T, D)
+        attn_h   = A @ V                                            # (B, H, T, d_h)
+        attn_out = attn_h.transpose(0, 2, 1, 3).reshape(B, T, D)   # (B, T, D)
 
-        # Feed-forward: D -> 4D (ReLU) -> D
-        h      = np.maximum(0.0, x_attn @ W1 + b1)  # (B, T, 4D)
-        ff_out = h @ W2 + b2                          # (B, T, D)
-        x_out  = x_attn + ff_out                      # residual
+        # Attention dropout (only during training)
+        attn_out, drop1_mask = self._apply_dropout(attn_out, training)
 
-        cache = (x, Q, K, V, A, attn_out, h, ff_out)  # x_attn omitted
+        # Residual 1: add attention output back to original x
+        x_attn = x + attn_out
+
+        # ---- Pre-norm 2: normalise before feed-forward ----------------------
+        ln2_out, ln2_cache = self._ln_forward(x_attn, blk["ln2_g"], blk["ln2_b"])
+
+        # ---- Feed-forward network: D -> 4D (ReLU) -> D ----------------------
+        # The 4x expansion gives the network a high-dimensional workspace
+        # to combine features before projecting back to D.
+        h      = np.maximum(0.0, ln2_out @ blk["W1"] + blk["b1"])  # (B, T, 4D)
+        ff_out = h @ blk["W2"] + blk["b2"]                          # (B, T, D)
+
+        # FF dropout (only during training)
+        ff_out, drop2_mask = self._apply_dropout(ff_out, training)
+
+        # Residual 2: add FF output back
+        x_out = x_attn + ff_out
+
+        # Save everything backward needs (x_attn omitted -- recomputed)
+        cache = (
+            x, ln1_out, ln1_cache,
+            Q, K, V, A,
+            attn_out, drop1_mask,
+            x_attn, ln2_out, ln2_cache,
+            h, ff_out, drop2_mask,
+        )
         return x_out, cache
 
-    # ---- Transformer block: backward ----------------------------------------
+    # ==========================================================================
+    #  Transformer block: backward
+    # ==========================================================================
 
     def _block_backward(self, d_out, cache, blk):
         """
-        Backprop through one causal transformer block.
+        Backprop through one transformer block.
 
         d_out : upstream gradient  (B, T, D)
-        Returns (d_x, grads_dict).
+        Returns (d_x, grads_dict) where d_x is passed to the previous block.
 
-        Key tricks
-        ----------
-        * x_attn recomputed from cache instead of stored -- saves VRAM.
-        * Fused Wqkv backward: concatenate dQ, dK, dV into (BT, 3D), then
-          one matmul each direction instead of three.
-        * Softmax backward: dS = A * (d_A - sum(d_A*A)) -- standard
-          Jacobian-vector product, avoids building the full Jacobian.
+        Residual rule
+        -------------
+        For any residual  out = a + f(a):
+            d_a += d_out          (direct path through residual)
+            d_a += d_f(a)         (path through the function)
+        Both gradients are summed because out depends on a twice.
+
+        Multi-head attention backward
+        -----------------------------
+        The forward merged H heads. Backward splits d_attn_out back into
+        H head-gradients, backprops through each head's softmax and Q/K/V
+        matmuls, then concatenates and does the fused Wqkv backward.
+
+        LayerNorm backward
+        ------------------
+        Called via _ln_backward() which returns gradients for x, gamma, beta.
         """
-        x, Q, K, V, A, attn_out, h, ff_out = cache
+        (
+            x, ln1_out, ln1_cache,
+            Q, K, V, A,
+            attn_out, drop1_mask,
+            x_attn, ln2_out, ln2_cache,
+            h, ff_out, drop2_mask,
+        ) = cache
+
         B, T, D = x.shape
-        W1, W2  = blk["W1"], blk["W2"]
+        H       = self.num_heads
+        d_h     = D // H
         BT      = B * T
 
-        x_attn = x + attn_out   # recompute rather than store
+        # ---- Residual 2 backward --------------------------------------------
+        # d_out flows through BOTH the direct residual (to x_attn) AND the
+        # FF branch. Both paths receive the full d_out.
+        d_ff_out   = d_out * drop2_mask if drop2_mask is not None else d_out
 
-        # Feed-forward backward
-        # d_out flows through residual (direct pass) AND ff branch (W2->ReLU->W1)
-        dW2      = h.reshape(BT, -1).T @ d_out.reshape(BT, -1)    # (4D, D)
-        db2      = d_out.sum(axis=(0, 1))                           # (D,)
-        d_h      = d_out @ W2.T                                     # (B, T, 4D)
-        d_h     *= (h > 0)                                          # ReLU derivative
-        dW1      = x_attn.reshape(BT, -1).T @ d_h.reshape(BT, -1)  # (D, 4D)
-        db1      = d_h.sum(axis=(0, 1))                             # (4D,)
-        # Gradient into x_attn: residual branch (d_out) + FF branch
-        d_x_attn = d_out + d_h @ W1.T                              # (B, T, D)
+        # FF backward
+        dW2     = h.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)    # (4D, D)
+        db2     = d_ff_out.sum(axis=(0, 1))                           # (D,)
+        d_h     = d_ff_out @ blk["W2"].T                              # (B, T, 4D)
+        d_h    *= (h > 0)                                             # ReLU deriv
+        dW1     = ln2_out.reshape(BT, -1).T @ d_h.reshape(BT, -1)   # (D, 4D)
+        db1     = d_h.sum(axis=(0, 1))                                # (4D,)
+        d_ln2_out = d_h @ blk["W1"].T                                 # (B, T, D)
 
-        # Attention backward
-        d_A = np.matmul(d_x_attn, V.transpose(0, 2, 1))            # (B, T, T)
-        dV  = np.matmul(A.transpose(0, 2, 1), d_x_attn)            # (B, T, D)
-        # Softmax Jacobian-vector product
-        dS  = A * (d_A - (d_A * A).sum(axis=2, keepdims=True))     # (B, T, T)
-        dS *= self._scale
-        dQ  = np.matmul(dS, K)                                      # (B, T, D)
-        dK  = np.matmul(dS.transpose(0, 2, 1), Q)                   # (B, T, D)
+        # LN2 backward: returns gradient into x_attn + LN parameter grads
+        d_x_attn_from_ff, d_ln2_g, d_ln2_b = self._ln_backward(d_ln2_out, ln2_cache)
 
-        # Fused Wqkv backward: concat dQ,dK,dV -> one matmul each direction
-        x_r    = x.reshape(BT, D)
-        dQKV_r = np.concatenate(
-            [dQ.reshape(BT, D), dK.reshape(BT, D), dV.reshape(BT, D)], axis=1
-        )                                                            # (BT, 3D)
-        dWqkv  = x_r.T @ dQKV_r                                     # (D, 3D)
+        # Combine: x_attn gradient = residual path (d_out) + FF path
+        d_x_attn = d_out + d_x_attn_from_ff
 
-        Wqkv = blk["Wqkv"]
-        d_x  = (
-            np.matmul(dQ, Wqkv[:, :D].T)      +
-            np.matmul(dK, Wqkv[:, D:2*D].T)   +
-            np.matmul(dV, Wqkv[:, 2*D:].T)    +
-            d_x_attn                            # residual connection gradient
+        # ---- Residual 1 backward --------------------------------------------
+        d_attn_out = d_x_attn * drop1_mask if drop1_mask is not None else d_x_attn
+
+        # Multi-head attention backward
+        # Reshape d_attn_out from (B,T,D) back to per-head (B,H,T,d_h)
+        d_attn_h = (
+            d_attn_out.reshape(B, T, H, d_h).transpose(0, 2, 1, 3)  # (B, H, T, d_h)
         )
 
-        grads = {"Wqkv": dWqkv, "W1": dW1, "b1": db1, "W2": dW2, "b2": db2}
+        # Backward through A @ V = attn_h
+        dA = d_attn_h @ V.transpose(0, 1, 3, 2)                # (B, H, T, T)
+        dV = A.transpose(0, 1, 3, 2) @ d_attn_h                # (B, H, T, d_h)
+
+        # Softmax Jacobian-vector product:
+        #   dS = A * (dA - sum(dA*A, axis=-1, keepdims=True))
+        # This avoids building the full (T,T) Jacobian matrix.
+        dS  = A * (dA - (dA * A).sum(axis=-1, keepdims=True))  # (B, H, T, T)
+        dS *= self._scale_head
+
+        # Backward through Q @ K^T
+        dQ = dS @ K                                             # (B, H, T, d_h)
+        dK = dS.transpose(0, 1, 3, 2) @ Q                      # (B, H, T, d_h)
+
+        # Reshape back: (B, H, T, d_h) -> (B, T, H, d_h) -> (BT, D)
+        dQ_r = dQ.transpose(0, 2, 1, 3).reshape(BT, D)
+        dK_r = dK.transpose(0, 2, 1, 3).reshape(BT, D)
+        dV_r = dV.transpose(0, 2, 1, 3).reshape(BT, D)
+
+        # Fused Wqkv backward: one matmul instead of three
+        ln1_out_r = ln1_out.reshape(BT, D)
+        dQKV_r    = np.concatenate([dQ_r, dK_r, dV_r], axis=1)  # (BT, 3D)
+        dWqkv     = ln1_out_r.T @ dQKV_r                          # (D, 3D)
+        d_ln1_out = (dQKV_r @ blk["Wqkv"].T).reshape(B, T, D)    # (B, T, D)
+
+        # LN1 backward
+        d_x_from_attn, d_ln1_g, d_ln1_b = self._ln_backward(d_ln1_out, ln1_cache)
+
+        # Total gradient into x: residual path + attention path
+        d_x = d_x_attn + d_x_from_attn
+
+        grads = {
+            "Wqkv":  dWqkv,
+            "W1":    dW1,  "b1": db1,
+            "W2":    dW2,  "b2": db2,
+            "ln1_g": d_ln1_g, "ln1_b": d_ln1_b,
+            "ln2_g": d_ln2_g, "ln2_b": d_ln2_b,
+        }
         return d_x, grads
 
-    # ---- Full forward pass --------------------------------------------------
+    # ==========================================================================
+    #  Full forward pass
+    # ==========================================================================
 
-    def _transformer_forward(self, token_idx_batch):
+    def _transformer_forward(self, token_idx_batch, training: bool = False):
         """
-        Complete forward pass from token indices to probabilities.
+        Complete forward pass from token indices to softmax probabilities.
 
-        token_idx_batch : int array (T, B)
-        Returns probs (B, T, vocab) and cache tuple for backward.
+        token_idx_batch : int array  (T, B)
+        training        : bool  -- enables dropout when True
+
+        Returns probs (B, T, vocab) and a cache tuple needed by the backward.
         """
-        toks = token_idx_batch.T                               # (B, T)
+        toks = token_idx_batch.T                                   # (B, T)
 
-        # Token embedding lookup + positional embedding.
-        # pos_embedding (T, D) broadcasts over batch dimension automatically.
-        x = self.embedding[toks] + self.pos_embedding          # (B, T, D)
+        # Token embedding lookup + positional embedding (broadcast over B)
+        x = self.embedding[toks] + self.pos_embedding              # (B, T, D)
 
+        # Embedding dropout: randomly zero full embedding vectors.
+        # Applied to the sum of token + position embeddings.
+        x, emb_drop_mask = self._apply_dropout(x, training)
+
+        # Transformer blocks
         block_caches = []
         for blk in self.blocks:
-            x, cache = self._block_forward(x, blk)
+            x, cache = self._block_forward(x, blk, training=training)
             block_caches.append(cache)
 
-        # Project ALL T positions to vocab logits at once
-        logits  = x @ self.Wout + self.bout                    # (B, T, vocab)
-        logits -= logits.max(axis=2, keepdims=True)            # stable softmax
-        e       = np.exp(logits)
-        probs   = e / e.sum(axis=2, keepdims=True)             # (B, T, vocab)
+        # Final LayerNorm: normalise before output projection
+        x, ln_f_cache = self._ln_forward(x, self.ln_f_g, self.ln_f_b)
 
-        return probs, (toks, x, block_caches)
+        # Output projection at ALL T positions simultaneously.
+        # Weight tying: use embedding.T instead of a separate Wout matrix.
+        if self.weight_tying:
+            logits = x @ self.embedding.T + self.bout              # (B, T, vocab)
+        else:
+            logits = x @ self.Wout + self.bout                     # (B, T, vocab)
+
+        # Numerically stable softmax (subtract max before exp)
+        logits -= logits.max(axis=2, keepdims=True)
+        e      = np.exp(logits)
+        probs  = e / e.sum(axis=2, keepdims=True)                  # (B, T, vocab)
+
+        return probs, (toks, x, block_caches, ln_f_cache, emb_drop_mask)
 
     def forward(self, inputs):
-        """Single-sample forward pass for text generation (last position only)."""
+        """
+        Single-sample forward pass used by generate().
+        training=False so dropout is disabled.
+        Returns last-position probabilities for the next character.
+        """
         if self.use_embedding:
             arr  = np.array(inputs, dtype=float).reshape(
                 self.context_size, self.vocab_size
@@ -421,12 +712,12 @@ class NeuralNetwork:
             toks = np.array(arr.argmax(axis=1), dtype=int).reshape(
                 self.context_size, 1
             )
-            probs, _ = self._transformer_forward(toks)
+            probs, _ = self._transformer_forward(toks, training=False)
             if _DEVICE == "gpu":
                 probs = np.asnumpy(probs)
-            return None, None, probs[0, -1, :]
+            return None, None, probs[0, -1, :]   # last position only
 
-        # Legacy MLP path
+        # Legacy MLP path (non-embedding models)
         X = np.array(inputs, dtype=float).reshape(-1, 1)
         a = X; zs = []; activations = [a]
         for i in range(len(self.hidden_layers)):
@@ -438,7 +729,9 @@ class NeuralNetwork:
         p     = e / e.sum(axis=0, keepdims=True)
         return zs, activations, p[:, 0]
 
-    # ---- Training loop ------------------------------------------------------
+    # ==========================================================================
+    #  Training loop
+    # ==========================================================================
 
     def train(
         self,
@@ -449,40 +742,41 @@ class NeuralNetwork:
         save_path:  str = "checkpoint.json",
     ) -> None:
         """
-        Train with batched gradient descent, Adam, and adaptive LR.
+        Train with batched gradient descent + Adam + adaptive LR.
 
         Parameters
         ----------
         data : tuple (X_idx, Y_idx) or legacy list of (features, label)
-            Preferred: index arrays from make_index_arrays() -- avoids
-            allocating one-hot floats that are decoded back to indices anyway.
+            Preferred format: index arrays from make_index_arrays() -- avoids
+            allocating one-hot floats that would be decoded back anyway.
         epochs : int
             Full passes over the training data.
         log_every : int
             Print loss every N epochs (0 = silent).
         save_every : int
-            Checkpoint every N epochs (0 = disabled). Uses ATOMIC WRITES --
-            interrupted saves never corrupt the target file.
+            Checkpoint every N epochs using atomic writes (0 = disabled).
 
-        Adaptive LR schedule
-        --------------------
-        Warmup (fresh only):
-            Epochs 0-4 ramp lr from lr/5 -> lr_max. Skipped on resume.
-        Bounce:
-            Loss up for bounce_patience=2 consecutive epochs -> lr *= 0.7.
-        Plateau:
-            No new best loss for plateau_patience=5 epochs -> lr *= 0.7.
-            Floored at lr_max / 5.
+        Gradient clipping
+        -----------------
+        Before each Adam update, the global L2 norm of ALL gradients is
+        computed. If it exceeds grad_clip, every gradient tensor is scaled
+        down proportionally so the norm equals grad_clip exactly.
+        This prevents a single bad batch from taking a destructively
+        large weight update step.
 
-        Adam notes
-        ----------
-        Bias correction is computed ONCE per epoch and baked into lr_eff:
-            lr_eff = epoch_lr * sqrt(1-beta2^t) / (1-beta1^t)
-        This avoids recomputing two power operations per parameter tensor.
+        Adaptive LR
+        -----------
+        Warmup (fresh training only, epochs 0-4):
+            Ramp lr from lr/5 -> lr_max. Skipped on resume because Adam
+            already has built-up momentum estimates.
+        Bounce (loss increases 2+ consecutive epochs):
+            lr *= 0.7  -- model overshot, take smaller steps.
+        Plateau (no new best for 5 epochs):
+            lr *= 0.7  -- model stuck, try finer steps.
+        Floored at lr_max / 5.
 
-        Gradient buffers are allocated ONCE before the loop and zeroed
-        in-place each epoch (buf[...] = 0.0), avoiding thousands of GPU
-        memory allocations that would each force a CUDA sync.
+        At the end of training, self.learning_rate is updated to the final
+        adaptive lr so that the next resume starts from the right value.
         """
         if not self._adam_init:
             self._init_adam()
@@ -495,12 +789,13 @@ class NeuralNetwork:
 
         print("  Loading dataset onto device...")
 
-        # Fast path: index arrays from make_index_arrays() (no one-hot floats)
+        # ---- Data ingestion -------------------------------------------------
+        # Fast path: make_index_arrays() returns (T,N) int32 arrays directly.
+        # Legacy path: decode one-hot samples back to indices.
         if isinstance(data, tuple) and len(data) == 2 and hasattr(data[0], "shape"):
             X_idx_cpu, Y_idx_cpu = data
             n = X_idx_cpu.shape[1]
         else:
-            # Legacy: decode one-hot -> indices
             n = len(data)
             X_idx_cpu = _np_cpu.zeros((ctx_size, n), dtype=_np_cpu.int32)
             Y_idx_cpu = _np_cpu.zeros((ctx_size, n), dtype=_np_cpu.int32)
@@ -511,24 +806,26 @@ class NeuralNetwork:
                 Y_idx_cpu[:-1, j]  = toks[1:]
                 Y_idx_cpu[-1,  j]  = label
 
-        X_idx = np.array(X_idx_cpu)   # move to GPU if CuPy
+        # Move entire dataset to GPU once (no-op on CPU)
+        X_idx = np.array(X_idx_cpu)
         Y_idx = np.array(Y_idx_cpu)
 
+        dp_str = f"{self.dropout:.2f}" if self.dropout > 0 else "OFF"
         print(
             f"  {_DEVICE.upper()} ready -- {n:,} samples | "
-            f"batch={self.batch_size} | optimizer=Adam+adaptive | "
-            f"lr={lr_max:.5f} (bounce*0.7, plateau*0.7, min={lr_min:.5f}) | "
-            f"embed={'ON' if self.use_embedding else 'OFF'} | "
-            f"transformer=ON (blocks={self.num_blocks}, independent) | "
-            f"causal=ON | all-positions=ON\n"
+            f"batch={self.batch_size} | lr={lr_max:.5f} | "
+            f"heads={self.num_heads} | dropout={dp_str} | "
+            f"weight_tying={'ON' if self.weight_tying else 'OFF'} | "
+            f"grad_clip={self.grad_clip if self.grad_clip > 0 else 'OFF'}\n"
         )
 
-        # Resume detection: if Adam state was restored (_adam_t > 0), skip
-        # warmup and start at the saved learning rate immediately.
+        # ---- Resume detection -----------------------------------------------
+        # If Adam state was loaded (_adam_t > 0), skip warmup and use the
+        # saved lr directly -- no need to re-ramp from scratch.
         _resuming = self._adam_init and self._adam_t > 0
         epoch_lr  = lr_max if not _resuming else self.learning_rate
 
-        # Adaptive LR state
+        # ---- Adaptive LR state ----------------------------------------------
         best_loss        = float("inf")
         plateau_count    = 0
         plateau_patience = 5
@@ -539,31 +836,43 @@ class NeuralNetwork:
         prev_loss        = float("inf")
         lr_change_msg    = ""
 
-        # Pre-allocate gradient accumulation buffers (zeroed in-place each epoch)
+        # ---- Pre-allocate gradient buffers ----------------------------------
+        # Allocated once, zeroed in-place each epoch (buf[...] = 0.0).
+        # Avoids thousands of GPU memory allocations and CUDA syncs.
         blk_grad_acc = [
             {k: np.zeros_like(v) for k, v in blk.items()}
             for blk in self.blocks
         ]
-        dWout_acc = np.zeros_like(self.Wout)
+        # Final LN gradient buffers
+        d_ln_f_g_acc = np.zeros_like(self.ln_f_g)
+        d_ln_f_b_acc = np.zeros_like(self.ln_f_b)
+
+        # Output projection / embedding gradient buffers
+        # With weight tying, dWout folds into de_acc (same matrix).
+        if not self.weight_tying:
+            dWout_acc = np.zeros_like(self.Wout)
         dbout_acc = np.zeros_like(self.bout)
         de_acc    = np.zeros_like(self.embedding)     if self.use_embedding else None
         dpe_acc   = np.zeros_like(self.pos_embedding) if self.use_embedding else None
 
-        # Hoisted loop constants (never change -- computing inside loop wastes cycles)
+        # ---- Hoisted constants (never change inside the loop) ---------------
         T          = ctx_size
-        t_idx      = np.arange(T)[None, :]                # (1, T)
-        b_idx_full = np.arange(self.batch_size)[:, None]  # (B, 1)
+        t_idx      = np.arange(T)[None, :]
+        b_idx_full = np.arange(self.batch_size)[:, None]
 
+        # ================================================================
+        #  Epoch loop
+        # ================================================================
         for epoch in range(epochs):
 
-            # Warmup: linearly ramp lr from lr/5 -> lr_max over first 5 epochs.
-            # Prevents large updates before Adam momentum has warmed up.
-            # Skipped when resuming (Adam already has good momentum estimates).
+            # Warmup: ramp lr linearly over first 5 epochs (fresh only).
+            # Adam's momentum estimates are unreliable at step 0 (initialised
+            # to zero), so large early steps can point in noisy directions.
             if not _resuming and epoch < 5:
                 epoch_lr      = lr_max * (epoch + 1) / 5
                 lr_change_msg = ""
 
-            # GPU-side shuffle: stays on the device, avoids CPU<->GPU round-trip
+            # GPU-side shuffle avoids moving data off GPU for index generation
             idx_np = np.random.permutation(n)
             X_shuf = X_idx[:, idx_np]
             Y_shuf = Y_idx[:, idx_np]
@@ -571,104 +880,197 @@ class NeuralNetwork:
             total_loss   = 0.0
             self._adam_t += 1
 
-            # Zero grad buffers in-place (no allocations)
+            # Zero all gradient buffers in-place (no allocations)
             for acc in blk_grad_acc:
                 for a in acc.values():
                     a[...] = 0.0
-            dWout_acc[...] = 0.0
+            d_ln_f_g_acc[...] = 0.0
+            d_ln_f_b_acc[...] = 0.0
+            if not self.weight_tying:
+                dWout_acc[...] = 0.0
             dbout_acc[...] = 0.0
             if self.use_embedding:
                 de_acc[...]  = 0.0
                 dpe_acc[...] = 0.0
 
+            # ================================================================
+            #  Mini-batch loop
+            # ================================================================
             for start in range(0, n, self.batch_size):
                 end = min(start + self.batch_size, n)
                 bs  = end - start
                 Xb  = X_shuf[:, start:end]    # (T, B)
                 Yb  = Y_shuf[:, start:end]    # (T, B)
 
-                probs, (toks, x_out, block_caches) = self._transformer_forward(Xb)
+                # Forward pass (training=True enables dropout)
+                probs, (toks, x_out, block_caches, ln_f_cache, emb_drop_mask) = (
+                    self._transformer_forward(Xb, training=True)
+                )
 
                 Yb_T  = Yb.T
                 b_idx = (b_idx_full if bs == self.batch_size
                          else np.arange(bs)[:, None])
 
-                # Cross-entropy loss: gather p at correct token, take -log
-                # No one-hot allocation needed -- index directly into probs.
+                # ---- Cross-entropy loss -------------------------------------
+                # Gather predicted probability at the correct next token.
+                # -log(p_correct) is the cross-entropy for one (batch, pos).
                 correct_probs = probs[b_idx, t_idx, Yb_T]
                 total_loss   += float(-np.sum(np.log(correct_probs + 1e-9)))
                 del correct_probs
 
-                # Softmax gradient simplification: delta = (p - one_hot(y)) / (B*T)
-                # Computed in-place on probs buffer -- no extra allocation.
+                # ---- Softmax + cross-entropy gradient -----------------------
+                # The combined gradient simplifies to:
+                #   delta[b,t,c] = (p[b,t,c] - 1[c==y[b,t]]) / (B*T)
+                # Computed in-place on the probs buffer -- no extra allocation.
                 probs[b_idx, t_idx, Yb_T] -= 1.0
                 probs *= 1.0 / (bs * T)
                 delta  = probs    # alias, not a copy
 
-                # Output layer gradients
-                dWout_acc += x_out.reshape(bs * T, -1).T @ delta.reshape(bs * T, -1)
-                dbout_acc += delta.sum(axis=(0, 1))
-                d_x        = delta @ self.Wout.T
-                del probs, x_out  # free VRAM immediately
+                # ---- Output projection backward ----------------------------
+                bs_T = bs * T
+                delta_r = delta.reshape(bs_T, vs)
+                x_out_r = x_out.reshape(bs_T, D)
 
-                # Backprop through transformer blocks in reverse order
+                if self.weight_tying:
+                    # Gradient to embedding from the output path:
+                    #   logits = x @ embedding.T  =>  d_embedding += delta.T @ x
+                    de_acc  += delta_r.T @ x_out_r                   # (vocab, D)
+                    d_x      = (delta_r @ self.embedding).reshape(bs, T, D)
+                else:
+                    dWout_acc += x_out_r.T @ delta_r                  # (D, vocab)
+                    d_x        = delta.reshape(bs, T, D) @ self.Wout.T
+
+                dbout_acc += delta.sum(axis=(0, 1))
+                del probs, x_out
+
+                # ---- Final LayerNorm backward -------------------------------
+                d_x, d_lg, d_lb = self._ln_backward(d_x, ln_f_cache)
+                d_ln_f_g_acc += d_lg
+                d_ln_f_b_acc += d_lb
+
+                # ---- Backprop through transformer blocks (reverse) ----------
                 for i, (cache, blk) in enumerate(
                     zip(reversed(block_caches), reversed(self.blocks))
                 ):
                     d_x, grads = self._block_backward(d_x, cache, blk)
-                    del cache    # free as we go to keep VRAM low
+                    del cache    # free VRAM as we go
                     acc = blk_grad_acc[self.num_blocks - 1 - i]
                     for k in grads:
                         acc[k] += grads[k]
                 del block_caches
 
-                # Embedding gradients
-                # pos_embedding: sum d_x over batch (same position, all samples)
-                # token embedding: scatter-add because multiple tokens in a batch
-                #   may map to the same vocab row (must accumulate, not assign).
-                if self.use_embedding:
-                    dpe_acc += d_x.sum(axis=0)
+                # ---- Embedding gradients ------------------------------------
+                # Apply embedding dropout gradient (if dropout was used)
+                if emb_drop_mask is not None:
+                    d_x = d_x * emb_drop_mask
 
+                if self.use_embedding:
+                    # Positional embedding: same position across all samples,
+                    # so sum d_x over the batch dimension.
+                    dpe_acc += d_x.sum(axis=0)                       # (T, D)
+
+                    # Token embedding: scatter-add because multiple tokens in
+                    # the same batch may map to the same vocab row.
                     if _DEVICE == "gpu" and _scatter_add is not None:
-                        # Stays entirely on GPU
-                        _scatter_add(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
+                        _scatter_add(de_acc, toks.reshape(-1),
+                                     d_x.reshape(-1, D))
                     elif _DEVICE == "gpu":
-                        # Fallback: move to CPU, add.at, move back
                         d_x_cpu  = np.asnumpy(d_x)
                         toks_cpu = np.asnumpy(toks)
                         de_cpu   = np.asnumpy(de_acc)
-                        _np_cpu.add.at(de_cpu, toks_cpu.reshape(-1), d_x_cpu.reshape(-1, D))
-                        de_acc   = np.array(de_cpu)
+                        _np_cpu.add.at(de_cpu, toks_cpu.reshape(-1),
+                                       d_x_cpu.reshape(-1, D))
+                        de_acc = np.array(de_cpu)
                     else:
-                        _np_cpu.add.at(de_acc, toks.reshape(-1), d_x.reshape(-1, D))
+                        _np_cpu.add.at(de_acc, toks.reshape(-1),
+                                       d_x.reshape(-1, D))
 
-            # Adam updates
-            # Fused bias correction: lr_eff = epoch_lr * sqrt(1-b2^t) / (1-b1^t)
-            # Computed ONCE per epoch, not once per parameter tensor.
+            # ================================================================
+            #  Gradient clipping
+            # ================================================================
+            # Compute the global L2 norm of ALL gradient tensors combined.
+            # If it exceeds grad_clip, scale every tensor down proportionally.
+            #
+            # WHY GLOBAL (not per-parameter)?
+            # Per-parameter clipping distorts the relative gradient directions.
+            # Global clipping preserves the direction -- it just shortens the
+            # overall step if it would be too large.
+            if self.grad_clip > 0:
+                all_grads = []
+                for acc in blk_grad_acc:
+                    for g in acc.values():
+                        all_grads.append(g.reshape(-1))
+                all_grads += [d_ln_f_g_acc.reshape(-1), d_ln_f_b_acc.reshape(-1)]
+                all_grads.append(dbout_acc.reshape(-1))
+                if not self.weight_tying:
+                    all_grads.append(dWout_acc.reshape(-1))
+                if self.use_embedding:
+                    all_grads += [de_acc.reshape(-1), dpe_acc.reshape(-1)]
+
+                # Sum of squared norms across all tensors
+                total_norm_sq = sum(float(np.sum(g * g)) for g in all_grads)
+                total_norm    = total_norm_sq ** 0.5
+
+                if total_norm > self.grad_clip:
+                    # Scale factor < 1 -- shrink all gradients uniformly
+                    scale = self.grad_clip / (total_norm + 1e-6)
+                    for acc in blk_grad_acc:
+                        for k in acc:
+                            acc[k] *= scale
+                    d_ln_f_g_acc *= scale
+                    d_ln_f_b_acc *= scale
+                    dbout_acc    *= scale
+                    if not self.weight_tying:
+                        dWout_acc *= scale
+                    if self.use_embedding:
+                        de_acc  *= scale
+                        dpe_acc *= scale
+
+            # ================================================================
+            #  Adam parameter updates
+            # ================================================================
+            # Bias correction is computed once per epoch and baked into lr_eff
+            # rather than recomputed per-parameter-tensor (saves ~16 power ops).
+            #   lr_eff = epoch_lr * sqrt(1 - beta2^t) / (1 - beta1^t)
             t      = self._adam_t
-            bc1    = 1.0 - 0.9   ** t
-            bc2    = 1.0 - 0.999 ** t
+            bc1    = 1.0 - 0.9   ** t    # (1 - beta1^t)
+            bc2    = 1.0 - 0.999 ** t    # (1 - beta2^t)
             lr_eff = epoch_lr * (bc2 ** 0.5) / bc1
 
             def _adam_step(param, grad, m, v):
-                """In-place Adam update. No allocations."""
-                m *= 0.9;   m += 0.1   * grad
-                v *= 0.999; v += 0.001 * grad * grad
+                """In-place Adam update. Zero allocations."""
+                m *= 0.9;   m += 0.1   * grad          # update m (momentum)
+                v *= 0.999; v += 0.001 * grad * grad   # update v (velocity)
                 param -= lr_eff * m / (np.sqrt(v) + 1e-8)
 
-            for blk, acc, adam_buf in zip(self.blocks, blk_grad_acc, self._adam_blocks):
+            # Update all block parameters
+            for blk, acc, adam_buf in zip(
+                self.blocks, blk_grad_acc, self._adam_blocks
+            ):
                 for k in blk:
                     _adam_step(blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"])
-            _adam_step(self.Wout, dWout_acc, self._mWout, self._vWout)
+
+            # Update final LN
+            _adam_step(self.ln_f_g, d_ln_f_g_acc, self._m_ln_f_g, self._v_ln_f_g)
+            _adam_step(self.ln_f_b, d_ln_f_b_acc, self._m_ln_f_b, self._v_ln_f_b)
+
+            # Update output projection (separate matrix only if not weight-tied)
+            if not self.weight_tying:
+                _adam_step(self.Wout, dWout_acc, self._mWout, self._vWout)
             _adam_step(self.bout, dbout_acc, self._mbout, self._vbout)
+
+            # Update embeddings
             if self.use_embedding:
                 _adam_step(self.embedding,     de_acc,  self._me,  self._ve)
                 _adam_step(self.pos_embedding, dpe_acc, self._mpe, self._vpe)
 
-            # Adaptive LR scheduler
+            # ================================================================
+            #  Adaptive LR scheduler
+            # ================================================================
             if epoch >= 5:
                 lr_change_msg = ""
                 if total_loss > prev_loss:
+                    # Loss went up -- model is bouncing over a minimum
                     bounce_count  += 1
                     plateau_count  = 0
                     if bounce_count >= bounce_patience:
@@ -698,9 +1100,10 @@ class NeuralNetwork:
                         plateau_count = 0
             prev_loss = total_loss
 
+            # ---- Logging ----------------------------------------------------
             if log_every and epoch % log_every == 0:
-                # equiv = average cross-entropy per (sample, position) pair.
-                # Comparable across different context lengths / dataset sizes.
+                # equiv = mean cross-entropy per (sample, position) pair.
+                # Comparable across runs with different context lengths.
                 equiv = total_loss / (n * ctx_size)
                 print(
                     f"Epoch {epoch:>6} | Loss: {total_loss:.2f}  "
@@ -708,79 +1111,99 @@ class NeuralNetwork:
                     flush=True,
                 )
 
+            # ---- Checkpoint -------------------------------------------------
             if save_every and epoch > 0 and epoch % save_every == 0:
                 self.save_weights(save_path)
                 print(f"  checkpoint saved -> {save_path}", flush=True)
 
-        # Persist the final adaptive lr so the next resume starts exactly
-        # where this run left off instead of jumping back to the original lr.
+        # Persist final adaptive lr so the next resume starts exactly here
         self.learning_rate = epoch_lr
         print(f"Training complete. (final lr={epoch_lr:.6f})")
 
-    # ---- Predict ------------------------------------------------------------
+    # ==========================================================================
+    #  Predict (generation)
+    # ==========================================================================
 
     def predict(self, inputs) -> Tuple[int, float, "np.ndarray"]:
-        """Run forward pass. Returns (predicted_class, confidence, probs)."""
+        """Run forward pass (no dropout). Returns (class, confidence, probs)."""
         _, _, probs = self.forward(inputs)
         if _DEVICE == "gpu":
             probs = np.asnumpy(probs)
         predicted_class = int(probs.argmax())
         return predicted_class, float(probs[predicted_class]), probs
 
-    # ---- Summary ------------------------------------------------------------
+    # ==========================================================================
+    #  Summary
+    # ==========================================================================
 
     def summary(self) -> None:
         """Print a formatted table of model architecture and parameter counts."""
         blk    = self.blocks[0]
         attn_p = blk["Wqkv"].size
-        ff_p   = blk["W1"].size + blk["b1"].size + blk["W2"].size + blk["b2"].size
-        out_p  = self.Wout.size + self.bout.size
+        ff_p   = (blk["W1"].size + blk["b1"].size +
+                  blk["W2"].size + blk["b2"].size)
+        ln_p   = (blk["ln1_g"].size + blk["ln1_b"].size +
+                  blk["ln2_g"].size + blk["ln2_b"].size)
+        ln_f_p = self.ln_f_g.size + self.ln_f_b.size
+        out_p  = (0 if self.weight_tying else self.Wout.size) + self.bout.size
         emb_p  = (self.embedding.size + self.pos_embedding.size
                   if self.use_embedding else 0)
-        total  = (attn_p + ff_p) * self.num_blocks + out_p + emb_p
-        width  = 52
+        total  = (attn_p + ff_p + ln_p) * self.num_blocks + ln_f_p + out_p + emb_p
+
+        width  = 56
         device = "GPU (CuPy)" if _DEVICE == "gpu" else "CPU (NumPy)"
         D      = self.embed_dim
+        d_h    = self._head_dim
 
         print("+" + "=" * width + "+")
         print("|" + " Mini-Transformer Summary".center(width) + "|")
         print("+" + "=" * width + "+")
-        print(f"|  {'Device':<16} | {device:<{width-22}}|")
-        print(f"|  {'Optimizer':<16} | {'Adam + adaptive LR':<{width-22}}|")
-        print(f"|  {'Batch size':<16} | {self.batch_size:<{width-22}}|")
+        print(f"|  {'Device':<18} | {device:<{width-24}}|")
+        print(f"|  {'Optimizer':<18} | {'Adam + adaptive LR':<{width-24}}|")
+        print(f"|  {'Batch size':<18} | {self.batch_size:<{width-24}}|")
         if self.use_embedding:
             edim = f"{self.vocab_size} chars x {D}d  context={self.context_size}"
-            print(f"|  {'Embedding':<16} | {edim:<{width-22}}|")
-        print(f"|  {'Blocks':<16} | {str(self.num_blocks) + ' (independent)':<{width-22}}|")
-        attn_str = f"causal, fused Wqkv {D}x{D*3} ({attn_p} params/block)"
+            print(f"|  {'Embedding':<18} | {edim:<{width-24}}|")
+        blk_str = f"{self.num_blocks} blocks  heads={self.num_heads}  d_head={d_h}"
+        print(f"|  {'Architecture':<18} | {blk_str:<{width-24}}|")
+        attn_str = f"causal MHA {D}x{D*3} ({attn_p} params/block)"
         ff_str   = f"{D}->{D*4}->{D} ({ff_p} params/block)"
-        print(f"|  {'Attention':<16} | {attn_str:<{width-22}}|")
-        print(f"|  {'Feed-forward':<16} | {ff_str:<{width-22}}|")
-        print(f"|  {'Output':<16} | {'all positions -> ' + str(self.output_size):<{width-22}}|")
-        print(f"|  {'Vectorised':<16} | {'ON (batch matmul)':<{width-22}}|")
+        ln_str   = f"pre-norm x2/block + final LN ({ln_p + ln_f_p} params)"
+        print(f"|  {'Attention':<18} | {attn_str:<{width-24}}|")
+        print(f"|  {'Feed-forward':<18} | {ff_str:<{width-24}}|")
+        print(f"|  {'LayerNorm':<18} | {ln_str:<{width-24}}|")
+        wt_str   = "ON (embedding.T)" if self.weight_tying else "OFF (separate)"
+        dp_str   = f"{self.dropout:.2f}" if self.dropout > 0 else "OFF"
+        gc_str   = f"{self.grad_clip}" if self.grad_clip > 0 else "OFF"
+        print(f"|  {'Weight tying':<18} | {wt_str:<{width-24}}|")
+        print(f"|  {'Dropout':<18} | {dp_str:<{width-24}}|")
+        print(f"|  {'Grad clip':<18} | {gc_str:<{width-24}}|")
+        print(f"|  {'Output':<18} | {'all positions -> ' + str(self.output_size):<{width-24}}|")
         print("+" + "=" * width + "+")
         pad = width - 23 - len(f"{total:,}")
-        print(f"|  Total parameters: {total:,}{'':<{pad}}|")
+        print(f"|  Total parameters: {total:,}{'':<{pad}}  |")
         print("+" + "=" * width + "+")
 
-    # ---- Save ---------------------------------------------------------------
+    # ==========================================================================
+    #  Save
+    # ==========================================================================
 
     def save_weights(self, filename: str = "weights.json") -> None:
         """
-        Save all weights, biases, and Adam state to a JSON file.
+        Save all weights, Adam state, and hyperparameters to JSON.
 
-        ATOMIC WRITE: saves to a temp file first, then renames over the target.
-        A Colab disconnect or OOM mid-save leaves the previous checkpoint intact
-        rather than producing a corrupt file.
+        ATOMIC WRITE: writes to a temp file first, then renames atomically.
+        If Colab disconnects mid-save, the previous checkpoint remains intact.
 
-        No indentation (indent=None): files are ~4x smaller (~50MB vs 220MB).
-        Loads identically -- just less human-readable.
+        Files are written without indentation (compact JSON) to keep them
+        ~4x smaller than pretty-printed versions (~50MB vs ~200MB).
         """
         to_list = (
             (lambda w: np.asnumpy(w).tolist()) if _DEVICE == "gpu"
             else (lambda w: w.tolist())
         )
 
+        # Serialize per-block Adam state (includes LN param buffers)
         adam_blocks = []
         if self._adam_init:
             for buf in self._adam_blocks:
@@ -790,6 +1213,7 @@ class NeuralNetwork:
                 )
 
         data = {
+            # ---- Hyperparameters ----------------------------------------
             "input_size":    self.input_size,
             "hidden_layers": self.hidden_layers,
             "output_size":   self.output_size,
@@ -801,53 +1225,75 @@ class NeuralNetwork:
             "context_size":  self.context_size,
             "embed_dim":     self.embed_dim,
             "num_blocks":    self.num_blocks,
+            "num_heads":     self.num_heads,
+            "dropout":       self.dropout,
+            "weight_tying":  self.weight_tying,
+            "grad_clip":     self.grad_clip,
             "device":        _DEVICE,
-            "weights":       [to_list(w) for w in self.weights],
-            "biases":        [to_list(b) for b in self.biases],
+            # ---- Legacy dense weights (compat) --------------------------
+            "weights": [to_list(w) for w in self.weights],
+            "biases":  [to_list(b) for b in self.biases],
+            # ---- Embeddings ---------------------------------------------
             "embedding":     to_list(self.embedding)     if self.use_embedding else None,
             "pos_embedding": to_list(self.pos_embedding) if self.use_embedding else None,
-            "Wout":          to_list(self.Wout),
-            "bout":          to_list(self.bout),
-            "blocks":        [{k: to_list(v) for k, v in blk.items()}
-                              for blk in self.blocks],
-            "adam_t":        self._adam_t if self._adam_init else 0,
-            "adam_mWout":    to_list(self._mWout) if self._adam_init else None,
-            "adam_vWout":    to_list(self._vWout) if self._adam_init else None,
-            "adam_mbout":    to_list(self._mbout) if self._adam_init else None,
-            "adam_vbout":    to_list(self._vbout) if self._adam_init else None,
-            "adam_me":       to_list(self._me)  if (self._adam_init and self.use_embedding) else None,
-            "adam_ve":       to_list(self._ve)  if (self._adam_init and self.use_embedding) else None,
-            "adam_mpe":      to_list(self._mpe) if (self._adam_init and self.use_embedding) else None,
-            "adam_vpe":      to_list(self._vpe) if (self._adam_init and self.use_embedding) else None,
-            "adam_blocks":   adam_blocks,
+            # ---- Transformer weights ------------------------------------
+            "Wout": to_list(self.Wout) if not self.weight_tying else None,
+            "bout": to_list(self.bout),
+            "ln_f_g": to_list(self.ln_f_g),
+            "ln_f_b": to_list(self.ln_f_b),
+            "blocks": [{k: to_list(v) for k, v in blk.items()}
+                       for blk in self.blocks],
+            # ---- Adam state ---------------------------------------------
+            "adam_t":      self._adam_t if self._adam_init else 0,
+            "adam_mWout":  to_list(self._mWout) if (self._adam_init and not self.weight_tying) else None,
+            "adam_vWout":  to_list(self._vWout) if (self._adam_init and not self.weight_tying) else None,
+            "adam_mbout":  to_list(self._mbout) if self._adam_init else None,
+            "adam_vbout":  to_list(self._vbout) if self._adam_init else None,
+            "adam_me":     to_list(self._me)  if (self._adam_init and self.use_embedding) else None,
+            "adam_ve":     to_list(self._ve)  if (self._adam_init and self.use_embedding) else None,
+            "adam_mpe":    to_list(self._mpe) if (self._adam_init and self.use_embedding) else None,
+            "adam_vpe":    to_list(self._vpe) if (self._adam_init and self.use_embedding) else None,
+            "adam_m_ln_f_g": to_list(self._m_ln_f_g) if self._adam_init else None,
+            "adam_v_ln_f_g": to_list(self._v_ln_f_g) if self._adam_init else None,
+            "adam_m_ln_f_b": to_list(self._m_ln_f_b) if self._adam_init else None,
+            "adam_v_ln_f_b": to_list(self._v_ln_f_b) if self._adam_init else None,
+            "adam_blocks": adam_blocks,
         }
 
-        # Atomic write: temp file -> rename (os.replace is atomic on Linux + Windows)
+        # Atomic write: temp file in same dir, then os.replace (atomic on Linux)
         dir_name = os.path.dirname(os.path.abspath(filename))
         tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
         try:
             with os.fdopen(tmp_fd, "w") as f:
-                json.dump(data, f)           # no indent = 4x smaller
+                json.dump(data, f)           # no indent = 4x smaller file
             os.replace(tmp_path, filename)   # atomic rename
         except Exception:
-            os.unlink(tmp_path)              # clean up on failure
+            os.unlink(tmp_path)              # clean up temp on failure
             raise
 
         print(f"Weights saved to '{filename}'.")
 
-    # ---- Load ---------------------------------------------------------------
+    # ==========================================================================
+    #  Load
+    # ==========================================================================
 
     def load_weights(self, filename: str = "weights.json") -> None:
         """
-        Load weights and (optionally) Adam state from a JSON file.
+        Load weights, hyperparameters, and Adam state from a JSON file.
 
-        Handles three legacy formats:
-          1. Current: fused Wqkv per block
-          2. Old: separate Wq/Wk/Wv per block -> merged on load
-          3. Very old: single shared Wq/Wk/Wv -> replicated per block
+        Backward compatibility
+        ----------------------
+        Handles four weight file formats:
+          1. Current  : LN params, multi-head, weight tying, final LN
+          2. Previous : no LN, single-head (num_heads=1), separate Wout
+          3. Old      : separate Wq/Wk/Wv per block -> merged on load
+          4. Very old : single shared Wq/Wk/Wv -> replicated per block
 
-        Adam state (adam_t > 0) is restored fully so that resuming training
-        skips warmup and continues with correct momentum estimates.
+        When loading an old file into the new architecture:
+          - LN params are initialised to identity (gamma=1, beta=0).
+            These are essentially no-ops initially and will be learned.
+          - num_heads defaults to 1 (single-head, safe for old Wqkv shapes).
+          - weight_tying defaults to False (old files have a separate Wout).
         """
         if not os.path.exists(filename):
             print(f"No weights file found at '{filename}'.")
@@ -856,6 +1302,7 @@ class NeuralNetwork:
         with open(filename) as f:
             data = json.load(f)
 
+        # ---- Restore hyperparameters ----------------------------------------
         self.input_size    = data["input_size"]
         self.hidden_layers = data["hidden_layers"]
         self.output_size   = data["output_size"]
@@ -867,20 +1314,46 @@ class NeuralNetwork:
         self.context_size  = data.get("context_size",  0)
         self.embed_dim     = data.get("embed_dim",     64)
         self.num_blocks    = data.get("num_blocks",    2)
+        # Old files default to 1 head (single-head safe for old Wqkv shapes)
+        self.num_heads     = data.get("num_heads",     1)
+        self.dropout       = data.get("dropout",       0.0)
+        self.weight_tying  = data.get("weight_tying",  False)
+        self.grad_clip     = data.get("grad_clip",     1.0)
         self._act_fn, self._act_d = _ACTIVATIONS[self.activation]
-        self._scale = 1.0 / (self.embed_dim ** 0.5)
+        self._head_dim     = self.embed_dim // self.num_heads
+        self._scale_head   = 1.0 / (self._head_dim ** 0.5)
 
+        # ---- Legacy dense weights -------------------------------------------
         self.weights = [np.array(w) for w in data["weights"]]
         self.biases  = [np.array(b) for b in data["biases"]]
+
+        # ---- Embeddings -----------------------------------------------------
         self.embedding     = np.array(data["embedding"])     if data.get("embedding")     else None
         self.pos_embedding = np.array(data["pos_embedding"]) if data.get("pos_embedding") else None
-        self.Wout = np.array(data["Wout"])
+
+        # ---- Output projection + final LN -----------------------------------
+        if self.weight_tying:
+            self.Wout = None
+        else:
+            self.Wout = np.array(data["Wout"]) if data.get("Wout") else None
         self.bout = np.array(data["bout"])
 
+        D = self.embed_dim
+        if data.get("ln_f_g") is not None:
+            self.ln_f_g = np.array(data["ln_f_g"])
+            self.ln_f_b = np.array(data["ln_f_b"])
+        else:
+            # Old file: initialise final LN as identity
+            self.ln_f_g = np.ones(D)
+            self.ln_f_b = np.zeros(D)
+
+        # ---- Transformer blocks ---------------------------------------------
         if "blocks" in data:
             self.blocks = []
             for blk in data["blocks"]:
                 b = {k: np.array(v) for k, v in blk.items()}
+
+                # Upgrade old separate Wq/Wk/Wv -> fused Wqkv
                 if "Wq" in b and "Wqkv" not in b:
                     import numpy as _nl
                     def _cpu(a): return np.asnumpy(a) if _DEVICE == "gpu" else a
@@ -888,8 +1361,17 @@ class NeuralNetwork:
                     Wk = _cpu(b.pop("Wk"))
                     Wv = _cpu(b.pop("Wv"))
                     b["Wqkv"] = np.array(_nl.concatenate([Wq, Wk, Wv], axis=1))
+
+                # Add LN params if missing (old file without LayerNorm)
+                if "ln1_g" not in b:
+                    b["ln1_g"] = np.ones(D)
+                    b["ln1_b"] = np.zeros(D)
+                    b["ln2_g"] = np.ones(D)
+                    b["ln2_b"] = np.zeros(D)
+
                 self.blocks.append(b)
         else:
+            # Very old single-weight format
             import numpy as _nl
             self.blocks = []
             for _ in range(self.num_blocks):
@@ -902,32 +1384,55 @@ class NeuralNetwork:
                     "b1":   np.array(data["b1"]),
                     "W2":   np.array(data["W2"]),
                     "b2":   np.array(data["b2"]),
+                    "ln1_g": np.ones(D), "ln1_b": np.zeros(D),
+                    "ln2_g": np.ones(D), "ln2_b": np.zeros(D),
                 })
 
+        # ---- Adam state -----------------------------------------------------
         self._adam_init = False
         if data.get("adam_t") and data["adam_t"] > 0:
-            self._init_adam()
-            self._adam_t = data["adam_t"]
-            self._mWout  = np.array(data["adam_mWout"])
-            self._vWout  = np.array(data["adam_vWout"])
-            self._mbout  = np.array(data["adam_mbout"])
-            self._vbout  = np.array(data["adam_vbout"])
+            self._init_adam()                         # allocate all buffers
+            self._adam_t = data["adam_t"]             # restore step counter
+
+            if not self.weight_tying and data.get("adam_mWout"):
+                self._mWout = np.array(data["adam_mWout"])
+                self._vWout = np.array(data["adam_vWout"])
+            self._mbout = np.array(data["adam_mbout"])
+            self._vbout = np.array(data["adam_vbout"])
+
             if self.use_embedding and data.get("adam_me") is not None:
                 self._me  = np.array(data["adam_me"])
                 self._ve  = np.array(data["adam_ve"])
                 self._mpe = np.array(data["adam_mpe"])
                 self._vpe = np.array(data["adam_vpe"])
+
+            # Final LN Adam state (absent in old files -> stays zero from _init)
+            if data.get("adam_m_ln_f_g") is not None:
+                self._m_ln_f_g = np.array(data["adam_m_ln_f_g"])
+                self._v_ln_f_g = np.array(data["adam_v_ln_f_g"])
+                self._m_ln_f_b = np.array(data["adam_m_ln_f_b"])
+                self._v_ln_f_b = np.array(data["adam_v_ln_f_b"])
+
+            # Per-block Adam state (includes LN buffers for new files)
             for i, buf in enumerate(data.get("adam_blocks", [])):
                 for k, mv in buf.items():
-                    self._adam_blocks[i][k]["m"] = np.array(mv["m"])
-                    self._adam_blocks[i][k]["v"] = np.array(mv["v"])
+                    if k in self._adam_blocks[i]:
+                        self._adam_blocks[i][k]["m"] = np.array(mv["m"])
+                        self._adam_blocks[i][k]["v"] = np.array(mv["v"])
+
             print(f"  Adam state restored (t={self._adam_t})")
 
         print(f"Weights loaded from '{filename}'.")
 
+    # ==========================================================================
+    #  Repr
+    # ==========================================================================
+
     def __repr__(self) -> str:
+        wt = "tied" if self.weight_tying else "separate"
         return (
             f"NeuralNetwork(embed={self.embed_dim}, blocks={self.num_blocks}, "
-            f"causal=True, all_positions=True, "
+            f"heads={self.num_heads}, dropout={self.dropout}, "
+            f"Wout={wt}, causal=True, all_positions=True, "
             f"lr={self.learning_rate}, device='{self.device}')"
         )
