@@ -497,13 +497,13 @@ class NeuralNetwork:
         # One (D, 3D) matmul produces all of Q, K, V for all heads at once.
         # Reshape to (B, T, 3, H, d_h) then move heads axis forward.
         QKV = (ln1_out.reshape(BT, D) @ blk["Wqkv"]).reshape(B, T, 3, H, d_h)
-        Q = QKV[:, :, 0].transpose(0, 2, 1, 3)    # (B, H, T, d_h)
-        K = QKV[:, :, 1].transpose(0, 2, 1, 3)
-        V = QKV[:, :, 2].transpose(0, 2, 1, 3)
+        Q = QKV[:, :, 0].transpose((0, 2, 1, 3))    # (B, H, T, d_h)
+        K = QKV[:, :, 1].transpose((0, 2, 1, 3))
+        V = QKV[:, :, 2].transpose((0, 2, 1, 3))
 
         # ---- Scaled dot-product attention (per head) ------------------------
         # scores[b, h, i, j] = how much position i in head h attends to j
-        scores  = Q @ K.transpose(0, 1, 3, 2) * self._scale_head  # (B, H, T, T)
+        scores  = Q @ K.transpose((0, 1, 3, 2)) * self._scale_head  # (B, H, T, T)
         scores += self._causal_mask(T)                              # block future
         scores -= scores.max(axis=-1, keepdims=True)                # stable softmax
         exp_s   = np.exp(scores)
@@ -511,7 +511,7 @@ class NeuralNetwork:
 
         # Weighted sum of values, then merge heads back to (B, T, D)
         attn_h   = A @ V                                            # (B, H, T, d_h)
-        attn_out = attn_h.transpose(0, 2, 1, 3).reshape(B, T, D)   # (B, T, D)
+        attn_out = attn_h.transpose((0, 2, 1, 3)).reshape(B, T, D)   # (B, T, D)
 
         # Attention dropout (only during training)
         attn_out, drop1_mask = self._apply_dropout(attn_out, training)
@@ -593,11 +593,11 @@ class NeuralNetwork:
         # FF backward
         dW2     = h.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)    # (4D, D)
         db2     = d_ff_out.sum(axis=(0, 1))                           # (D,)
-        d_h     = d_ff_out @ blk["W2"].T                              # (B, T, 4D)
-        d_h    *= (h > 0)                                             # ReLU deriv
-        dW1     = ln2_out.reshape(BT, -1).T @ d_h.reshape(BT, -1)   # (D, 4D)
-        db1     = d_h.sum(axis=(0, 1))                                # (4D,)
-        d_ln2_out = d_h @ blk["W1"].T                                 # (B, T, D)
+        d_h_grad     = d_ff_out @ blk["W2"].T                              # (B, T, 4D)
+        d_h_grad    *= (h > 0)                                             # ReLU deriv
+        dW1     = ln2_out.reshape(BT, -1).T @ d_h_grad.reshape(BT, -1)   # (D, 4D)
+        db1     = d_h_grad.sum(axis=(0, 1))                                # (4D,)
+        d_ln2_out = d_h_grad @ blk["W1"].T                                 # (B, T, D)
 
         # LN2 backward: returns gradient into x_attn + LN parameter grads
         d_x_attn_from_ff, d_ln2_g, d_ln2_b = self._ln_backward(d_ln2_out, ln2_cache)
@@ -611,12 +611,12 @@ class NeuralNetwork:
         # Multi-head attention backward
         # Reshape d_attn_out from (B,T,D) back to per-head (B,H,T,d_h)
         d_attn_h = (
-            d_attn_out.reshape(B, T, H, d_h).transpose(0, 2, 1, 3)  # (B, H, T, d_h)
+            d_attn_out.reshape(B, T, H, d_h).transpose((0, 2, 1, 3))  # (B, H, T, d_h)
         )
 
         # Backward through A @ V = attn_h
-        dA = d_attn_h @ V.transpose(0, 1, 3, 2)                # (B, H, T, T)
-        dV = A.transpose(0, 1, 3, 2) @ d_attn_h                # (B, H, T, d_h)
+        dA = d_attn_h @ V.transpose((0, 1, 3, 2))                # (B, H, T, T)
+        dV = A.transpose((0, 1, 3, 2)) @ d_attn_h                # (B, H, T, d_h)
 
         # Softmax Jacobian-vector product:
         #   dS = A * (dA - sum(dA*A, axis=-1, keepdims=True))
@@ -626,12 +626,12 @@ class NeuralNetwork:
 
         # Backward through Q @ K^T
         dQ = dS @ K                                             # (B, H, T, d_h)
-        dK = dS.transpose(0, 1, 3, 2) @ Q                      # (B, H, T, d_h)
+        dK = dS.transpose((0, 1, 3, 2)) @ Q                      # (B, H, T, d_h)
 
         # Reshape back: (B, H, T, d_h) -> (B, T, H, d_h) -> (BT, D)
-        dQ_r = dQ.transpose(0, 2, 1, 3).reshape(BT, D)
-        dK_r = dK.transpose(0, 2, 1, 3).reshape(BT, D)
-        dV_r = dV.transpose(0, 2, 1, 3).reshape(BT, D)
+        dQ_r = dQ.transpose((0, 2, 1, 3)).reshape(BT, D)
+        dK_r = dK.transpose((0, 2, 1, 3)).reshape(BT, D)
+        dV_r = dV.transpose((0, 2, 1, 3)).reshape(BT, D)
 
         # Fused Wqkv backward: one matmul instead of three
         ln1_out_r = ln1_out.reshape(BT, D)
@@ -938,7 +938,7 @@ class NeuralNetwork:
                     d_x      = (delta_r @ self.embedding).reshape(bs, T, D)
                 else:
                     dWout_acc += x_out_r.T @ delta_r                  # (D, vocab)
-                    d_x        = delta.reshape(bs, T, D) @ self.Wout.T
+                    d_x        = delta @ self.Wout.T
 
                 dbout_acc += delta.sum(axis=(0, 1))
                 del probs, x_out
