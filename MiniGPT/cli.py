@@ -79,8 +79,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Training epochs. (default: 100)")
     tg.add_argument("--samples",    type=int,   default=20_000,
                     help="Max training samples. (default: 20000)")
-    tg.add_argument("--context",    type=int,   default=12,
-                    help="Context window size. (default: 12)")
+    tg.add_argument("--context",    type=int,   default=2048,
+                    help="Context window size. (default: 2048)")
     tg.add_argument("--hidden",     type=int,   nargs="+", default=[512, 256, 128],
                     help="Hidden layer sizes. E.g. --hidden 512 256 128\n(default: 512 256 128)")
     tg.add_argument("--activation", type=str,   default="relu",
