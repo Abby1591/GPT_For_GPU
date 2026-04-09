@@ -360,6 +360,8 @@ class NeuralNetwork:
     grad_clip : float
         Max global gradient L2 norm before Adam update (0 = disabled).
         Prevents a bad batch from taking a destructively large step.
+    dtype : str
+        Data type for weights. 'float32' or 'float16' for memory efficiency.
     """
 
     def __init__(
@@ -379,6 +381,7 @@ class NeuralNetwork:
         dropout:       float = 0.0,
         weight_tying:  bool  = True,
         grad_clip:     float = 1.0,
+        dtype:         str   = "float32",
     ) -> None:
         if activation not in _ACTIVATIONS:
             raise ValueError(
@@ -408,8 +411,7 @@ class NeuralNetwork:
         self.dropout       = dropout
         self.weight_tying  = weight_tying
         self.grad_clip     = grad_clip
-        self.device        = _DEVICE
-        self._act_fn, self._act_d = _ACTIVATIONS[activation]
+        self.dtype         = dtype
 
         # Head dimension: each head attends in a d_h-dimensional subspace.
         # Scale for attention scores: 1/sqrt(d_h) keeps dot products from
@@ -422,8 +424,8 @@ class NeuralNetwork:
         # Positional embedding: (context_size, D) -- one row per position.
         # Both are learned and updated by Adam just like any weight matrix.
         if self.use_embedding:
-            self.embedding     = np.random.randn(vocab_size, embed_dim) * 0.01
-            self.pos_embedding = np.random.randn(context_size, embed_dim) * 0.01
+            self.embedding     = np.random.randn(vocab_size, embed_dim).astype(dtype) * 0.01
+            self.pos_embedding = np.random.randn(context_size, embed_dim).astype(dtype) * 0.01
         else:
             self.embedding     = None
             self.pos_embedding = None
@@ -447,18 +449,18 @@ class NeuralNetwork:
         self.blocks: List[Dict] = []
         for _ in range(num_blocks):
             self.blocks.append({
-                "Wqkv": np.random.randn(D, D * 3) * 0.02,
-                "W1":   np.random.randn(D, D * 4) * 0.02,
-                "b1":   np.zeros(D * 4),
-                "W2":   np.random.randn(D * 4, D) * resid_scale,
-                "b2":   np.zeros(D),
+                "Wqkv": np.random.randn(D, D * 3).astype(dtype) * 0.02,
+                "W1":   np.random.randn(D, D * 4).astype(dtype) * 0.02,
+                "b1":   np.zeros(D * 4).astype(dtype),
+                "W2":   np.random.randn(D * 4, D).astype(dtype) * resid_scale,
+                "b2":   np.zeros(D).astype(dtype),
                 # LayerNorm params: gamma (scale) init to 1, beta (shift) to 0.
                 # At init this is an identity transform -- the model learns
                 # to deviate from identity as training progresses.
-                "ln1_g": np.ones(D),
-                "ln1_b": np.zeros(D),
-                "ln2_g": np.ones(D),
-                "ln2_b": np.zeros(D),
+                "ln1_g": np.ones(D).astype(dtype),
+                "ln1_b": np.zeros(D).astype(dtype),
+                "ln2_g": np.ones(D).astype(dtype),
+                "ln2_b": np.zeros(D).astype(dtype),
             })
 
         # ---- Final LayerNorm (GPT-2 style) ----------------------------------
