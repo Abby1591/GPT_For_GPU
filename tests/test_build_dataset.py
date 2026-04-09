@@ -21,6 +21,7 @@ from build_dataset import (
     WIKIQUOTE_PAGES,
     _get,
     _get_json,
+    _save_checkpoint,
     clean,
     strip_gutenberg_boilerplate,
 )
@@ -310,6 +311,124 @@ class TestDataLists(unittest.TestCase):
         has_sci = any("Curie" in t or "Darwin" in t or "Goodall" in t
                       for t in DIVERSE_ARTICLES)
         self.assertTrue(has_sci)
+
+
+# =============================================================================
+#  Checkpoint saving and loading
+# =============================================================================
+
+class TestCheckpointSave(unittest.TestCase):
+
+    def setUp(self):
+        """Create temporary test files."""
+        self.test_checkpoint = "test_checkpoint.txt"
+        self.cleanup_files = [self.test_checkpoint]
+
+    def tearDown(self):
+        """Remove test files."""
+        for f in self.cleanup_files:
+            if os.path.exists(f):
+                os.remove(f)
+
+    def test_save_checkpoint_creates_file(self):
+        """_save_checkpoint must create a file."""
+        chunks = ["chunk 1", "chunk 2", "chunk 3"]
+        _save_checkpoint(chunks, self.test_checkpoint)
+        self.assertTrue(os.path.exists(self.test_checkpoint))
+
+    def test_save_checkpoint_joins_with_double_newline(self):
+        """Chunks must be joined with '\\n\\n' separator."""
+        chunks = ["first text", "second text", "third text"]
+        _save_checkpoint(chunks, self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        expected = "first text\n\nsecond text\n\nthird text"
+        self.assertEqual(content, expected)
+
+    def test_save_checkpoint_empty_list(self):
+        """Empty chunk list must create empty file."""
+        _save_checkpoint([], self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        self.assertEqual(content, "")
+
+    def test_save_checkpoint_single_chunk(self):
+        """Single chunk must be saved as-is."""
+        chunks = ["only one chunk here"]
+        _save_checkpoint(chunks, self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        self.assertEqual(content, "only one chunk here")
+
+    def test_save_checkpoint_overwrites_existing(self):
+        """Saving to same file must overwrite."""
+        _save_checkpoint(["first"], self.test_checkpoint)
+        _save_checkpoint(["second"], self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        self.assertEqual(content, "second")
+
+    def test_save_checkpoint_preserves_content(self):
+        """Content inside chunks must be preserved exactly."""
+        chunks = [
+            "Line 1\nLine 2\nLine 3",
+            "Another\nmulti-line\nchunk",
+            "Special chars: !@#$%^&*()"
+        ]
+        _save_checkpoint(chunks, self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        expected = "Line 1\nLine 2\nLine 3\n\nAnother\nmulti-line\nchunk\n\nSpecial chars: !@#$%^&*()"
+        self.assertEqual(content, expected)
+
+    def test_save_and_load_roundtrip(self):
+        """Save then load must preserve content."""
+        original_chunks = [
+            "The quick brown fox",
+            "jumps over the lazy dog",
+            "The end."
+        ]
+        _save_checkpoint(original_chunks, self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            loaded_content = f.read()
+        
+        # Reconstruct what should be in the file
+        expected_content = "\n\n".join(original_chunks)
+        self.assertEqual(loaded_content, expected_content)
+
+    def test_save_checkpoint_handles_unicode(self):
+        """Unicode content must be saved and retrieved correctly."""
+        chunks = ["café", "naïve", "résumé", "🎉 emoji"]
+        _save_checkpoint(chunks, self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        self.assertIn("café", content)
+        self.assertIn("🎉 emoji", content)
+
+    def test_save_checkpoint_large_chunks(self):
+        """Large chunks must be saved without truncation."""
+        large_chunk = "A" * 100000  # 100KB
+        chunks = [large_chunk, large_chunk]
+        _save_checkpoint(chunks, self.test_checkpoint)
+        
+        with open(self.test_checkpoint, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        # Should have two 100KB chunks separated by \n\n
+        self.assertEqual(len(content), len(large_chunk) * 2 + 2)
 
 
 if __name__ == "__main__":

@@ -980,23 +980,24 @@ def fetch_simple_wikipedia(target_chars: int) -> List[str]:
     chunks = []
     total  = 0
     seen   = set()
-    fails  = 0
+    ok = fail = 0
 
-    while total < target_chars and fails < 40:
+    while total < target_chars and fail < 30:
         url = (
             "https://simple.wikipedia.org/w/api.php"
             "?action=query&list=random&rnlimit=20&rnnamespace=0"
-            "&prop=extracts&explaintext=1&format=json"
+            "&format=json"
         )
         data = _get_json(url)
         if not data:
-            fails += 1
+            fail += 1
             continue
         try:
             titles = [p["title"] for p in data["query"]["random"]]
         except Exception:
-            fails += 1
+            fail += 1
             continue
+        batch_added = 0
         for title in titles:
             if title in seen or total >= target_chars:
                 continue
@@ -1005,8 +1006,17 @@ def fetch_simple_wikipedia(target_chars: int) -> List[str]:
             if text and len(text) >= 100:
                 chunks.append(text)
                 total += len(text)
+                batch_added += 1
+                ok += 1
+                if ok % 5 == 0:
+                    print(f"    [{ok}] {title}  ({len(text):,} chars)  total={total:,}/{target_chars:,}")
+            else:
+                fail += 1
+        
+        if batch_added == 0:
+            break
 
-    print(f"  Simple Wikipedia done: {total:,} chars from {len(chunks)} articles")
+    print(f"  Simple Wikipedia done: {total:,} chars from {len(chunks)} articles ({ok} OK, {fail} skipped)")
     return chunks
 
 
@@ -1094,8 +1104,14 @@ def fetch_wikibooks(target_chars: int) -> List[str]:
 
 
 # =============================================================================
-#  Assemble
+#  Checkpoint saving
 # =============================================================================
+
+def _save_checkpoint(chunks: List[str], filename: str) -> None:
+    """Save phase chunks to checkpoint file."""
+    text = "\n\n".join(chunks)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(text)
 
 def build_dataset(
     target_chars:    int,
@@ -1133,23 +1149,38 @@ def build_dataset(
 
     if not no_gutenberg:
         gutenberg_chars = int(target_chars * 0.35)
-        chunks.extend(fetch_gutenberg(gutenberg_chars))
+        phase_chunks = fetch_gutenberg(gutenberg_chars)
+        chunks.extend(phase_chunks)
+        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_1_gutenberg.txt")
+        print(f"  ✓ Gutenberg checkpoint saved")
 
     if not no_wikipedia:
         wikipedia_chars = int(target_chars * 0.30)
-        chunks.extend(fetch_wikipedia(wikipedia_chars))
+        phase_chunks = fetch_wikipedia(wikipedia_chars)
+        chunks.extend(phase_chunks)
+        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_2_wikipedia.txt")
+        print(f"  ✓ Wikipedia checkpoint saved")
 
     if not no_simple_wiki:
         simple_chars = int(target_chars * 0.15)
-        chunks.extend(fetch_simple_wikipedia(simple_chars))
+        phase_chunks = fetch_simple_wikipedia(simple_chars)
+        chunks.extend(phase_chunks)
+        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_3_simple_wikipedia.txt")
+        print(f"  ✓ Simple Wikipedia checkpoint saved")
 
     if not no_wikiquote:
         wikiquote_chars = int(target_chars * 0.10)
-        chunks.extend(fetch_wikiquote(wikiquote_chars))
+        phase_chunks = fetch_wikiquote(wikiquote_chars)
+        chunks.extend(phase_chunks)
+        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_4_wikiquote.txt")
+        print(f"  ✓ Wikiquote checkpoint saved")
 
     if not no_wikibooks:
         wikibooks_chars = int(target_chars * 0.10)
-        chunks.extend(fetch_wikibooks(wikibooks_chars))
+        phase_chunks = fetch_wikibooks(wikibooks_chars)
+        chunks.extend(phase_chunks)
+        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_5_wikibooks.txt")
+        print(f"  ✓ Wikibooks checkpoint saved")
 
     if not chunks:
         print("\nERROR: no text collected. Check internet connection.")
