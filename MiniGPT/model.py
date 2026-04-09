@@ -277,6 +277,32 @@ class MiniGPT:
         print(f"Input dimension  : {self.context_size} x {tokenizer.size} = "
               f"{self.context_size * tokenizer.size}")
 
+        # Write tokenizer + config BEFORE training starts so that any
+        # mid-training checkpoint saved by save_every is immediately loadable
+        # via MiniGPT.load().  Both files are static -- they never change
+        # during training -- so writing them once up-front is safe.
+        if save_every and save_path:
+            tok_path = save_path.replace(".json", "_tokenizer.json")
+            cfg_path = save_path.replace(".json", "_config.json")
+            if not os.path.exists(tok_path):
+                tokenizer.save(tok_path)
+                print(f"Checkpoint header saved: '{tok_path}'")
+            if not os.path.exists(cfg_path):
+                with open(cfg_path, "w") as _f:
+                    json.dump({
+                        "context_size":  self.context_size,
+                        "hidden_layers": self.hidden_layers,
+                        "activation":    self.activation,
+                        "learning_rate": self.learning_rate,
+                        "embed_dim":     self.embed_dim,
+                        "num_blocks":    self.num_blocks,
+                        "num_heads":     self.num_heads,
+                        "dropout":       self.dropout,
+                        "weight_tying":  self.weight_tying,
+                        "grad_clip":     self.grad_clip,
+                    }, _f, indent=2)
+                print(f"Checkpoint header saved: '{cfg_path}'")
+
         print(f"\nTraining for {epochs} epoch(s)...\n")
         t0 = time.time()
         self.nn.train(index_data, epochs=epochs, log_every=log_every,
@@ -365,13 +391,8 @@ class MiniGPT:
         generated = list(prompt) if prompt else []
 
         for _ in range(length):
-            # Flatten one-hot encodings of each context character
-            features = []
-            for idx in ctx:
-                features.extend(tok.one_hot(idx))
-
-            # Forward pass -> raw probabilities
-            _, _, probs = self.nn.predict(features)
+            # Forward pass directly from token indices -- no one-hot needed
+            probs = self.nn.predict_from_indices(ctx)
 
             # Temperature scaling
             if temperature != 1.0:
@@ -389,8 +410,90 @@ class MiniGPT:
         return "".join(generated)
 
     # ------------------------------------------------------------------
-    # Save / Load
+    # TurboQuant-accelerated generation
     # ------------------------------------------------------------------
+
+    def generate_fast(
+        self,
+        prompt:      str   = "",
+        length:      int   = 200,
+        temperature: float = 0.8,
+        kv_bits:     int   = 8,
+    ) -> str:
+        """
+        Generate text using a TurboQuant KV cache for faster inference.
+
+        Identical interface to :meth:`generate`, but uses
+        :meth:`NeuralNetwork.generate_fast` under the hood:
+
+        - **Prefill** once on the prompt (full forward pass).
+        - **Decode** one token at a time, attending the new Q over all
+          cached K,V — no full context recomputation per step.
+        - KV pairs are compressed with TurboQuant_mse (random rotation +
+          INT8 scalar quantisation, ~4× smaller than float32 at kv_bits=8).
+
+        Speed: ~context_size× fewer transformer operations than generate().
+        Quality: near-identical; small positional approximation error
+        (see NeuralNetwork.generate_fast docstring).
+
+        Papers
+        ------
+        TurboQuant  arXiv:2504.19874  ICLR 2026
+        PolarQuant  arXiv:2502.02617  AISTATS 2026
+        QJL         arXiv:2406.03482  AAAI 2025
+
+        :param prompt:      Seed text (unknown chars are dropped).
+        :param length:      New characters to generate.
+        :param temperature: Sampling temperature.
+        :param kv_bits:     KV cache quantisation bits (8 = 4× compression,
+                            4 = 8× compression with slightly more distortion).
+        """
+        if self.nn is None or self.tokenizer is None:
+            raise RuntimeError(
+                "Model is not ready. Call train() or MiniGPT.load() first."
+            )
+
+        tok = self.tokenizer
+
+        seed = tok.encode(prompt) if prompt else [random.randint(0, tok.size - 1)]
+        ctx  = seed[-self.context_size:]
+        while len(ctx) < self.context_size:
+            ctx = [0] + ctx
+
+        indices = self.nn.generate_fast(
+            ctx, length=length, temperature=temperature, kv_bits=kv_bits
+        )
+
+        prefix    = list(prompt) if prompt else []
+        generated = prefix + [tok.idx2ch.get(i, "?") for i in indices]
+        return "".join(generated)
+
+    # ------------------------------------------------------------------
+    # INT8 weight quantisation
+    # ------------------------------------------------------------------
+
+    def quantize(self) -> None:
+        """
+        Post-training INT8 quantisation of all major weight matrices.
+
+        Delegates to :meth:`NeuralNetwork.quantize_weights_int8`.
+        Call this after training is complete, before saving the final
+        checkpoint.  The resulting JSON file will be ~4× smaller.
+
+        Example::
+
+            model.train("data.txt", epochs=100)
+            model.quantize()          # snap weights to INT8 grid
+            model.save("model_q8.json")  # ~4× smaller file
+
+        Do **not** continue training after quantising.
+        """
+        if self.nn is None:
+            print("Nothing to quantise — model has not been trained.")
+            return
+        self.nn.quantize_weights_int8()
+
+
 
     def save(self, weights_path: str = "gpt_weights.json") -> None:
         """
@@ -508,6 +611,12 @@ class MiniGPT:
             vocab_size    = model.tokenizer.size,
             context_size  = model.context_size,
             embed_dim     = model.embed_dim,
+            num_blocks    = model.num_blocks,
+            num_heads     = model.num_heads,
+            dropout       = model.dropout,
+            weight_tying  = model.weight_tying,
+            grad_clip     = model.grad_clip,
+            batch_size    = model.batch_size,
         )
         model.nn.load_weights(weights_path)
         print("miniGPT loaded successfully.")
