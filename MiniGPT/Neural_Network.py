@@ -131,8 +131,15 @@ class TurboQuantKVCache:
         near-optimal Lloyd-Max approximation -- no per-vector zero-point or
         per-block normalisation constant is needed (zero overhead).
 
-    3.  Store int8 values + one float32 scale per vector.
-        Memory vs float32:  ~ bits / 32  (e.g. 8-bit → 4× smaller).
+    3.  Storage:
+        8-bit: int8 values + one float32 scale per head-vector → 4× vs fp32.
+        4-bit: two nibbles packed per byte (high nibble / low nibble) + one
+               float32 scale per head-vector → ~8× vs fp32.
+               Packing: high = (q+8) >> 0 stored in bits [7:4],
+                         low = (q+8) stored in bits [3:0].
+               Values are in [-7, 7] (maxval = 7); +8 shifts to [1, 15]
+               so that the unsigned nibble 0x0 is reserved as a padding
+               sentinel and never produced by valid quantised data.
 
     4.  Reconstruct  v_approx = q * scale @ R
 
@@ -146,6 +153,10 @@ class TurboQuantKVCache:
     head_dim     : dimension per head (embed_dim // num_heads)
     context_size : ring-buffer capacity (= model's context window)
     bits         : quantisation bit-width (4 or 8; default 8)
+
+    Notes
+    -----
+    head_dim must be even when bits=4 (two values packed per byte).
 
     References
     ----------
@@ -162,10 +173,17 @@ class TurboQuantKVCache:
         context_size: int,
         bits:         int = 8,
     ) -> None:
-        self.L   = num_layers
-        self.H   = num_heads
-        self.d   = head_dim
-        self.T   = context_size
+        if bits not in (4, 8):
+            raise ValueError(f"bits must be 4 or 8, got {bits}")
+        if bits == 4 and head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim must be even for 4-bit packing, got {head_dim}"
+            )
+
+        self.L    = num_layers
+        self.H    = num_heads
+        self.d    = head_dim
+        self.T    = context_size
         self.bits = bits
         self._maxval = 2 ** (bits - 1) - 1   # 127 for int8, 7 for int4
 
@@ -173,49 +191,98 @@ class TurboQuantKVCache:
         # Data-oblivious: generated once, reused for every vector.
         # QR decomposition of a Gaussian matrix gives a Haar-distributed
         # (uniformly random) orthogonal matrix -- exactly what TurboQuant needs.
-        raw       = _np_cpu.random.randn(head_dim, head_dim).astype(_np_cpu.float32)
-        R, _      = _np_cpu.linalg.qr(raw)
-        self._R   = R          # (d, d) float32
-        self._Rt  = R.T        # precomputed inverse (R orthogonal → R^-1 = R^T)
+        raw     = _np_cpu.random.randn(head_dim, head_dim).astype(_np_cpu.float32)
+        R, _    = _np_cpu.linalg.qr(raw)
+        self._R  = R      # (d, d)  float32
+        self._Rt = R.T    # precomputed inverse (R orthogonal → R^-1 = R^T)
 
-        # Ring buffer: per-layer, per-head, per-position
-        # int8 quantised values  (L, H, T, d)
-        # float32 per-vector scales (L, H, T)
-        self._Kq = _np_cpu.zeros((self.L, self.H, self.T, self.d), dtype=_np_cpu.int8)
-        self._Vq = _np_cpu.zeros((self.L, self.H, self.T, self.d), dtype=_np_cpu.int8)
+        # Ring buffer: per-layer, per-head, per-position.
+        # 8-bit: store raw int8, shape (L, H, T, d).
+        # 4-bit: pack two nibbles per byte, shape (L, H, T, d//2).
+        #        High nibble = even index, low nibble = odd index.
+        d_stored = head_dim if bits == 8 else head_dim // 2
+        self._Kq = _np_cpu.zeros(
+            (self.L, self.H, self.T, d_stored), dtype=_np_cpu.uint8
+        )
+        self._Vq = _np_cpu.zeros(
+            (self.L, self.H, self.T, d_stored), dtype=_np_cpu.uint8
+        )
+        # float32 per-head-vector scales (L, H, T)
         self._Ks = _np_cpu.zeros((self.L, self.H, self.T), dtype=_np_cpu.float32)
         self._Vs = _np_cpu.zeros((self.L, self.H, self.T), dtype=_np_cpu.float32)
 
-        self._pos    = 0   # next write position
+        self._pos    = 0   # next write position in ring buffer
         self._filled = 0   # tokens stored so far (≤ T)
 
     # ------------------------------------------------------------------
-    # Quantise / dequantise one head-vector
+    # Internal: pack / unpack int4 nibbles
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pack_nibbles(q_int8: "_np_cpu.ndarray") -> "_np_cpu.ndarray":
+        """
+        Pack a (..., d) int8 array whose values are in [-7, 7] into a
+        (..., d//2) uint8 array using 4-bit nibbles.
+
+        Encoding: shift values by +8 so they land in [1, 15] (unsigned nibble).
+        Even-indexed values go into the high nibble (bits 7-4),
+        odd-indexed values go into the low nibble  (bits 3-0).
+
+        The sentinel value 0x0 (= original -8, outside [-7,7]) is never
+        produced, making it safe as a zero-initialisation marker.
+        """
+        shifted = (q_int8 + 8).astype(_np_cpu.uint8)   # [1, 15], fits in 4 bits
+        hi = shifted[..., 0::2] << 4                    # even → high nibble
+        lo = shifted[..., 1::2] & 0x0F                  # odd  → low  nibble
+        return (hi | lo).astype(_np_cpu.uint8)
+
+    @staticmethod
+    def _unpack_nibbles(packed: "_np_cpu.ndarray") -> "_np_cpu.ndarray":
+        """
+        Unpack a (..., d//2) uint8 array back to (..., d) int8 in [-7, 7].
+
+        Reverses _pack_nibbles: extract high and low nibbles, interleave,
+        then shift back by -8.
+        """
+        hi = (packed >> 4) & 0x0F                        # bits 7-4
+        lo =  packed        & 0x0F                        # bits 3-0
+        # interleave: even positions ← hi, odd positions ← lo
+        d  = packed.shape[-1] * 2
+        out = _np_cpu.empty(packed.shape[:-1] + (d,), dtype=_np_cpu.uint8)
+        out[..., 0::2] = hi
+        out[..., 1::2] = lo
+        return (out.astype(_np_cpu.int16) - 8).astype(_np_cpu.int8)
+
+    # ------------------------------------------------------------------
+    # Quantise / dequantise one head-vector (used by push/get internally)
     # ------------------------------------------------------------------
 
     def _quant(self, v: "_np_cpu.ndarray"):
         """
         TurboQuant_mse encode: rotate then scalar-quantise.
+
         v      : (d,) float32
-        returns: q (d,) int8, scale float32
+        returns: q (d,) int8 in [-maxval, maxval], scale float32
         """
-        v_rot  = v @ self._R                          # rotate
+        v_rot  = v @ self._R
         absmax = float(_np_cpu.max(_np_cpu.abs(v_rot))) + 1e-9
         scale  = absmax / self._maxval
-        q      = _np_cpu.clip(
+        q = _np_cpu.clip(
             _np_cpu.round(v_rot / scale),
             -self._maxval, self._maxval,
         ).astype(_np_cpu.int8)
         return q, scale
 
-    def _dequant(self, q: "_np_cpu.ndarray", scale: float):
+    def _dequant(self, q: "_np_cpu.ndarray", scale: float) -> "_np_cpu.ndarray":
         """
         TurboQuant_mse decode: dequantise then inverse-rotate.
-        q     : (d,) int8, scale: float32
+
+        q     : (d,) int8
+        scale : float32
         returns: (d,) float32
         """
         v_rot_approx = q.astype(_np_cpu.float32) * scale
-        return v_rot_approx @ self._Rt               # R^T = R^-1 for orthogonal R
+        return v_rot_approx @ self._Rt   # R^T = R^-1 for orthogonal R
 
     # ------------------------------------------------------------------
     # Batch push / get (vectorised over heads)
@@ -229,81 +296,109 @@ class TurboQuantKVCache:
         layer        : int
         """
         p = self._pos
-        # Vectorise over heads: (H, d) @ (d, d) = (H, d)
-        K_rot = K_new @ self._R    # (H, d)
+
+        # Rotate all heads at once: (H, d) @ (d, d) = (H, d)
+        K_rot = K_new @ self._R
         V_rot = V_new @ self._R
 
-        # Per-head symmetric scales
-        K_abs = _np_cpu.abs(K_rot).max(axis=-1) + 1e-9    # (H,)
-        V_abs = _np_cpu.abs(V_rot).max(axis=-1) + 1e-9
+        # Per-head symmetric scales: shape (H,)
+        K_sc = _np_cpu.abs(K_rot).max(axis=-1) / self._maxval + 1e-9
+        V_sc = _np_cpu.abs(V_rot).max(axis=-1) / self._maxval + 1e-9
 
-        K_sc  = K_abs / self._maxval
-        V_sc  = V_abs / self._maxval
-
-        self._Kq[layer, :, p, :] = _np_cpu.clip(
+        # Quantise to int8 in [-maxval, maxval]: shape (H, d)
+        K_q8 = _np_cpu.clip(
             _np_cpu.round(K_rot / K_sc[:, None]),
             -self._maxval, self._maxval,
         ).astype(_np_cpu.int8)
-        self._Vq[layer, :, p, :] = _np_cpu.clip(
+        V_q8 = _np_cpu.clip(
             _np_cpu.round(V_rot / V_sc[:, None]),
             -self._maxval, self._maxval,
         ).astype(_np_cpu.int8)
+
+        # Store: int8 as-is (8-bit) or pack into nibbles (4-bit)
+        if self.bits == 8:
+            self._Kq[layer, :, p, :] = K_q8.view(_np_cpu.uint8)
+            self._Vq[layer, :, p, :] = V_q8.view(_np_cpu.uint8)
+        else:
+            self._Kq[layer, :, p, :] = self._pack_nibbles(K_q8)
+            self._Vq[layer, :, p, :] = self._pack_nibbles(V_q8)
 
         self._Ks[layer, :, p] = K_sc
         self._Vs[layer, :, p] = V_sc
 
     def advance(self) -> None:
-        """Advance the ring-buffer pointer after all layers for one token."""
+        """Advance the ring-buffer pointer after all layers have been pushed."""
         self._pos    = (self._pos + 1) % self.T
         self._filled = min(self._filled + 1, self.T)
 
     def get(self, layer: int):
         """
-        Dequantise and return full K, V tensors for attention.
+        Dequantise and return the full K, V tensors for attention.
 
-        Returns K (H, T_filled, d), V (H, T_filled, d)  float32 on CPU.
-        The oldest token is at index 0, newest at index T_filled-1.
+        Returns
+        -------
+        K : (H, T_filled, d)  float32  -- oldest token at index 0
+        V : (H, T_filled, d)  float32
         """
         n = self._filled
         if n == 0:
             empty = _np_cpu.zeros((self.H, 0, self.d), dtype=_np_cpu.float32)
             return empty, empty
 
-        # Indices in ring-buffer order (oldest → newest)
+        # Ring-buffer index order: oldest → newest
         if n < self.T:
             idx = _np_cpu.arange(n)
         else:
             idx = (_np_cpu.arange(n) + self._pos) % self.T
 
-        Kq = self._Kq[layer][:, idx, :]   # (H, n, d) int8
-        Vq = self._Vq[layer][:, idx, :]
-        Ks = self._Ks[layer][:, idx]       # (H, n) float32
-        Vs = self._Vs[layer][:, idx]
+        # Fetch packed storage: (H, n, d) or (H, n, d//2)
+        Kq_raw = self._Kq[layer][:, idx, :]
+        Vq_raw = self._Vq[layer][:, idx, :]
+        Ks     = self._Ks[layer][:, idx]    # (H, n) float32
+        Vs     = self._Vs[layer][:, idx]
 
-        # Dequantise: (H, n, d) * (H, n, 1) then inverse-rotate
-        K_rot = Kq.astype(_np_cpu.float32) * Ks[:, :, None]  # (H, n, d)
+        # Unpack to int8 (no-op for 8-bit path)
+        if self.bits == 8:
+            Kq = Kq_raw.view(_np_cpu.int8)   # (H, n, d)
+            Vq = Vq_raw.view(_np_cpu.int8)
+        else:
+            # Unpack nibbles: (H, n, d//2) → (H, n, d)
+            Kq = self._unpack_nibbles(Kq_raw)
+            Vq = self._unpack_nibbles(Vq_raw)
+
+        # Dequantise: (H, n, d) * (H, n, 1) → float32
+        K_rot = Kq.astype(_np_cpu.float32) * Ks[:, :, None]
         V_rot = Vq.astype(_np_cpu.float32) * Vs[:, :, None]
 
-        # Inverse rotation: (H, n, d) @ (d, d)
-        K = K_rot @ self._Rt   # (H, n, d)
+        # Inverse rotation: (H, n, d) @ (d, d) → (H, n, d)
+        K = K_rot @ self._Rt
         V = V_rot @ self._Rt
         return K, V
 
     def reset(self) -> None:
-        """Clear cache for a new generation sequence."""
+        """Clear the cache for a new generation sequence."""
         self._Kq[...] = 0;  self._Vq[...] = 0
         self._Ks[...] = 0;  self._Vs[...] = 0
         self._pos    = 0;   self._filled  = 0
 
     def memory_bytes(self) -> int:
-        """Bytes used by the compressed cache."""
+        """
+        Actual bytes used by the compressed cache.
+
+        Counts both the quantised value arrays and the float32 scale arrays.
+        """
         return (self._Kq.nbytes + self._Vq.nbytes +
                 self._Ks.nbytes + self._Vs.nbytes)
 
     def compression_ratio(self) -> float:
-        """Compression factor vs float32 storage of same data."""
-        f32 = self.L * self.H * self.T * self.d * 4 * 2   # *2 for K and V
-        return f32 / (self.memory_bytes() + 1e-9)
+        """
+        Compression factor vs storing K and V as raw float32.
+
+        Numerator  : float32 bytes for L×H×T×d  K tensors + same for V.
+        Denominator: actual bytes used (quantised values + scales).
+        """
+        fp32_bytes = self.L * self.H * self.T * self.d * 4 * 2  # K + V
+        return fp32_bytes / (self.memory_bytes() + 1e-9)
 
     def __repr__(self) -> str:
         mb = self.memory_bytes() / 1024 / 1024
