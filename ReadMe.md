@@ -10,10 +10,10 @@ is hand-written. Runs on a free Google Colab T4 GPU.
 
 ```
 GPT/
-├── Neural_Network.py          # Core transformer: forward, backward, Adam, save/load
 ├── build_dataset.py           # Dataset crawler: Gutenberg, Wikipedia, Wikiquote
 ├── miniGPT/
 │   ├── __init__.py
+│   ├── Neural_Network.py      # Core transformer: forward, backward, Adam, save/load
 │   ├── tokenizer.py           # CharTokenizer: encode, decode, one_hot, save/load
 │   ├── data.py                # load_text, make_samples, make_index_arrays
 │   ├── model.py               # MiniGPT: train, generate, save, load
