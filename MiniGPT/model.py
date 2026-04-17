@@ -37,7 +37,7 @@ except ImportError:
     sys.exit(1)
 
 from tokenizer import CharTokenizer
-from data import load_text, make_samples, simplify_text, make_index_arrays
+from data import load_text, simplify_text, make_index_arrays
 
 
 class MiniGPT:

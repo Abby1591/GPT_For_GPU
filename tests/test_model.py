@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'miniGPT'))
 
 try:
-    from model import MiniGPT
+    from MiniGPT.model import MiniGPT
     from tokenizer import CharTokenizer
     HAS_MODEL = True
 except ImportError:

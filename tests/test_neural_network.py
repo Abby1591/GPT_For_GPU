@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 try:
-    from Neural_Network import NeuralNetwork
+    from MiniGPT.Neural_Network import NeuralNetwork
     HAS_NN = True
 except ImportError:
     HAS_NN = False

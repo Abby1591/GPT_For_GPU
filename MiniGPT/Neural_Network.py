@@ -50,6 +50,14 @@ from typing import Dict, List, Literal, Optional, Tuple
 # ---- GPU / CPU backend -------------------------------------------------------
 # Import CuPy as `np` so all array code is device-agnostic.
 # Falls back to NumPy silently if CuPy is not installed.
+# Force Cuda Path to fix Bug where it Doesnt recognize the cuda install untested in google collab needs to be changed in the future
+
+cuda_path = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+
+if os.path.exists(cuda_path):
+    os.environ["CUDA_PATH"] = cuda_path
+    os.environ["PATH"] = cuda_path + r"\bin;" + os.environ["PATH"]
+
 try:
     import cupy as np
     np.cuda.Device(0).use()

@@ -19,7 +19,7 @@ from data import load_text, make_index_arrays, make_samples, simplify_text
 from tokenizer import CharTokenizer
 
 try:
-    from model import MiniGPT
+    from MiniGPT.model import MiniGPT
     HAS_MODEL = True
 except ImportError:
     HAS_MODEL = False
@@ -93,7 +93,6 @@ class TestDataPipeline(unittest.TestCase):
         """make_index_arrays output should agree with make_samples labels."""
         tok     = CharTokenizer(_TEXT)
         encoded = tok.encode(_TEXT)
-        import numpy as np
 
         # make_index_arrays
         X, Y = make_index_arrays(encoded, context_size=4, max_samples=10)
