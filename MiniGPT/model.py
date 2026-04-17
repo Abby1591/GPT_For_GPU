@@ -246,6 +246,8 @@ class MiniGPT:
         # Accept either a file path or a raw string
         if os.path.isfile(text_or_path):
             text = load_text(text_or_path, max_chars=max_chars)
+        elif text_or_path.endswith(".txt"):
+            raise FileNotFoundError(f"Dataset not found: {text_or_path}")
         else:
             text = text_or_path
 
