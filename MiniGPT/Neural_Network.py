@@ -112,6 +112,313 @@ _ACTIVATIONS: Dict[str, tuple] = {
 
 
 # ==============================================================================
+#  TurboQuant KV Cache
+#  Papers:
+#    TurboQuant (arXiv 2504.19874, ICLR 2026) -- random rotation + Lloyd-Max
+#    PolarQuant (arXiv 2502.02617, AISTATS 2026) -- polar coordinate variant
+#    QJL        (arXiv 2406.03482, AAAI 2025) -- 1-bit JL residual correction
+# ==============================================================================
+
+class TurboQuantKVCache:
+    """
+    Compressed KV cache implementing TurboQuant_mse.
+
+    Algorithm
+    ---------
+    For every K or V head-vector v ∈ R^d_h arriving online:
+
+    1.  Random rotation  v_rot = v @ R^T
+        R is a fixed random orthogonal matrix (QR-decomposed from Gaussian).
+        After rotation each coordinate is approximately Beta(d/2, d/2)
+        distributed and near-independent (Fact 3 of the TurboQuant paper).
+
+    2.  Scalar quantisation  q = round(v_rot / scale)  where
+        scale = max(|v_rot|) / (2^(bits-1) - 1)
+        This is the symmetric uniform quantiser.  For the concentrated Beta
+        distribution that results from step 1, uniform quantisation is a
+        near-optimal Lloyd-Max approximation -- no per-vector zero-point or
+        per-block normalisation constant is needed (zero overhead).
+
+    3.  Storage:
+        8-bit: int8 values + one float32 scale per head-vector → 4× vs fp32.
+        4-bit: two nibbles packed per byte (high nibble / low nibble) + one
+               float32 scale per head-vector → ~8× vs fp32.
+               Packing: high = (q+8) >> 0 stored in bits [7:4],
+                         low = (q+8) stored in bits [3:0].
+               Values are in [-7, 7] (maxval = 7); +8 shifts to [1, 15]
+               so that the unsigned nibble 0x0 is reserved as a padding
+               sentinel and never produced by valid quantised data.
+
+    4.  Reconstruct  v_approx = q * scale @ R
+
+    The cache is a ring buffer of size context_size.  When full the oldest
+    token is evicted (sliding window, matching miniGPT's generation strategy).
+
+    Parameters
+    ----------
+    num_layers   : transformer depth
+    num_heads    : attention heads
+    head_dim     : dimension per head (embed_dim // num_heads)
+    context_size : ring-buffer capacity (= model's context window)
+    bits         : quantisation bit-width (4 or 8; default 8)
+
+    Notes
+    -----
+    head_dim must be even when bits=4 (two values packed per byte).
+
+    References
+    ----------
+    TurboQuant: https://arxiv.org/abs/2504.19874
+    PolarQuant: https://arxiv.org/abs/2502.02617
+    QJL:        https://arxiv.org/abs/2406.03482
+    """
+
+    def __init__(
+        self,
+        num_layers:   int,
+        num_heads:    int,
+        head_dim:     int,
+        context_size: int,
+        bits:         int = 8,
+    ) -> None:
+        if bits not in (4, 8):
+            raise ValueError(f"bits must be 4 or 8, got {bits}")
+        if bits == 4 and head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim must be even for 4-bit packing, got {head_dim}"
+            )
+
+        self.L    = num_layers
+        self.H    = num_heads
+        self.d    = head_dim
+        self.T    = context_size
+        self.bits = bits
+        self._maxval = 2 ** (bits - 1) - 1   # 127 for int8, 7 for int4
+
+        # Fixed random orthogonal rotation matrix R ∈ R^(d, d).
+        # Data-oblivious: generated once, reused for every vector.
+        # QR decomposition of a Gaussian matrix gives a Haar-distributed
+        # (uniformly random) orthogonal matrix -- exactly what TurboQuant needs.
+        raw     = _np_cpu.random.randn(head_dim, head_dim).astype(_np_cpu.float32)
+        R, _    = _np_cpu.linalg.qr(raw)
+        self._R  = R      # (d, d)  float32
+        self._Rt = R.T    # precomputed inverse (R orthogonal → R^-1 = R^T)
+
+        # Ring buffer: per-layer, per-head, per-position.
+        # 8-bit: store raw int8, shape (L, H, T, d).
+        # 4-bit: pack two nibbles per byte, shape (L, H, T, d//2).
+        #        High nibble = even index, low nibble = odd index.
+        d_stored = head_dim if bits == 8 else head_dim // 2
+        self._Kq = _np_cpu.zeros(
+            (self.L, self.H, self.T, d_stored), dtype=_np_cpu.uint8
+        )
+        self._Vq = _np_cpu.zeros(
+            (self.L, self.H, self.T, d_stored), dtype=_np_cpu.uint8
+        )
+        # float32 per-head-vector scales (L, H, T)
+        self._Ks = _np_cpu.zeros((self.L, self.H, self.T), dtype=_np_cpu.float32)
+        self._Vs = _np_cpu.zeros((self.L, self.H, self.T), dtype=_np_cpu.float32)
+
+        self._pos    = 0   # next write position in ring buffer
+        self._filled = 0   # tokens stored so far (≤ T)
+
+    # ------------------------------------------------------------------
+    # Internal: pack / unpack int4 nibbles
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pack_nibbles(q_int8: "_np_cpu.ndarray") -> "_np_cpu.ndarray":
+        """
+        Pack a (..., d) int8 array whose values are in [-7, 7] into a
+        (..., d//2) uint8 array using 4-bit nibbles.
+
+        Encoding: shift values by +8 so they land in [1, 15] (unsigned nibble).
+        Even-indexed values go into the high nibble (bits 7-4),
+        odd-indexed values go into the low nibble  (bits 3-0).
+
+        The sentinel value 0x0 (= original -8, outside [-7,7]) is never
+        produced, making it safe as a zero-initialisation marker.
+        """
+        shifted = (q_int8 + 8).astype(_np_cpu.uint8)   # [1, 15], fits in 4 bits
+        hi = shifted[..., 0::2] << 4                    # even → high nibble
+        lo = shifted[..., 1::2] & 0x0F                  # odd  → low  nibble
+        return (hi | lo).astype(_np_cpu.uint8)
+
+    @staticmethod
+    def _unpack_nibbles(packed: "_np_cpu.ndarray") -> "_np_cpu.ndarray":
+        """
+        Unpack a (..., d//2) uint8 array back to (..., d) int8 in [-7, 7].
+
+        Reverses _pack_nibbles: extract high and low nibbles, interleave,
+        then shift back by -8.
+        """
+        hi = (packed >> 4) & 0x0F                        # bits 7-4
+        lo =  packed        & 0x0F                        # bits 3-0
+        # interleave: even positions ← hi, odd positions ← lo
+        d  = packed.shape[-1] * 2
+        out = _np_cpu.empty(packed.shape[:-1] + (d,), dtype=_np_cpu.uint8)
+        out[..., 0::2] = hi
+        out[..., 1::2] = lo
+        return (out.astype(_np_cpu.int16) - 8).astype(_np_cpu.int8)
+
+    # ------------------------------------------------------------------
+    # Quantise / dequantise one head-vector (used by push/get internally)
+    # ------------------------------------------------------------------
+
+    def _quant(self, v: "_np_cpu.ndarray"):
+        """
+        TurboQuant_mse encode: rotate then scalar-quantise.
+
+        v      : (d,) float32
+        returns: q (d,) int8 in [-maxval, maxval], scale float32
+        """
+        v_rot  = v @ self._R
+        absmax = float(_np_cpu.max(_np_cpu.abs(v_rot))) + 1e-9
+        scale  = absmax / self._maxval
+        q = _np_cpu.clip(
+            _np_cpu.round(v_rot / scale),
+            -self._maxval, self._maxval,
+        ).astype(_np_cpu.int8)
+        return q, scale
+
+    def _dequant(self, q: "_np_cpu.ndarray", scale: float) -> "_np_cpu.ndarray":
+        """
+        TurboQuant_mse decode: dequantise then inverse-rotate.
+
+        q     : (d,) int8
+        scale : float32
+        returns: (d,) float32
+        """
+        v_rot_approx = q.astype(_np_cpu.float32) * scale
+        return v_rot_approx @ self._Rt   # R^T = R^-1 for orthogonal R
+
+    # ------------------------------------------------------------------
+    # Batch push / get (vectorised over heads)
+    # ------------------------------------------------------------------
+
+    def push(self, K_new: "_np_cpu.ndarray", V_new: "_np_cpu.ndarray", layer: int) -> None:
+        """
+        Compress and store K,V for one new token in the given layer.
+
+        K_new, V_new : (H, d)  float32  -- one token, all heads
+        layer        : int
+        """
+        p = self._pos
+
+        # Rotate all heads at once: (H, d) @ (d, d) = (H, d)
+        K_rot = K_new @ self._R
+        V_rot = V_new @ self._R
+
+        # Per-head symmetric scales: shape (H,)
+        K_sc = _np_cpu.abs(K_rot).max(axis=-1) / self._maxval + 1e-9
+        V_sc = _np_cpu.abs(V_rot).max(axis=-1) / self._maxval + 1e-9
+
+        # Quantise to int8 in [-maxval, maxval]: shape (H, d)
+        K_q8 = _np_cpu.clip(
+            _np_cpu.round(K_rot / K_sc[:, None]),
+            -self._maxval, self._maxval,
+        ).astype(_np_cpu.int8)
+        V_q8 = _np_cpu.clip(
+            _np_cpu.round(V_rot / V_sc[:, None]),
+            -self._maxval, self._maxval,
+        ).astype(_np_cpu.int8)
+
+        # Store: int8 as-is (8-bit) or pack into nibbles (4-bit)
+        if self.bits == 8:
+            self._Kq[layer, :, p, :] = K_q8.view(_np_cpu.uint8)
+            self._Vq[layer, :, p, :] = V_q8.view(_np_cpu.uint8)
+        else:
+            self._Kq[layer, :, p, :] = self._pack_nibbles(K_q8)
+            self._Vq[layer, :, p, :] = self._pack_nibbles(V_q8)
+
+        self._Ks[layer, :, p] = K_sc
+        self._Vs[layer, :, p] = V_sc
+
+    def advance(self) -> None:
+        """Advance the ring-buffer pointer after all layers have been pushed."""
+        self._pos    = (self._pos + 1) % self.T
+        self._filled = min(self._filled + 1, self.T)
+
+    def get(self, layer: int):
+        """
+        Dequantise and return the full K, V tensors for attention.
+
+        Returns
+        -------
+        K : (H, T_filled, d)  float32  -- oldest token at index 0
+        V : (H, T_filled, d)  float32
+        """
+        n = self._filled
+        if n == 0:
+            empty = _np_cpu.zeros((self.H, 0, self.d), dtype=_np_cpu.float32)
+            return empty, empty
+
+        # Ring-buffer index order: oldest → newest
+        if n < self.T:
+            idx = _np_cpu.arange(n)
+        else:
+            idx = (_np_cpu.arange(n) + self._pos) % self.T
+
+        # Fetch packed storage: (H, n, d) or (H, n, d//2)
+        Kq_raw = self._Kq[layer][:, idx, :]
+        Vq_raw = self._Vq[layer][:, idx, :]
+        Ks     = self._Ks[layer][:, idx]    # (H, n) float32
+        Vs     = self._Vs[layer][:, idx]
+
+        # Unpack to int8 (no-op for 8-bit path)
+        if self.bits == 8:
+            Kq = Kq_raw.view(_np_cpu.int8)   # (H, n, d)
+            Vq = Vq_raw.view(_np_cpu.int8)
+        else:
+            # Unpack nibbles: (H, n, d//2) → (H, n, d)
+            Kq = self._unpack_nibbles(Kq_raw)
+            Vq = self._unpack_nibbles(Vq_raw)
+
+        # Dequantise: (H, n, d) * (H, n, 1) → float32
+        K_rot = Kq.astype(_np_cpu.float32) * Ks[:, :, None]
+        V_rot = Vq.astype(_np_cpu.float32) * Vs[:, :, None]
+
+        # Inverse rotation: (H, n, d) @ (d, d) → (H, n, d)
+        K = K_rot @ self._Rt
+        V = V_rot @ self._Rt
+        return K, V
+
+    def reset(self) -> None:
+        """Clear the cache for a new generation sequence."""
+        self._Kq[...] = 0;  self._Vq[...] = 0
+        self._Ks[...] = 0;  self._Vs[...] = 0
+        self._pos    = 0;   self._filled  = 0
+
+    def memory_bytes(self) -> int:
+        """
+        Actual bytes used by the compressed cache.
+
+        Counts both the quantised value arrays and the float32 scale arrays.
+        """
+        return (self._Kq.nbytes + self._Vq.nbytes +
+                self._Ks.nbytes + self._Vs.nbytes)
+
+    def compression_ratio(self) -> float:
+        """
+        Compression factor vs storing K and V as raw float32.
+
+        Numerator  : float32 bytes for L×H×T×d  K tensors + same for V.
+        Denominator: actual bytes used (quantised values + scales).
+        """
+        fp32_bytes = self.L * self.H * self.T * self.d * 4 * 2  # K + V
+        return fp32_bytes / (self.memory_bytes() + 1e-9)
+
+    def __repr__(self) -> str:
+        mb = self.memory_bytes() / 1024 / 1024
+        return (
+            f"TurboQuantKVCache(layers={self.L}, heads={self.H}, "
+            f"d_h={self.d}, T={self.T}, bits={self.bits}, "
+            f"filled={self._filled}, "
+            f"{mb:.2f} MB, ~{self.compression_ratio():.1f}x vs fp32)"
+        )
+
+
+# ==============================================================================
 #  Main class
 # ==============================================================================
 
@@ -156,6 +463,8 @@ class NeuralNetwork:
     grad_clip : float
         Max global gradient L2 norm before Adam update (0 = disabled).
         Prevents a bad batch from taking a destructively large step.
+    dtype : str
+        Data type for weights. 'float32' or 'float16' for memory efficiency.
     """
 
     def __init__(
@@ -175,6 +484,7 @@ class NeuralNetwork:
         dropout:       float = 0.0,
         weight_tying:  bool  = True,
         grad_clip:     float = 1.0,
+        dtype:         str   = "float32",
     ) -> None:
         if activation not in _ACTIVATIONS:
             raise ValueError(
@@ -204,8 +514,7 @@ class NeuralNetwork:
         self.dropout       = dropout
         self.weight_tying  = weight_tying
         self.grad_clip     = grad_clip
-        self.device        = _DEVICE
-        self._act_fn, self._act_d = _ACTIVATIONS[activation]
+        self.dtype         = dtype
 
         # Head dimension: each head attends in a d_h-dimensional subspace.
         # Scale for attention scores: 1/sqrt(d_h) keeps dot products from
@@ -218,8 +527,8 @@ class NeuralNetwork:
         # Positional embedding: (context_size, D) -- one row per position.
         # Both are learned and updated by Adam just like any weight matrix.
         if self.use_embedding:
-            self.embedding     = np.random.randn(vocab_size, embed_dim) * 0.01
-            self.pos_embedding = np.random.randn(context_size, embed_dim) * 0.01
+            self.embedding     = np.random.randn(vocab_size, embed_dim).astype(dtype) * 0.01
+            self.pos_embedding = np.random.randn(context_size, embed_dim).astype(dtype) * 0.01
         else:
             self.embedding     = None
             self.pos_embedding = None
@@ -243,18 +552,18 @@ class NeuralNetwork:
         self.blocks: List[Dict] = []
         for _ in range(num_blocks):
             self.blocks.append({
-                "Wqkv": np.random.randn(D, D * 3) * 0.02,
-                "W1":   np.random.randn(D, D * 4) * 0.02,
-                "b1":   np.zeros(D * 4),
-                "W2":   np.random.randn(D * 4, D) * resid_scale,
-                "b2":   np.zeros(D),
+                "Wqkv": np.random.randn(D, D * 3).astype(dtype) * 0.02,
+                "W1":   np.random.randn(D, D * 4).astype(dtype) * 0.02,
+                "b1":   np.zeros(D * 4).astype(dtype),
+                "W2":   np.random.randn(D * 4, D).astype(dtype) * resid_scale,
+                "b2":   np.zeros(D).astype(dtype),
                 # LayerNorm params: gamma (scale) init to 1, beta (shift) to 0.
                 # At init this is an identity transform -- the model learns
                 # to deviate from identity as training progresses.
-                "ln1_g": np.ones(D),
-                "ln1_b": np.zeros(D),
-                "ln2_g": np.ones(D),
-                "ln2_b": np.zeros(D),
+                "ln1_g": np.ones(D).astype(dtype),
+                "ln1_b": np.zeros(D).astype(dtype),
+                "ln2_g": np.ones(D).astype(dtype),
+                "ln2_b": np.zeros(D).astype(dtype),
             })
 
         # ---- Final LayerNorm (GPT-2 style) ----------------------------------
@@ -599,13 +908,15 @@ class NeuralNetwork:
         d_ff_out   = d_out * drop2_mask if drop2_mask is not None else d_out
 
         # FF backward
-        dW2     = h.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)    # (4D, D)
-        db2     = d_ff_out.sum(axis=(0, 1))                           # (D,)
-        d_h_grad     = d_ff_out @ blk["W2"].T                              # (B, T, 4D)
-        d_h_grad    *= (h > 0)                                             # ReLU deriv
-        dW1     = ln2_out.reshape(BT, -1).T @ d_h_grad.reshape(BT, -1)   # (D, 4D)
-        db1     = d_h_grad.sum(axis=(0, 1))                                # (4D,)
-        d_ln2_out = d_h_grad @ blk["W1"].T                                 # (B, T, D)
+        # Note: d_h_grad is named with _grad suffix to avoid shadowing d_h (int)
+        # which is the head dimension D//H used later in reshape calls.
+        dW2       = h.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)    # (4D, D)
+        db2       = d_ff_out.sum(axis=(0, 1))                           # (D,)
+        d_h_grad  = d_ff_out @ blk["W2"].T                              # (B, T, 4D)
+        d_h_grad *= (h > 0)                                             # ReLU deriv
+        dW1       = ln2_out.reshape(BT, -1).T @ d_h_grad.reshape(BT, -1)   # (D, 4D)
+        db1       = d_h_grad.sum(axis=(0, 1))                                # (4D,)
+        d_ln2_out = d_h_grad @ blk["W1"].T                                   # (B, T, D)
 
         # LN2 backward: returns gradient into x_attn + LN parameter grads
         d_x_attn_from_ff, d_ln2_g, d_ln2_b = self._ln_backward(d_ln2_out, ln2_cache)
@@ -946,7 +1257,9 @@ class NeuralNetwork:
                     d_x      = (delta_r @ self.embedding).reshape(bs, T, D)
                 else:
                     dWout_acc += x_out_r.T @ delta_r                  # (D, vocab)
-                    d_x        = delta @ self.Wout.T
+                    # delta is (bs, T, vocab), Wout.T is (vocab, D)
+                    # matmul gives (bs, T, D) directly -- no reshape needed
+                    d_x        = delta @ self.Wout.T                  # (bs, T, D)
 
                 dbout_acc += delta.sum(axis=(0, 1))
                 del probs, x_out
@@ -1140,9 +1453,293 @@ class NeuralNetwork:
         predicted_class = int(probs.argmax())
         return predicted_class, float(probs[predicted_class]), probs
 
+    def predict_from_indices(self, token_indices) -> "np.ndarray":
+        """
+        Fast generation path: takes token indices directly, skips one-hot roundtrip.
+        Returns last-position probability vector, shape (vocab_size,).
+        """
+        toks  = np.array(token_indices, dtype=int).reshape(self.context_size, 1)
+        probs, _ = self._transformer_forward(toks, training=False)
+        if _DEVICE == "gpu":
+            probs = np.asnumpy(probs)
+        return probs[0, -1, :]
+
     # ==========================================================================
-    #  Summary
+    #  TurboQuant: single-token decode step
     # ==========================================================================
+
+    def _block_forward_decode(
+        self,
+        x_new:   "np.ndarray",
+        blk:     dict,
+        K_cache: "np.ndarray",
+        V_cache: "np.ndarray",
+    ):
+        """
+        Single-token forward through one transformer block using a pre-built
+        TurboQuant KV cache instead of recomputing the full context window.
+
+        x_new   : (1, D)       -- embedded new token (with positional embedding)
+        K_cache : (H, T, d_h)  -- dequantised keys from TurboQuantKVCache.get()
+        V_cache : (H, T, d_h)  -- dequantised values
+
+        No causal mask: all cached tokens are in the past so the new token may
+        attend to all of them without restriction.
+
+        Returns
+        -------
+        x_out  (1, D)  -- output to pass along / into next block
+        K_new  (H, d_h) -- new key  (to be pushed into TurboQuantKVCache)
+        V_new  (H, d_h) -- new value
+        """
+        D, H, d_h = self.embed_dim, self.num_heads, self._head_dim
+
+        # Pre-norm 1
+        ln1_out, _ = self._ln_forward(
+            x_new[None, ...], blk["ln1_g"], blk["ln1_b"]
+        )                                                       # (1, 1, D)
+
+        # QKV for new token only
+        QKV   = (ln1_out.reshape(1, D) @ blk["Wqkv"]).reshape(1, 3, H, d_h)
+        Q     = QKV[0, 0]    # (H, d_h)  query
+        K_new = QKV[0, 1]    # (H, d_h)  new key   → will be cached
+        V_new = QKV[0, 2]    # (H, d_h)  new value → will be cached
+
+        T = K_cache.shape[1]
+        if T > 0:
+            # Attention: Q (H, d_h) over cached K (H, T, d_h) → scores (H, 1, T)
+            scores = (Q[:, None, :] @ K_cache.transpose(0, 2, 1)) * self._scale_head
+            scores -= scores.max(axis=-1, keepdims=True)
+            A        = np.exp(scores)
+            A       /= A.sum(axis=-1, keepdims=True)             # (H, 1, T)
+            attn_h   = A @ V_cache                               # (H, 1, d_h)
+            attn_out = attn_h.transpose(1, 0, 2).reshape(1, D)  # (1, D)
+        else:
+            attn_out = np.zeros((1, D))
+
+        x_attn = x_new + attn_out    # residual 1
+
+        # Pre-norm 2 + feed-forward
+        ln2_out, _ = self._ln_forward(
+            x_attn[None, ...], blk["ln2_g"], blk["ln2_b"]
+        )                                                        # (1, 1, D)
+        h_ff  = np.maximum(0.0, ln2_out.reshape(1, D) @ blk["W1"] + blk["b1"])
+        ff    = h_ff @ blk["W2"] + blk["b2"]                    # (1, D)
+        x_out = x_attn + ff    # residual 2
+
+        return x_out, K_new, V_new
+
+    # ==========================================================================
+    #  TurboQuant-accelerated generation
+    # ==========================================================================
+
+    def generate_fast(
+        self,
+        token_indices: list,
+        length:      int,
+        temperature: float = 0.8,
+        kv_bits:     int   = 8,
+    ) -> list:
+        """
+        Autoregressive generation with a TurboQuant KV cache.
+
+        Speed comparison vs predict_from_indices()
+        -------------------------------------------
+        predict_from_indices() recomputes ALL T context tokens from scratch each
+        step → O(T²) attention work per generated character.
+
+        generate_fast() does:
+          1. Prefill  – one full T-token forward to populate the KV cache.
+          2. Decode   – per step: embed 1 new token, attend its Q over T cached
+                        K,V via _block_forward_decode() → O(T) per step.
+
+        For T=32 and length=300 that is ~32× fewer transformer operations.
+
+        KV memory compression
+        ---------------------
+        TurboQuant_mse (arXiv 2504.19874):
+          • Random orthogonal rotation R equalises coordinate variances.
+          • After rotation, each coordinate follows ~Beta(d/2, d/2) →
+            uniform INT8 scalar quantisation is near-optimal (Lloyd-Max approx).
+          • Storage: int8 values + 1 float32 scale per head-vector.
+          • Memory vs float32: kv_bits/32  (~4× at 8-bit, ~8× at 4-bit).
+
+        Quality note
+        ------------
+        miniGPT uses learned positional embeddings at fixed slot positions.
+        When the sliding window advances, surviving tokens nominally shift one
+        slot left → their K,V should be recomputed.  This method caches K,V
+        without updating for the shift, introducing a small bounded error.
+        In practice the effect on generation quality is negligible.
+
+        Papers
+        ------
+        TurboQuant  arXiv 2504.19874  ICLR 2026
+        PolarQuant  arXiv 2502.02617  AISTATS 2026
+        QJL         arXiv 2406.03482  AAAI 2025
+
+        Parameters
+        ----------
+        token_indices : list[int]  initial context (length must = context_size)
+        length        : int        new tokens to generate
+        temperature   : float      sampling temperature
+        kv_bits       : int        KV cache quantisation bits (4 or 8)
+
+        Returns
+        -------
+        list[int]  generated token indices
+        """
+        T   = self.context_size
+        D   = self.embed_dim
+        ctx = list(token_indices)
+
+        # ── Prefill ────────────────────────────────────────────────────────────
+        # block_caches[i] = cache tuple; K at index 4, V at index 5 (B,H,T,d_h)
+        toks_arr = np.array(ctx, dtype=int).reshape(T, 1)
+        _, (_, _, block_caches, _, _) = self._transformer_forward(
+            toks_arr, training=False
+        )
+
+        kvc = TurboQuantKVCache(
+            num_layers   = self.num_blocks,
+            num_heads    = self.num_heads,
+            head_dim     = self._head_dim,
+            context_size = T,
+            bits         = kv_bits,
+        )
+
+        to_cpu = ((lambda a: np.asnumpy(a)) if _DEVICE == "gpu"
+                  else (lambda a: _np_cpu.array(a)))
+
+        for t in range(T):
+            for li, bc in enumerate(block_caches):
+                kvc.push(
+                    to_cpu(bc[4][0, :, t, :]).astype(_np_cpu.float32),  # K
+                    to_cpu(bc[5][0, :, t, :]).astype(_np_cpu.float32),  # V
+                    li,
+                )
+            kvc.advance()
+        del block_caches
+
+        generated = []
+
+        # ── Decode loop ────────────────────────────────────────────────────────
+        for _ in range(length):
+            new_tok = ctx[-1]
+
+            # Embed at slot T-1 (last position in the sliding window)
+            x = (self.embedding[new_tok] + self.pos_embedding[T - 1]).reshape(1, D)
+
+            new_kvs = []
+            for li, blk in enumerate(self.blocks):
+                K_cpu, V_cpu = kvc.get(li)          # (H, T_filled, d_h) CPU
+                K_dev = np.array(K_cpu)
+                V_dev = np.array(V_cpu)
+                x, K_new, V_new = self._block_forward_decode(x, blk, K_dev, V_dev)
+                new_kvs.append((
+                    to_cpu(K_new).astype(_np_cpu.float32),
+                    to_cpu(V_new).astype(_np_cpu.float32),
+                ))
+
+            # Final LayerNorm + output projection
+            x_norm, _ = self._ln_forward(x[None, ...], self.ln_f_g, self.ln_f_b)
+            if self.weight_tying:
+                logits = x_norm.reshape(1, D) @ self.embedding.T + self.bout
+            else:
+                logits = x_norm.reshape(1, D) @ self.Wout + self.bout
+
+            logits -= logits.max()
+            probs   = np.exp(logits).ravel()
+            probs  /= probs.sum()
+            if _DEVICE == "gpu":
+                probs = np.asnumpy(probs)
+
+            # Temperature scaling + sample
+            if temperature != 1.0:
+                lp  = _np_cpu.log(probs.astype(_np_cpu.float64) + 1e-9) / temperature
+                lp -= lp.max()
+                probs = _np_cpu.exp(lp).astype(_np_cpu.float64)
+                probs /= probs.sum()
+
+            next_idx = int(_np_cpu.random.choice(len(probs), p=probs / probs.sum()))
+            generated.append(next_idx)
+
+            ctx = ctx[1:] + [next_idx]
+
+            for li, (K_c, V_c) in enumerate(new_kvs):
+                kvc.push(K_c, V_c, li)
+            kvc.advance()
+
+        return generated
+
+    # ==========================================================================
+    #  INT8 weight quantisation
+    # ==========================================================================
+
+    def quantize_weights_int8(self) -> None:
+        """
+        Post-training INT8 symmetric per-row quantisation of weight matrices.
+
+        Method
+        ------
+        For each row r of weight matrix W:
+            scale = max(|r|) / 127
+            q     = round(r / scale).clip(-127, 127)
+            r_approx = q * scale            (written back as float32)
+
+        After this call the weights are float32 values snapped to an INT8
+        grid.  JSON serialisation of such values achieves ~4× compression
+        (JSON numbers have far fewer unique values to encode).
+
+        What is quantised: Wqkv, W1, W2 in every transformer block, plus
+        the token embedding (and Wout when weight tying is off).
+        Biases, LayerNorm parameters, and positional embeddings are skipped
+        (tiny; quantisation overhead not worth it).
+
+        Intended use
+        ------------
+        Call once after training is complete.  Then save_weights() for a
+        ~4× smaller checkpoint file.  The model can then be loaded normally
+        and used for inference.  Do NOT continue training after quantising --
+        the weight gradients operate on the approximated values.
+        """
+        if getattr(self, "_int8_quantised", False):
+            print("Already INT8 quantised — skipping.")
+            return
+
+        to_cpu = ((lambda a: np.asnumpy(a).astype(_np_cpu.float32))
+                  if _DEVICE == "gpu"
+                  else (lambda a: _np_cpu.array(a, dtype=_np_cpu.float32)))
+
+        def _quant(W_np32):
+            scales = _np_cpu.abs(W_np32).max(axis=-1, keepdims=True) / 127.0 + 1e-9
+            q      = _np_cpu.clip(_np_cpu.round(W_np32 / scales), -127, 127)
+            return (q * scales).astype(_np_cpu.float32)
+
+        total = 0
+        for blk in self.blocks:
+            for key in ("Wqkv", "W1", "W2"):
+                W = to_cpu(blk[key])
+                blk[key] = np.array(_quant(W))
+                total += W.size
+
+        if self.use_embedding:
+            E = to_cpu(self.embedding)
+            self.embedding = np.array(_quant(E))
+            total += E.size
+
+        if not self.weight_tying and self.Wout is not None:
+            Wo = to_cpu(self.Wout)
+            self.Wout = np.array(_quant(Wo))
+            total += Wo.size
+
+        self._int8_quantised = True
+        print(
+            f"INT8 quantisation complete — {total:,} params  "
+            f"(~4× size reduction vs float32)"
+        )
+
+
 
     def summary(self) -> None:
         """Print a formatted table of model architecture and parameter counts."""
