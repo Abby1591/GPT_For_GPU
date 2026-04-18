@@ -52,7 +52,10 @@ from typing import Dict, List, Literal, Optional, Tuple
 # Falls back to NumPy silently if CuPy is not installed.
 # Force Cuda Path to fix Bug where it Doesnt recognize the cuda install untested in google collab needs to be changed in the future
 
-cuda_path = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+cuda_path = os.environ.get(
+    "CUDA_PATH",
+    r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4",
+)
 
 if os.path.exists(cuda_path):
     os.environ["CUDA_PATH"] = cuda_path
@@ -92,7 +95,7 @@ Sample         = Tuple[List[float], int]
 # Derivative receives the PRE-activation value z (not the output a).
 
 def _relu(x):                  return np.maximum(0.0, x)
-def _relu_d(x):                return (x > 0).astype(float)
+def _relu_d(x):                return (x > 0).astype(x.dtype)
 
 def _tanh(x):                  return np.tanh(x)
 def _tanh_d(x):                return 1.0 - np.tanh(x) ** 2
@@ -218,8 +221,8 @@ class NeuralNetwork:
         # Positional embedding: (context_size, D) -- one row per position.
         # Both are learned and updated by Adam just like any weight matrix.
         if self.use_embedding:
-            self.embedding     = np.random.randn(vocab_size, embed_dim) * 0.01
-            self.pos_embedding = np.random.randn(context_size, embed_dim) * 0.01
+            self.embedding     = np.random.randn(vocab_size, embed_dim).astype(np.float32) * 0.01
+            self.pos_embedding = np.random.randn(context_size, embed_dim).astype(np.float32) * 0.01
         else:
             self.embedding     = None
             self.pos_embedding = None
@@ -239,46 +242,34 @@ class NeuralNetwork:
         # scaling). With N residual paths each adding variance, this keeps
         # the total residual stream variance under control.
         D            = embed_dim
-        resid_scale  = 0.02 / (2 * num_blocks) ** 0.5
+        resid_scale  = np.float32(0.02 / (2 * num_blocks) ** 0.5)
         self.blocks: List[Dict] = []
         for _ in range(num_blocks):
             self.blocks.append({
-                "Wqkv": np.random.randn(D, D * 3) * 0.02,
-                "W1":   np.random.randn(D, D * 4) * 0.02,
-                "b1":   np.zeros(D * 4),
-                "W2":   np.random.randn(D * 4, D) * resid_scale,
-                "b2":   np.zeros(D),
-                # LayerNorm params: gamma (scale) init to 1, beta (shift) to 0.
-                # At init this is an identity transform -- the model learns
-                # to deviate from identity as training progresses.
-                "ln1_g": np.ones(D),
-                "ln1_b": np.zeros(D),
-                "ln2_g": np.ones(D),
-                "ln2_b": np.zeros(D),
+                "Wqkv": np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02),
+                "W1":   np.random.randn(D, D * 4).astype(np.float32) * np.float32(0.02),
+                "b1":   np.zeros(D * 4, dtype=np.float32),
+                "W2":   np.random.randn(D * 4, D).astype(np.float32) * resid_scale,
+                "b2":   np.zeros(D, dtype=np.float32),
+                "ln1_g": np.ones(D, dtype=np.float32),
+                "ln1_b": np.zeros(D, dtype=np.float32),
+                "ln2_g": np.ones(D, dtype=np.float32),
+                "ln2_b": np.zeros(D, dtype=np.float32),
             })
 
         # ---- Final LayerNorm (GPT-2 style) ----------------------------------
         # Applied once after all transformer blocks, before output projection.
         # Ensures the final representations are well-scaled before the linear
         # output layer reads them.
-        self.ln_f_g = np.ones(D)
-        self.ln_f_b = np.zeros(D)
+        self.ln_f_g = np.ones(D, dtype=np.float32)
+        self.ln_f_b = np.zeros(D, dtype=np.float32)
 
         # ---- Output projection ----------------------------------------------
-        # Maps (B, T, D) -> (B, T, vocab) at ALL token positions.
-        #
-        # WEIGHT TYING: if enabled, Wout is not a separate matrix -- the
-        # forward pass computes x @ embedding.T instead of x @ Wout.
-        # Gradients from the output path accumulate into embedding's Adam
-        # buffers alongside gradients from the embedding lookup path.
-        # This works well because both mappings want similar directions:
-        # "character c" in input space and "predict character c" in output
-        # space are naturally related.
         if weight_tying:
-            self.Wout = None    # no separate matrix; embedding.T used
+            self.Wout = None
         else:
-            self.Wout = np.random.randn(D, output_size) * 0.02
-        self.bout = np.zeros(output_size)
+            self.Wout = np.random.randn(D, output_size).astype(np.float32) * np.float32(0.02)
+        self.bout = np.zeros(output_size, dtype=np.float32)
 
         # ---- Legacy dense weights (backward compatibility only) -------------
         # Old weight files contain these arrays. They are never trained or
@@ -289,9 +280,9 @@ class NeuralNetwork:
         self.biases  = []
         for i in range(len(layer_sizes) - 1):
             fan_in, fan_out = layer_sizes[i], layer_sizes[i + 1]
-            scale = np.sqrt(2.0 / (fan_in + fan_out))   # Xavier/Glorot
-            self.weights.append(np.random.randn(fan_out, fan_in) * scale)
-            self.biases.append(np.zeros((fan_out, 1)))
+            scale = np.sqrt(np.float32(2.0) / np.float32(fan_in + fan_out))
+            self.weights.append(np.random.randn(fan_out, fan_in).astype(np.float32) * scale)
+            self.biases.append(np.zeros((fan_out, 1), dtype=np.float32))
 
         # Adam not initialised until first train() or load_weights() call.
         self._adam_init = False
@@ -432,8 +423,8 @@ class NeuralNetwork:
         if not training or self.dropout == 0.0:
             return x, None
         # Bernoulli mask: 1 with probability (1-dropout), 0 otherwise
-        mask = (np.random.rand(*x.shape) > self.dropout).astype(float)
-        mask /= (1.0 - self.dropout)   # inverted scaling
+        mask = (np.random.rand(*x.shape) > self.dropout).astype(x.dtype)
+        mask /= x.dtype.type(1.0 - self.dropout)   # inverted scaling
         return x * mask, mask
 
     # ==========================================================================
@@ -455,14 +446,14 @@ class NeuralNetwork:
         Cached: only rebuilt when T changes (never in practice).
         """
         if not hasattr(self, "_mask_cache") or self._mask_cache.shape[0] != T:
-            self._mask_cache = np.triu(np.ones((T, T)), k=1) * -1e9
+            self._mask_cache = (np.triu(np.ones((T, T)), k=1) * -1e9).astype(np.float32)
         return self._mask_cache
 
     # ==========================================================================
     #  Transformer block: forward
     # ==========================================================================
 
-    def _block_forward(self, x, blk, training: bool = False):
+    def _block_forward(self, x, blk, training: bool = False, mask=None):
         """
         One causal transformer block with pre-norm and multi-head attention.
 
@@ -505,17 +496,21 @@ class NeuralNetwork:
         # One (D, 3D) matmul produces all of Q, K, V for all heads at once.
         # Reshape to (B, T, 3, H, d_h) then move heads axis forward.
         QKV = (ln1_out.reshape(BT, D) @ blk["Wqkv"]).reshape(B, T, 3, H, d_h)
-        Q = QKV[:, :, 0].transpose((0, 2, 1, 3))    # (B, H, T, d_h)
-        K = QKV[:, :, 1].transpose((0, 2, 1, 3))
-        V = QKV[:, :, 2].transpose((0, 2, 1, 3))
+        Q = QKV[:, :, 0].transpose((0, 2, 1, 3)).copy()    # (B, H, T, d_h)
+        K = QKV[:, :, 1].transpose((0, 2, 1, 3)).copy()
+        V = QKV[:, :, 2].transpose((0, 2, 1, 3)).copy()
+        del QKV                                              # free full buffer
 
         # ---- Scaled dot-product attention (per head) ------------------------
         # scores[b, h, i, j] = how much position i in head h attends to j
         scores  = Q @ K.transpose((0, 1, 3, 2)) * self._scale_head  # (B, H, T, T)
-        scores += self._causal_mask(T)                              # block future
+        if mask is None:
+            mask = self._causal_mask(T)
+        scores += mask                                               # block future
         scores -= scores.max(axis=-1, keepdims=True)                # stable softmax
         exp_s   = np.exp(scores)
         A       = exp_s / exp_s.sum(axis=-1, keepdims=True)         # (B, H, T, T)
+        del scores, exp_s                                            # free VRAM now
 
         # Weighted sum of values, then merge heads back to (B, T, D)
         attn_h   = A @ V                                            # (B, H, T, d_h)
@@ -684,10 +679,15 @@ class NeuralNetwork:
         # Applied to the sum of token + position embeddings.
         x, emb_drop_mask = self._apply_dropout(x, training)
 
+        # Hoist causal mask: T never changes mid-run, so compute once and
+        # pass it into every block rather than calling _causal_mask() inside
+        # _block_forward on every block × batch × epoch iteration.
+        mask = self._causal_mask(toks.shape[1])   # (T, T)
+
         # Transformer blocks
         block_caches = []
         for blk in self.blocks:
-            x, cache = self._block_forward(x, blk, training=training)
+            x, cache = self._block_forward(x, blk, training=training, mask=mask)
             block_caches.append(cache)
 
         # Final LayerNorm: normalise before output projection
@@ -884,6 +884,14 @@ class NeuralNetwork:
         t_idx      = np.arange(T)[None, :]
         b_idx_full = np.arange(self.batch_size)[:, None]
 
+        # Adam step defined once -- lr_eff passed explicitly so the function
+        # is not re-created every epoch as a closure capturing lr_eff.
+        def _adam_step(param, grad, m, v, lr_eff):
+            """In-place Adam update. Zero allocations."""
+            m *= 0.9;   m += 0.1   * grad          # update m (momentum)
+            v *= 0.999; v += 0.001 * grad * grad   # update v (velocity)
+            param -= lr_eff * m / (np.sqrt(v) + 1e-8)
+
         # ================================================================
         #  Epoch loop
         # ================================================================
@@ -1031,9 +1039,9 @@ class NeuralNetwork:
                 if self.use_embedding:
                     all_grads += [de_acc.reshape(-1), dpe_acc.reshape(-1)]
 
-                # Sum of squared norms across all tensors
-                total_norm_sq = sum(float(np.sum(g * g)) for g in all_grads)
-                total_norm    = total_norm_sq ** 0.5
+                # One concatenation + one dot product = one GPU sync instead of N.
+                all_flat   = np.concatenate(all_grads)
+                total_norm = float(np.sqrt(np.dot(all_flat, all_flat)))
 
                 if total_norm > self.grad_clip:
                     # Scale factor < 1 -- shrink all gradients uniformly
@@ -1061,32 +1069,26 @@ class NeuralNetwork:
             bc2    = 1.0 - 0.999 ** t    # (1 - beta2^t)
             lr_eff = epoch_lr * (bc2 ** 0.5) / bc1
 
-            def _adam_step(param, grad, m, v):
-                """In-place Adam update. Zero allocations."""
-                m *= 0.9;   m += 0.1   * grad          # update m (momentum)
-                v *= 0.999; v += 0.001 * grad * grad   # update v (velocity)
-                param -= lr_eff * m / (np.sqrt(v) + 1e-8)
-
             # Update all block parameters
             for blk, acc, adam_buf in zip(
                 self.blocks, blk_grad_acc, self._adam_blocks
             ):
                 for k in blk:
-                    _adam_step(blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"])
+                    _adam_step(blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"], lr_eff)
 
             # Update final LN
-            _adam_step(self.ln_f_g, d_ln_f_g_acc, self._m_ln_f_g, self._v_ln_f_g)
-            _adam_step(self.ln_f_b, d_ln_f_b_acc, self._m_ln_f_b, self._v_ln_f_b)
+            _adam_step(self.ln_f_g, d_ln_f_g_acc, self._m_ln_f_g, self._v_ln_f_g, lr_eff)
+            _adam_step(self.ln_f_b, d_ln_f_b_acc, self._m_ln_f_b, self._v_ln_f_b, lr_eff)
 
             # Update output projection (separate matrix only if not weight-tied)
             if not self.weight_tying:
-                _adam_step(self.Wout, dWout_acc, self._mWout, self._vWout)
-            _adam_step(self.bout, dbout_acc, self._mbout, self._vbout)
+                _adam_step(self.Wout, dWout_acc, self._mWout, self._vWout, lr_eff)
+            _adam_step(self.bout, dbout_acc, self._mbout, self._vbout, lr_eff)
 
             # Update embeddings
             if self.use_embedding:
-                _adam_step(self.embedding,     de_acc,  self._me,  self._ve)
-                _adam_step(self.pos_embedding, dpe_acc, self._mpe, self._vpe)
+                _adam_step(self.embedding,     de_acc,  self._me,  self._ve,  lr_eff)
+                _adam_step(self.pos_embedding, dpe_acc, self._mpe, self._vpe, lr_eff)
 
             # ================================================================
             #  Adaptive LR scheduler
@@ -1352,30 +1354,31 @@ class NeuralNetwork:
         self.biases  = [np.array(b) for b in data["biases"]]
 
         # ---- Embeddings -----------------------------------------------------
-        self.embedding     = np.array(data["embedding"])     if data.get("embedding")     else None
-        self.pos_embedding = np.array(data["pos_embedding"]) if data.get("pos_embedding") else None
+        _f32 = np.float32
+        self.embedding     = np.array(data["embedding"],     dtype=_f32) if data.get("embedding")     else None
+        self.pos_embedding = np.array(data["pos_embedding"], dtype=_f32) if data.get("pos_embedding") else None
 
         # ---- Output projection + final LN -----------------------------------
         if self.weight_tying:
             self.Wout = None
         else:
-            self.Wout = np.array(data["Wout"]) if data.get("Wout") else None
-        self.bout = np.array(data["bout"])
+            self.Wout = np.array(data["Wout"], dtype=_f32) if data.get("Wout") else None
+        self.bout = np.array(data["bout"], dtype=_f32)
 
         D = self.embed_dim
         if data.get("ln_f_g") is not None:
-            self.ln_f_g = np.array(data["ln_f_g"])
-            self.ln_f_b = np.array(data["ln_f_b"])
+            self.ln_f_g = np.array(data["ln_f_g"], dtype=_f32)
+            self.ln_f_b = np.array(data["ln_f_b"], dtype=_f32)
         else:
             # Old file: initialise final LN as identity
-            self.ln_f_g = np.ones(D)
-            self.ln_f_b = np.zeros(D)
+            self.ln_f_g = np.ones(D, dtype=_f32)
+            self.ln_f_b = np.zeros(D, dtype=_f32)
 
         # ---- Transformer blocks ---------------------------------------------
         if "blocks" in data:
             self.blocks = []
             for blk in data["blocks"]:
-                b = {k: np.array(v) for k, v in blk.items()}
+                b = {k: np.array(v, dtype=_f32) for k, v in blk.items()}
 
                 # Upgrade old separate Wq/Wk/Wv -> fused Wqkv
                 if "Wq" in b and "Wqkv" not in b:
@@ -1384,14 +1387,14 @@ class NeuralNetwork:
                     Wq = _cpu(b.pop("Wq"))
                     Wk = _cpu(b.pop("Wk"))
                     Wv = _cpu(b.pop("Wv"))
-                    b["Wqkv"] = np.array(_nl.concatenate([Wq, Wk, Wv], axis=1))
+                    b["Wqkv"] = np.array(_nl.concatenate([Wq, Wk, Wv], axis=1), dtype=_f32)
 
                 # Add LN params if missing (old file without LayerNorm)
                 if "ln1_g" not in b:
-                    b["ln1_g"] = np.ones(D)
-                    b["ln1_b"] = np.zeros(D)
-                    b["ln2_g"] = np.ones(D)
-                    b["ln2_b"] = np.zeros(D)
+                    b["ln1_g"] = np.ones(D, dtype=_f32)
+                    b["ln1_b"] = np.zeros(D, dtype=_f32)
+                    b["ln2_g"] = np.ones(D, dtype=_f32)
+                    b["ln2_b"] = np.zeros(D, dtype=_f32)
 
                 self.blocks.append(b)
         else:
@@ -1399,17 +1402,17 @@ class NeuralNetwork:
             import numpy as _nl
             self.blocks = []
             for _ in range(self.num_blocks):
-                Wq = _nl.array(data["Wq"])
-                Wk = _nl.array(data["Wk"])
-                Wv = _nl.array(data["Wv"])
+                Wq = _nl.array(data["Wq"], dtype=_nl.float32)
+                Wk = _nl.array(data["Wk"], dtype=_nl.float32)
+                Wv = _nl.array(data["Wv"], dtype=_nl.float32)
                 self.blocks.append({
-                    "Wqkv": np.array(_nl.concatenate([Wq, Wk, Wv], axis=1)),
-                    "W1":   np.array(data["W1"]),
-                    "b1":   np.array(data["b1"]),
-                    "W2":   np.array(data["W2"]),
-                    "b2":   np.array(data["b2"]),
-                    "ln1_g": np.ones(D), "ln1_b": np.zeros(D),
-                    "ln2_g": np.ones(D), "ln2_b": np.zeros(D),
+                    "Wqkv": np.array(_nl.concatenate([Wq, Wk, Wv], axis=1), dtype=_f32),
+                    "W1":   np.array(data["W1"], dtype=_f32),
+                    "b1":   np.array(data["b1"], dtype=_f32),
+                    "W2":   np.array(data["W2"], dtype=_f32),
+                    "b2":   np.array(data["b2"], dtype=_f32),
+                    "ln1_g": np.ones(D, dtype=_f32), "ln1_b": np.zeros(D, dtype=_f32),
+                    "ln2_g": np.ones(D, dtype=_f32), "ln2_b": np.zeros(D, dtype=_f32),
                 })
 
         # ---- Adam state -----------------------------------------------------
@@ -1419,30 +1422,30 @@ class NeuralNetwork:
             self._adam_t = data["adam_t"]             # restore step counter
 
             if not self.weight_tying and data.get("adam_mWout"):
-                self._mWout = np.array(data["adam_mWout"])
-                self._vWout = np.array(data["adam_vWout"])
-            self._mbout = np.array(data["adam_mbout"])
-            self._vbout = np.array(data["adam_vbout"])
+                self._mWout = np.array(data["adam_mWout"], dtype=_f32)
+                self._vWout = np.array(data["adam_vWout"], dtype=_f32)
+            self._mbout = np.array(data["adam_mbout"], dtype=_f32)
+            self._vbout = np.array(data["adam_vbout"], dtype=_f32)
 
             if self.use_embedding and data.get("adam_me") is not None:
-                self._me  = np.array(data["adam_me"])
-                self._ve  = np.array(data["adam_ve"])
-                self._mpe = np.array(data["adam_mpe"])
-                self._vpe = np.array(data["adam_vpe"])
+                self._me  = np.array(data["adam_me"],  dtype=_f32)
+                self._ve  = np.array(data["adam_ve"],  dtype=_f32)
+                self._mpe = np.array(data["adam_mpe"], dtype=_f32)
+                self._vpe = np.array(data["adam_vpe"], dtype=_f32)
 
             # Final LN Adam state (absent in old files -> stays zero from _init)
             if data.get("adam_m_ln_f_g") is not None:
-                self._m_ln_f_g = np.array(data["adam_m_ln_f_g"])
-                self._v_ln_f_g = np.array(data["adam_v_ln_f_g"])
-                self._m_ln_f_b = np.array(data["adam_m_ln_f_b"])
-                self._v_ln_f_b = np.array(data["adam_v_ln_f_b"])
+                self._m_ln_f_g = np.array(data["adam_m_ln_f_g"], dtype=_f32)
+                self._v_ln_f_g = np.array(data["adam_v_ln_f_g"], dtype=_f32)
+                self._m_ln_f_b = np.array(data["adam_m_ln_f_b"], dtype=_f32)
+                self._v_ln_f_b = np.array(data["adam_v_ln_f_b"], dtype=_f32)
 
             # Per-block Adam state (includes LN buffers for new files)
             for i, buf in enumerate(data.get("adam_blocks", [])):
                 for k, mv in buf.items():
                     if k in self._adam_blocks[i]:
-                        self._adam_blocks[i][k]["m"] = np.array(mv["m"])
-                        self._adam_blocks[i][k]["v"] = np.array(mv["v"])
+                        self._adam_blocks[i][k]["m"] = np.array(mv["m"], dtype=_f32)
+                        self._adam_blocks[i][k]["v"] = np.array(mv["v"], dtype=_f32)
 
             print(f"  Adam state restored (t={self._adam_t})")
 
