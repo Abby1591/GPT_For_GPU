@@ -72,6 +72,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--load",   metavar="WEIGHTS_FILE",help="Load saved weights for generation only.")
     p.add_argument("--save",   metavar="WEIGHTS_FILE", default="gpt_weights.json",
                    help="Where to save after training.\n(default: gpt_weights.json)")
+    p.add_argument("--no_save", action="store_true",
+                   help="Skip saving weights after training. Overrides --save.")
 
     # ── Training ──────────────────────────────────────────────────────────────
     tg = p.add_argument_group("Training options")
@@ -199,11 +201,12 @@ def main() -> None:
             max_samples  = args.samples,
             max_chars    = args.max_chars,
             simple_vocab = args.simple_vocab,
-            save_every   = args.save_every,
+            save_every   = 0 if args.no_save else args.save_every,
             save_path    = args.save,
             log_every    = args.log_every,
         )
-        model.save(args.save)
+        if not args.no_save:
+            model.save(args.save)
         print("\n-- Sample generation --------------------------------------------------")
         print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature))
 
@@ -228,11 +231,12 @@ def main() -> None:
             max_samples  = args.samples,
             max_chars    = args.max_chars,
             simple_vocab = args.simple_vocab,
-            save_every   = args.save_every,
+            save_every   = 0 if args.no_save else args.save_every,
             save_path    = args.save,
             log_every    = args.log_every,
         )
-        model.save(args.save)
+        if not args.no_save:
+            model.save(args.save)
         print("\n── Sample generation ──────────────────────────────────────────")
         print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature))
 

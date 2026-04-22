@@ -45,21 +45,26 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import numpy as _np_cpu
 from typing import Dict, List, Literal, Optional, Tuple
 
-# ---- GPU / CPU backend -------------------------------------------------------
+
+# ==============================================================================
+#  GPU / CPU backend
+# ==============================================================================
 # Import CuPy as `np` so all array code is device-agnostic.
 # Falls back to NumPy silently if CuPy is not installed.
-# Force Cuda Path to fix Bug where it Doesnt recognize the cuda install untested in google collab needs to be changed in the future
+# Force CUDA path to fix a bug where it doesn't recognise the CUDA install.
+# This path constant may need to be changed for non-Windows or Colab setups.
 
-cuda_path = os.environ.get(
+_CUDA_PATH = os.environ.get(
     "CUDA_PATH",
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4",
 )
 
-if os.path.exists(cuda_path):
-    os.environ["CUDA_PATH"] = cuda_path
-    os.environ["PATH"] = cuda_path + r"\bin;" + os.environ["PATH"]
+if os.path.exists(_CUDA_PATH):
+    os.environ["CUDA_PATH"] = _CUDA_PATH
+    os.environ["PATH"] = _CUDA_PATH + r"\bin;" + os.environ["PATH"]
 
 try:
     import cupy as np
@@ -81,18 +86,20 @@ except Exception:
     _scatter_add = None
     print("CuPy not found -- falling back to CPU (NumPy)")
 
-# CPU numpy is always needed for index operations CuPy does not support.
-import numpy as _np_cpu
 
+# ==============================================================================
+#  Type aliases
+# ==============================================================================
 
-# ---- Type aliases ------------------------------------------------------------
 ActivationName = Literal["sigmoid", "tanh", "relu", "leaky_relu"]
 Sample         = Tuple[List[float], int]
 
 
-# ---- Activation functions and derivatives ------------------------------------
+# ==============================================================================
+#  Activation functions and their derivatives
+# ==============================================================================
 # Each entry is (forward_fn, derivative_fn).
-# Derivative receives the PRE-activation value z (not the output a).
+# Derivatives receive the PRE-activation value z (not the output a).
 
 def _relu(x):                  return np.maximum(0.0, x)
 def _relu_d(x):                return (x > 0).astype(x.dtype)
@@ -115,7 +122,402 @@ _ACTIVATIONS: Dict[str, tuple] = {
 
 
 # ==============================================================================
-#  Main class
+#  Adam optimiser step  (module-level so it can be used without a class instance)
+# ==============================================================================
+
+def _adam_step(param, grad, m, v, lr_eff):
+    """
+    In-place Adam parameter update. Zero allocations.
+
+    Adam update rule (per parameter):
+        m  = beta1*m + (1-beta1)*grad          -- smoothed gradient
+        v  = beta2*v + (1-beta2)*grad^2        -- smoothed squared grad
+        theta -= lr_eff * m / (sqrt(v) + eps)
+
+    Bias correction is pre-baked into lr_eff by the caller:
+        lr_eff = lr * sqrt(1 - beta2^t) / (1 - beta1^t)
+    """
+    m *= 0.9;   m += 0.1   * grad          # momentum
+    v *= 0.999; v += 0.001 * grad * grad   # velocity
+    param -= lr_eff * m / (np.sqrt(v) + 1e-8)
+
+
+# ==============================================================================
+#  KV-Cache base class
+# ==============================================================================
+
+class _KVCacheBase:
+    """
+    Abstract base for compressed KV caches.
+
+    Subclasses implement _encode_* / _decode_* to decide how K and V are
+    actually stored in memory.  The public API is just append() + get().
+
+    Layout: one list of (K_list, V_list) per transformer layer.
+    Each K_list[t] / V_list[t] is a (H, dh) array (one time-step).
+    """
+
+    def __init__(self, num_layers: int, num_heads: int, head_dim: int):
+        self.num_layers = num_layers
+        self.num_heads  = num_heads
+        self.head_dim   = head_dim
+        self._k: List[List] = [[] for _ in range(num_layers)]
+        self._v: List[List] = [[] for _ in range(num_layers)]
+
+    def reset(self) -> None:
+        """Clear all stored K/V (call before each new generation)."""
+        for i in range(self.num_layers):
+            self._k[i].clear()
+            self._v[i].clear()
+
+    # ---- override in subclasses --------------------------------------------
+
+    def _encode_k(self, k: _np_cpu.ndarray) -> object:
+        """Compress a (H, dh) key slice for storage."""
+        return k
+
+    def _decode_k(self, stored: object) -> _np_cpu.ndarray:
+        """Reconstruct a (H, dh) key slice from storage."""
+        return stored
+
+    def _encode_v(self, v: _np_cpu.ndarray) -> object:
+        return v
+
+    def _decode_v(self, stored: object) -> _np_cpu.ndarray:
+        return stored
+
+    # ---- public API --------------------------------------------------------
+
+    def append(
+        self,
+        layer: int,
+        k:     _np_cpu.ndarray,   # (H, dh)
+        v:     _np_cpu.ndarray,   # (H, dh)
+    ) -> None:
+        self._k[layer].append(self._encode_k(k))
+        self._v[layer].append(self._encode_v(v))
+
+    def get(
+        self, layer: int
+    ) -> Tuple[_np_cpu.ndarray, _np_cpu.ndarray]:
+        """Return (K_all, V_all) each (H, T, dh) in float32."""
+        K = _np_cpu.stack([self._decode_k(s) for s in self._k[layer]], axis=1)
+        V = _np_cpu.stack([self._decode_v(s) for s in self._v[layer]], axis=1)
+        return K, V
+
+    def compression_ratio(self) -> float:
+        """Ratio of bytes used vs the equivalent fp32 storage."""
+        raise NotImplementedError
+
+    def __repr__(self) -> str:
+        total = sum(len(self._k[i]) for i in range(self.num_layers))
+        return (
+            f"{self.__class__.__name__}("
+            f"layers={self.num_layers}, heads={self.num_heads}, "
+            f"head_dim={self.head_dim}, stored_steps={total})"
+        )
+
+
+# ==============================================================================
+#  TurboQuantKVCache  --  random-rotation + scalar quantisation
+# ==============================================================================
+
+class TurboQuantKVCache(_KVCacheBase):
+    """
+    Quantised KV cache using the TurboQuant_mse algorithm.
+
+    Algorithm per time-step (encode)
+    ---------------------------------
+    1. Random orthogonal rotation R (Haar-distributed, fixed at construction):
+          k_rot = k @ R.T          shape (H, dh)
+       Rotation spreads any channel-wise outliers across ALL dimensions,
+       making the resulting distribution much easier to quantise uniformly.
+
+    2. Scalar quantisation (int8 or nibble-packed int4):
+       int8  : per-head min/max scaling
+                   scale = (max - min) / 255
+                   zero  = round(-min / scale)
+                   q     = clip(round(x / scale) + zero, 0, 255).astype(uint8)
+       int4  : same per-head scaling, values packed two-per-byte (nibbles)
+                   q4 = clip(round(x / scale) + zero, 0, 15).astype(uint8)
+                   packed[i] = q4[2i] | (q4[2i+1] << 4)
+
+    Decode reverses: unpack -> dequantise -> rotate back (k @ R).
+
+    Parameters
+    ----------
+    num_layers  : number of transformer blocks
+    num_heads   : H
+    head_dim    : dh  (must be even for int4 packing)
+    bits        : 8 (int8) or 4 (nibble-packed int4)
+    seed        : random seed for the rotation matrices
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_heads:  int,
+        head_dim:   int,
+        bits:       int = 8,
+        seed:       int = 42,
+    ):
+        super().__init__(num_layers, num_heads, head_dim)
+        if bits not in (4, 8):
+            raise ValueError("bits must be 4 or 8")
+        if bits == 4 and head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for 4-bit nibble packing")
+        self.bits = bits
+
+        # One rotation matrix per head, fixed for the lifetime of the cache.
+        # Haar-distributed: draw a random matrix, QR-decompose, take Q.
+        rng = _np_cpu.random.default_rng(seed)
+        self._R: List[_np_cpu.ndarray] = []   # R[h] shape (dh, dh)
+        for _ in range(num_heads):
+            A = rng.standard_normal((head_dim, head_dim)).astype(_np_cpu.float32)
+            Q, _ = _np_cpu.linalg.qr(A)
+            self._R.append(Q)
+
+    # ---- int8 quantisation helpers -----------------------------------------
+
+    def _quant8(
+        self, x: _np_cpu.ndarray
+    ) -> Tuple[_np_cpu.ndarray, float, int]:
+        """Quantise (dh,) float32 to uint8. Returns (q, scale, zero)."""
+        mn, mx = float(x.min()), float(x.max())
+        if mx == mn:
+            return _np_cpu.zeros(x.shape, dtype=_np_cpu.uint8), 1.0, 0
+        scale = (mx - mn) / 255.0
+        zero  = int(round(-mn / scale))
+        q     = _np_cpu.clip(
+            _np_cpu.round(x / scale).astype(_np_cpu.int32) + zero, 0, 255
+        ).astype(_np_cpu.uint8)
+        return q, scale, zero
+
+    def _dequant8(
+        self, q: _np_cpu.ndarray, scale: float, zero: int
+    ) -> _np_cpu.ndarray:
+        return (q.astype(_np_cpu.float32) - zero) * scale
+
+    # ---- int4 (nibble-packed) quantisation helpers -------------------------
+
+    def _quant4(
+        self, x: _np_cpu.ndarray
+    ) -> Tuple[_np_cpu.ndarray, float, int]:
+        """Quantise (dh,) float32 to nibble-packed uint8. Returns (packed, scale, zero)."""
+        mn, mx = float(x.min()), float(x.max())
+        if mx == mn:
+            return _np_cpu.zeros(len(x) // 2, dtype=_np_cpu.uint8), 1.0, 0
+        scale  = (mx - mn) / 15.0
+        zero   = int(round(-mn / scale))
+        q4     = _np_cpu.clip(
+            _np_cpu.round(x / scale).astype(_np_cpu.int32) + zero, 0, 15
+        ).astype(_np_cpu.uint8)
+        # Pack two nibbles per byte: low nibble = even index, high = odd index
+        packed = (q4[0::2] & 0x0F) | ((q4[1::2] & 0x0F) << 4)
+        return packed, scale, zero
+
+    def _dequant4(
+        self, packed: _np_cpu.ndarray, scale: float, zero: int, dh: int
+    ) -> _np_cpu.ndarray:
+        q4 = _np_cpu.empty(dh, dtype=_np_cpu.uint8)
+        q4[0::2] = packed & 0x0F
+        q4[1::2] = (packed >> 4) & 0x0F
+        return (q4.astype(_np_cpu.float32) - zero) * scale
+
+    # ---- encode / decode ---------------------------------------------------
+
+    def _encode_k(self, k: _np_cpu.ndarray):
+        """k: (H, dh) -> list of (packed, scale, zero) per head"""
+        out = []
+        for h in range(self.num_heads):
+            k_rot = k[h] @ self._R[h].T          # rotate: (dh,)
+            if self.bits == 8:
+                out.append(self._quant8(k_rot))
+            else:
+                out.append(self._quant4(k_rot))
+        return out
+
+    def _decode_k(self, stored) -> _np_cpu.ndarray:
+        """stored: list of (packed, scale, zero) per head -> (H, dh)"""
+        rows = []
+        dh   = self.head_dim
+        for h, (packed, scale, zero) in enumerate(stored):
+            if self.bits == 8:
+                k_rot = self._dequant8(packed, scale, zero)
+            else:
+                k_rot = self._dequant4(packed, scale, zero, dh)
+            rows.append(k_rot @ self._R[h])       # rotate back: (dh,)
+        return _np_cpu.stack(rows, axis=0)         # (H, dh)
+
+    def _encode_v(self, v: _np_cpu.ndarray):
+        """v: (H, dh) -> list of (packed, scale, zero) per head (no rotation)"""
+        out = []
+        for h in range(self.num_heads):
+            # Values are NOT rotated -- their distribution is already mild.
+            # Per KIVI's analysis, only keys need the rotation treatment.
+            if self.bits == 8:
+                out.append(self._quant8(v[h]))
+            else:
+                out.append(self._quant4(v[h]))
+        return out
+
+    def _decode_v(self, stored) -> _np_cpu.ndarray:
+        rows = []
+        dh   = self.head_dim
+        for h, (packed, scale, zero) in enumerate(stored):
+            if self.bits == 8:
+                rows.append(self._dequant8(packed, scale, zero))
+            else:
+                rows.append(self._dequant4(packed, scale, zero, dh))
+        return _np_cpu.stack(rows, axis=0)   # (H, dh)
+
+    def compression_ratio(self) -> float:
+        """
+        Actual bytes stored vs equivalent fp32 storage.
+        fp32 baseline: H * dh * 4 bytes per (K or V) step.
+        Quantised storage: H * (packed_bytes + 5) per step
+          where packed_bytes = dh for int8, dh//2 for int4
+          and   5 = 4 bytes (float32 scale) + 1 byte (uint8 zero).
+        """
+        dh         = self.head_dim
+        H          = self.num_heads
+        fp32_kv    = H * dh * 4 * 2          # K + V, float32
+        pack_bytes = dh if self.bits == 8 else dh // 2
+        quant_kv   = H * (pack_bytes + 5) * 2  # K + V, quantised
+        return fp32_kv / max(quant_kv, 1)
+
+    def __repr__(self) -> str:
+        base = super().__repr__()
+        return base + f"  bits={self.bits}  ratio={self.compression_ratio():.2f}x"
+
+
+# ==============================================================================
+#  PolarQuantKVCache  --  outlier-aware mixed-precision KV cache
+# ==============================================================================
+
+class PolarQuantKVCache(_KVCacheBase):
+    """
+    Mixed-precision KV cache inspired by QuaRot / ResQ outlier-retention ideas.
+
+    Algorithm
+    ---------
+    Keys are analysed at each step for per-channel magnitude.  Channels whose
+    L∞ magnitude exceeds a dynamic threshold (outlier_factor × median) are
+    kept in float16; the remaining "inlier" channels are quantised to int8.
+
+    Values are always stored at int8 with per-token scaling (KIVI-style).
+
+    This avoids the rotation overhead of TurboQuant and instead surgically
+    retains precision where the distribution would be hard to quantise.
+
+    Parameters
+    ----------
+    num_layers      : transformer blocks
+    num_heads       : H
+    head_dim        : dh
+    outlier_factor  : channels with abs > factor × median(abs) are kept fp16.
+                      Higher = fewer outliers retained (more compression).
+    """
+
+    def __init__(
+        self,
+        num_layers:     int,
+        num_heads:      int,
+        head_dim:       int,
+        outlier_factor: float = 4.0,
+    ):
+        super().__init__(num_layers, num_heads, head_dim)
+        self.outlier_factor = outlier_factor
+
+    # ---- key encode / decode (outlier-aware per-channel) -------------------
+
+    def _encode_k(self, k: _np_cpu.ndarray):
+        """k: (H, dh) -> per-head tuple of (q_inlier, scale, zero, outlier_idx, outlier_vals)"""
+        out = []
+        for h in range(self.num_heads):
+            row   = k[h]                          # (dh,)
+            abs_r = _np_cpu.abs(row)
+            med   = float(_np_cpu.median(abs_r)) + 1e-9
+            thr   = self.outlier_factor * med
+
+            out_idx  = _np_cpu.where(abs_r > thr)[0].astype(_np_cpu.int16)
+            out_vals = row[out_idx].astype(_np_cpu.float16)
+
+            # Zero out outliers before quantising the inlier portion
+            row_in = row.copy()
+            row_in[out_idx] = 0.0
+
+            mn, mx = float(row_in.min()), float(row_in.max())
+            if mx == mn:
+                scale, zero = 1.0, 0
+                q = _np_cpu.zeros(self.head_dim, dtype=_np_cpu.uint8)
+            else:
+                scale = (mx - mn) / 255.0
+                zero  = int(round(-mn / scale))
+                q = _np_cpu.clip(
+                    _np_cpu.round(row_in / scale).astype(_np_cpu.int32) + zero,
+                    0, 255
+                ).astype(_np_cpu.uint8)
+
+            out.append((q, scale, zero, out_idx, out_vals))
+        return out
+
+    def _decode_k(self, stored) -> _np_cpu.ndarray:
+        rows = []
+        for q, scale, zero, out_idx, out_vals in stored:
+            row = (q.astype(_np_cpu.float32) - zero) * scale
+            if len(out_idx):
+                row[out_idx] = out_vals.astype(_np_cpu.float32)
+            rows.append(row)
+        return _np_cpu.stack(rows, axis=0)   # (H, dh)
+
+    # ---- value encode / decode (per-head int8, KIVI-style per-token) -------
+
+    def _encode_v(self, v: _np_cpu.ndarray):
+        out = []
+        for h in range(self.num_heads):
+            row = v[h]
+            mn, mx = float(row.min()), float(row.max())
+            if mx == mn:
+                out.append((_np_cpu.zeros(self.head_dim, dtype=_np_cpu.uint8), 1.0, 0))
+            else:
+                scale = (mx - mn) / 255.0
+                zero  = int(round(-mn / scale))
+                q = _np_cpu.clip(
+                    _np_cpu.round(row / scale).astype(_np_cpu.int32) + zero,
+                    0, 255
+                ).astype(_np_cpu.uint8)
+                out.append((q, scale, zero))
+        return out
+
+    def _decode_v(self, stored) -> _np_cpu.ndarray:
+        rows = []
+        for q, scale, zero in stored:
+            rows.append((q.astype(_np_cpu.float32) - zero) * scale)
+        return _np_cpu.stack(rows, axis=0)   # (H, dh)
+
+    def compression_ratio(self) -> float:
+        """
+        Approximation: assumes ~5% of channels are outliers (kept fp16).
+        fp32 baseline: H * dh * 4 * 2  (K + V).
+        Compressed:    K = H*(dh*1 + dh*0.05*2 + 5),  V = H*(dh*1 + 5)
+        """
+        H         = self.num_heads
+        dh        = self.head_dim
+        fp32_kv   = H * dh * 4 * 2
+        k_bytes   = H * (dh + int(dh * 0.05) * 2 + 5)
+        v_bytes   = H * (dh + 5)
+        return fp32_kv / max(k_bytes + v_bytes, 1)
+
+    def __repr__(self) -> str:
+        base = super().__repr__()
+        return (base +
+                f"  outlier_factor={self.outlier_factor}"
+                f"  ratio≈{self.compression_ratio():.2f}x")
+
+
+# ==============================================================================
+#  NeuralNetwork  --  main model class
 # ==============================================================================
 
 class NeuralNetwork:
@@ -160,6 +562,10 @@ class NeuralNetwork:
         Max global gradient L2 norm before Adam update (0 = disabled).
         Prevents a bad batch from taking a destructively large step.
     """
+
+    # ==========================================================================
+    #  Construction
+    # ==========================================================================
 
     def __init__(
         self,
@@ -217,7 +623,7 @@ class NeuralNetwork:
         self._scale_head = 1.0 / (self._head_dim ** 0.5)
 
         # ---- Token + positional embeddings ----------------------------------
-        # Token embedding:    (vocab_size, D)  -- one row per character.
+        # Token embedding:      (vocab_size, D)  -- one row per character.
         # Positional embedding: (context_size, D) -- one row per position.
         # Both are learned and updated by Adam just like any weight matrix.
         if self.use_embedding:
@@ -241,16 +647,16 @@ class NeuralNetwork:
         # W2 is scaled by 1/sqrt(2*num_blocks) on init (GPT-2 residual
         # scaling). With N residual paths each adding variance, this keeps
         # the total residual stream variance under control.
-        D            = embed_dim
-        resid_scale  = np.float32(0.02 / (2 * num_blocks) ** 0.5)
+        D           = embed_dim
+        resid_scale = np.float32(0.02 / (2 * num_blocks) ** 0.5)
         self.blocks: List[Dict] = []
         for _ in range(num_blocks):
             self.blocks.append({
-                "Wqkv": np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02),
-                "W1":   np.random.randn(D, D * 4).astype(np.float32) * np.float32(0.02),
-                "b1":   np.zeros(D * 4, dtype=np.float32),
-                "W2":   np.random.randn(D * 4, D).astype(np.float32) * resid_scale,
-                "b2":   np.zeros(D, dtype=np.float32),
+                "Wqkv":  np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02),
+                "W1":    np.random.randn(D, D * 4).astype(np.float32) * np.float32(0.02),
+                "b1":    np.zeros(D * 4, dtype=np.float32),
+                "W2":    np.random.randn(D * 4, D).astype(np.float32) * resid_scale,
+                "b2":    np.zeros(D, dtype=np.float32),
                 "ln1_g": np.ones(D, dtype=np.float32),
                 "ln1_b": np.zeros(D, dtype=np.float32),
                 "ln2_g": np.ones(D, dtype=np.float32),
@@ -288,7 +694,7 @@ class NeuralNetwork:
         self._adam_init = False
 
     # ==========================================================================
-    #  Adam optimiser
+    #  Adam optimiser  (initialisation + state)
     # ==========================================================================
 
     def _init_adam(self) -> None:
@@ -296,18 +702,13 @@ class NeuralNetwork:
         Allocate zeroed first-moment (m) and second-moment (v) buffers for
         every learnable parameter.
 
-        Adam update rule (per parameter):
-            m  = beta1*m + (1-beta1)*grad          -- smoothed gradient
-            v  = beta2*v + (1-beta2)*grad^2        -- smoothed squared grad
-            theta -= lr * m_hat / (sqrt(v_hat)+eps)
-
-        m and v together form the "Adam state". Saving and restoring them
-        on resume means the optimizer does NOT forget the momentum it built
-        up over hundreds of epochs -- a clean resume with no warmup needed.
+        Saving and restoring the Adam state on resume means the optimizer
+        does NOT forget the momentum it built up -- a clean resume with no
+        warmup needed.
         """
         z = np.zeros_like
 
-        # Per-block buffers (includes LN params since they are in blk dict)
+        # Per-block buffers (includes LN params since they live in blk dict)
         self._adam_blocks = []
         for blk in self.blocks:
             self._adam_blocks.append(
@@ -332,7 +733,7 @@ class NeuralNetwork:
         self._adam_init = True
 
     # ==========================================================================
-    #  LayerNorm
+    #  LayerNorm  (forward + backward kept together)
     # ==========================================================================
 
     def _ln_forward(self, x, gamma, beta, eps=1e-5):
@@ -346,12 +747,6 @@ class NeuralNetwork:
         Formula:
             x_norm = (x - mean) / sqrt(var + eps)
             out    = gamma * x_norm + beta
-
-        WHY LAYERNORM?
-        Without normalisation, activations can grow or shrink as they
-        pass through blocks, making the loss landscape spiky and hard to
-        optimise. LayerNorm keeps each token's representation on a
-        consistent scale regardless of the input magnitude.
 
         WHY PRE-NORM (before attention/FF)?
         Post-norm (GPT-1 style) normalises the residual stream AFTER adding
@@ -409,7 +804,7 @@ class NeuralNetwork:
     def _apply_dropout(self, x, training: bool):
         """
         Inverted dropout: zero out random activations during training,
-        then SCALE UP the survivors by 1/(1-rate) so the expected sum
+        then scale up the survivors by 1/(1-rate) so the expected sum
         is unchanged.
 
         At inference (training=False) or if dropout=0, returns x unchanged
@@ -440,9 +835,6 @@ class NeuralNetwork:
         future positions to ~0, enforcing the "causal" property:
         position i can only attend to positions 0..i.
 
-        This is what allows autoregressive generation -- the model is
-        trained to never see future tokens, so it cannot at generation time.
-
         Cached: only rebuilt when T changes (never in practice).
         """
         if not hasattr(self, "_mask_cache") or self._mask_cache.shape[0] != T:
@@ -472,8 +864,7 @@ class NeuralNetwork:
 
         WHY MULTIPLE HEADS?
         Each head can learn a different "what to attend to" pattern.
-        Head 0 might learn word boundaries, head 1 might learn repeated
-        characters, head 2 might track vowel/consonant alternation, etc.
+        Head 0 might learn word boundaries, head 1 repeated characters, etc.
         With a single head, all of this must be crammed into one pattern.
 
         The scale is now 1/sqrt(d_h), NOT 1/sqrt(D). This is important:
@@ -484,10 +875,10 @@ class NeuralNetwork:
         Everything needed by backward. x_attn is NOT saved -- recomputed
         cheaply from x + attn_out to save VRAM.
         """
-        B, T, D  = x.shape
-        H        = self.num_heads
-        d_h      = D // H                  # dimension per head
-        BT       = B * T
+        B, T, D = x.shape
+        H       = self.num_heads
+        d_h     = D // H                  # dimension per head
+        BT      = B * T
 
         # ---- Pre-norm 1: normalise before attention -------------------------
         ln1_out, ln1_cache = self._ln_forward(x, blk["ln1_g"], blk["ln1_b"])
@@ -513,8 +904,8 @@ class NeuralNetwork:
         del scores, exp_s                                            # free VRAM now
 
         # Weighted sum of values, then merge heads back to (B, T, D)
-        attn_h   = A @ V                                            # (B, H, T, d_h)
-        attn_out = attn_h.transpose((0, 2, 1, 3)).reshape(B, T, D)   # (B, T, D)
+        attn_h   = A @ V                                             # (B, H, T, d_h)
+        attn_out = attn_h.transpose((0, 2, 1, 3)).reshape(B, T, D)  # (B, T, D)
 
         # Attention dropout (only during training)
         attn_out, drop1_mask = self._apply_dropout(attn_out, training)
@@ -570,10 +961,6 @@ class NeuralNetwork:
         The forward merged H heads. Backward splits d_attn_out back into
         H head-gradients, backprops through each head's softmax and Q/K/V
         matmuls, then concatenates and does the fused Wqkv backward.
-
-        LayerNorm backward
-        ------------------
-        Called via _ln_backward() which returns gradients for x, gamma, beta.
         """
         (
             x, ln1_out, ln1_cache,
@@ -591,16 +978,16 @@ class NeuralNetwork:
         # ---- Residual 2 backward --------------------------------------------
         # d_out flows through BOTH the direct residual (to x_attn) AND the
         # FF branch. Both paths receive the full d_out.
-        d_ff_out   = d_out * drop2_mask if drop2_mask is not None else d_out
+        d_ff_out = d_out * drop2_mask if drop2_mask is not None else d_out
 
         # FF backward
-        dW2     = h.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)    # (4D, D)
-        db2     = d_ff_out.sum(axis=(0, 1))                           # (D,)
-        d_h_grad     = d_ff_out @ blk["W2"].T                              # (B, T, 4D)
+        dW2          = h.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)    # (4D, D)
+        db2          = d_ff_out.sum(axis=(0, 1))                           # (D,)
+        d_h_grad     = d_ff_out @ blk["W2"].T                             # (B, T, 4D)
         d_h_grad    *= (h > 0)                                             # ReLU deriv
-        dW1     = ln2_out.reshape(BT, -1).T @ d_h_grad.reshape(BT, -1)   # (D, 4D)
-        db1     = d_h_grad.sum(axis=(0, 1))                                # (4D,)
-        d_ln2_out = d_h_grad @ blk["W1"].T                                 # (B, T, D)
+        dW1          = ln2_out.reshape(BT, -1).T @ d_h_grad.reshape(BT, -1)  # (D, 4D)
+        db1          = d_h_grad.sum(axis=(0, 1))                           # (4D,)
+        d_ln2_out    = d_h_grad @ blk["W1"].T                             # (B, T, D)
 
         # LN2 backward: returns gradient into x_attn + LN parameter grads
         d_x_attn_from_ff, d_ln2_g, d_ln2_b = self._ln_backward(d_ln2_out, ln2_cache)
@@ -629,7 +1016,7 @@ class NeuralNetwork:
 
         # Backward through Q @ K^T
         dQ = dS @ K                                             # (B, H, T, d_h)
-        dK = dS.transpose((0, 1, 3, 2)) @ Q                      # (B, H, T, d_h)
+        dK = dS.transpose((0, 1, 3, 2)) @ Q                    # (B, H, T, d_h)
 
         # Reshape back: (B, H, T, d_h) -> (B, T, H, d_h) -> (BT, D)
         dQ_r = dQ.transpose((0, 2, 1, 3)).reshape(BT, D)
@@ -658,7 +1045,7 @@ class NeuralNetwork:
         return d_x, grads
 
     # ==========================================================================
-    #  Full forward pass
+    #  Full transformer forward pass
     # ==========================================================================
 
     def _transformer_forward(self, token_idx_batch, training: bool = False):
@@ -676,12 +1063,10 @@ class NeuralNetwork:
         x = self.embedding[toks] + self.pos_embedding              # (B, T, D)
 
         # Embedding dropout: randomly zero full embedding vectors.
-        # Applied to the sum of token + position embeddings.
         x, emb_drop_mask = self._apply_dropout(x, training)
 
         # Hoist causal mask: T never changes mid-run, so compute once and
-        # pass it into every block rather than calling _causal_mask() inside
-        # _block_forward on every block × batch × epoch iteration.
+        # pass it into every block rather than recomputing per block.
         mask = self._causal_mask(toks.shape[1])   # (T, T)
 
         # Transformer blocks
@@ -709,22 +1094,22 @@ class NeuralNetwork:
 
     def forward(self, inputs):
         """
-        Single-sample forward pass used by generate().
+        Single-sample forward pass used by generate() and predict().
         training=False so dropout is disabled.
-        Returns last-position probabilities for the next character.
+        Returns (zs, activations, probs) where probs is last-position only.
 
-        Fast path: if inputs is a plain Python list/array of integer token
+        Fast path: if inputs is a plain list/array of integer token
         indices (length == context_size), skip one-hot encode/decode entirely
         and pass directly to _transformer_forward.  This is ~vocab_size x
-        faster per generate step (no one_hot() loop, no argmax decode).
+        faster per generate step.
 
         Legacy path: flat float one-hot vector (context_size * vocab_size
-        elements) — kept for backward compatibility with any external callers.
+        elements) -- kept for backward compatibility with external callers.
         """
         if self.use_embedding:
             # Fast path: caller already has integer indices
             if (len(inputs) == self.context_size
-                    and not isinstance(inputs[0], float)):
+                    and isinstance(inputs[0], (int, _np_cpu.integer))):
                 toks = np.array(inputs, dtype=int).reshape(
                     self.context_size, 1
                 )
@@ -785,22 +1170,16 @@ class NeuralNetwork:
         Before each Adam update, the global L2 norm of ALL gradients is
         computed. If it exceeds grad_clip, every gradient tensor is scaled
         down proportionally so the norm equals grad_clip exactly.
-        This prevents a single bad batch from taking a destructively
-        large weight update step.
 
         Adaptive LR
         -----------
         Warmup (fresh training only, epochs 0-4):
-            Ramp lr from lr/5 -> lr_max. Skipped on resume because Adam
-            already has built-up momentum estimates.
+            Ramp lr from lr/5 -> lr_max. Skipped on resume.
         Bounce (loss increases 2+ consecutive epochs):
             lr *= 0.7  -- model overshot, take smaller steps.
         Plateau (no new best for 5 epochs):
             lr *= 0.7  -- model stuck, try finer steps.
         Floored at lr_max / 5.
-
-        At the end of training, self.learning_rate is updated to the final
-        adaptive lr so that the next resume starts from the right value.
         """
         if not self._adam_init:
             self._init_adam()
@@ -844,8 +1223,7 @@ class NeuralNetwork:
         )
 
         # ---- Resume detection -----------------------------------------------
-        # If Adam state was loaded (_adam_t > 0), skip warmup and use the
-        # saved lr directly -- no need to re-ramp from scratch.
+        # If Adam state was loaded (_adam_t > 0), skip warmup.
         _resuming = self._adam_init and self._adam_t > 0
         epoch_lr  = lr_max if not _resuming else self.learning_rate
 
@@ -867,6 +1245,7 @@ class NeuralNetwork:
             {k: np.zeros_like(v) for k, v in blk.items()}
             for blk in self.blocks
         ]
+
         # Final LN gradient buffers
         d_ln_f_g_acc = np.zeros_like(self.ln_f_g)
         d_ln_f_b_acc = np.zeros_like(self.ln_f_b)
@@ -883,14 +1262,6 @@ class NeuralNetwork:
         T          = ctx_size
         t_idx      = np.arange(T)[None, :]
         b_idx_full = np.arange(self.batch_size)[:, None]
-
-        # Adam step defined once -- lr_eff passed explicitly so the function
-        # is not re-created every epoch as a closure capturing lr_eff.
-        def _adam_step(param, grad, m, v, lr_eff):
-            """In-place Adam update. Zero allocations."""
-            m *= 0.9;   m += 0.1   * grad          # update m (momentum)
-            v *= 0.999; v += 0.001 * grad * grad   # update v (velocity)
-            param -= lr_eff * m / (np.sqrt(v) + 1e-8)
 
         # ================================================================
         #  Epoch loop
@@ -909,8 +1280,7 @@ class NeuralNetwork:
             X_shuf = X_idx[:, idx_np]
             Y_shuf = Y_idx[:, idx_np]
 
-            total_loss   = 0.0
-            self._adam_t += 1
+            total_loss = 0.0
 
             # Zero all gradient buffers in-place (no allocations)
             for acc in blk_grad_acc:
@@ -959,17 +1329,17 @@ class NeuralNetwork:
                 delta  = probs    # alias, not a copy
 
                 # ---- Output projection backward ----------------------------
-                bs_T = bs * T
+                bs_T    = bs * T
                 delta_r = delta.reshape(bs_T, vs)
                 x_out_r = x_out.reshape(bs_T, D)
 
                 if self.weight_tying:
                     # Gradient to embedding from the output path:
                     #   logits = x @ embedding.T  =>  d_embedding += delta.T @ x
-                    de_acc  += delta_r.T @ x_out_r                   # (vocab, D)
-                    d_x      = (delta_r @ self.embedding).reshape(bs, T, D)
+                    de_acc += delta_r.T @ x_out_r                   # (vocab, D)
+                    d_x     = (delta_r @ self.embedding).reshape(bs, T, D)
                 else:
-                    dWout_acc += x_out_r.T @ delta_r                  # (D, vocab)
+                    dWout_acc += x_out_r.T @ delta_r                 # (D, vocab)
                     d_x        = delta @ self.Wout.T
 
                 dbout_acc += delta.sum(axis=(0, 1))
@@ -992,7 +1362,6 @@ class NeuralNetwork:
                 del block_caches
 
                 # ---- Embedding gradients ------------------------------------
-                # Apply embedding dropout gradient (if dropout was used)
                 if emb_drop_mask is not None:
                     d_x = d_x * emb_drop_mask
 
@@ -1061,9 +1430,12 @@ class NeuralNetwork:
             # ================================================================
             #  Adam parameter updates
             # ================================================================
-            # Bias correction is computed once per epoch and baked into lr_eff
-            # rather than recomputed per-parameter-tensor (saves ~16 power ops).
+            # Increment step counter once per gradient update (i.e. per epoch,
+            # since we accumulate gradients over all batches before stepping).
+            # Bias correction is baked into lr_eff rather than recomputed
+            # per-parameter-tensor (saves ~16 power ops).
             #   lr_eff = epoch_lr * sqrt(1 - beta2^t) / (1 - beta1^t)
+            self._adam_t += 1
             t      = self._adam_t
             bc1    = 1.0 - 0.9   ** t    # (1 - beta1^t)
             bc2    = 1.0 - 0.999 ** t    # (1 - beta2^t)
@@ -1126,10 +1498,9 @@ class NeuralNetwork:
                         plateau_count = 0
             prev_loss = total_loss
 
-            # ---- Logging ----------------------------------------------------
+            # ---- Logging ------------------------------------------------
             if log_every and epoch % log_every == 0:
                 # equiv = mean cross-entropy per (sample, position) pair.
-                # Comparable across runs with different context lengths.
                 equiv = total_loss / (n * ctx_size)
                 print(
                     f"Epoch {epoch:>6} | Loss: {total_loss:.2f}  "
@@ -1137,7 +1508,7 @@ class NeuralNetwork:
                     flush=True,
                 )
 
-            # ---- Checkpoint -------------------------------------------------
+            # ---- Checkpoint ---------------------------------------------
             if save_every and epoch > 0 and epoch % save_every == 0:
                 self.save_weights(save_path)
                 print(f"  checkpoint saved -> {save_path}", flush=True)
@@ -1147,7 +1518,7 @@ class NeuralNetwork:
         print(f"Training complete. (final lr={epoch_lr:.6f})")
 
     # ==========================================================================
-    #  Predict (generation)
+    #  Predict
     # ==========================================================================
 
     def predict(self, inputs) -> Tuple[int, float, "np.ndarray"]:
@@ -1190,17 +1561,17 @@ class NeuralNetwork:
         if self.use_embedding:
             edim = f"{self.vocab_size} chars x {D}d  context={self.context_size}"
             print(f"|  {'Embedding':<18} | {edim:<{width-24}}|")
-        blk_str = f"{self.num_blocks} blocks  heads={self.num_heads}  d_head={d_h}"
-        print(f"|  {'Architecture':<18} | {blk_str:<{width-24}}|")
+        blk_str  = f"{self.num_blocks} blocks  heads={self.num_heads}  d_head={d_h}"
         attn_str = f"causal MHA {D}x{D*3} ({attn_p} params/block)"
         ff_str   = f"{D}->{D*4}->{D} ({ff_p} params/block)"
         ln_str   = f"pre-norm x2/block + final LN ({ln_p + ln_f_p} params)"
-        print(f"|  {'Attention':<18} | {attn_str:<{width-24}}|")
-        print(f"|  {'Feed-forward':<18} | {ff_str:<{width-24}}|")
-        print(f"|  {'LayerNorm':<18} | {ln_str:<{width-24}}|")
         wt_str   = "ON (embedding.T)" if self.weight_tying else "OFF (separate)"
         dp_str   = f"{self.dropout:.2f}" if self.dropout > 0 else "OFF"
         gc_str   = f"{self.grad_clip}" if self.grad_clip > 0 else "OFF"
+        print(f"|  {'Architecture':<18} | {blk_str:<{width-24}}|")
+        print(f"|  {'Attention':<18} | {attn_str:<{width-24}}|")
+        print(f"|  {'Feed-forward':<18} | {ff_str:<{width-24}}|")
+        print(f"|  {'LayerNorm':<18} | {ln_str:<{width-24}}|")
         print(f"|  {'Weight tying':<18} | {wt_str:<{width-24}}|")
         print(f"|  {'Dropout':<18} | {dp_str:<{width-24}}|")
         print(f"|  {'Grad clip':<18} | {gc_str:<{width-24}}|")
@@ -1211,7 +1582,7 @@ class NeuralNetwork:
         print("+" + "=" * width + "+")
 
     # ==========================================================================
-    #  Save
+    #  Save / Load weights
     # ==========================================================================
 
     def save_weights(self, filename: str = "weights.json") -> None:
@@ -1219,7 +1590,8 @@ class NeuralNetwork:
         Save all weights, Adam state, and hyperparameters to JSON.
 
         ATOMIC WRITE: writes to a temp file first, then renames atomically.
-        If Colab disconnects mid-save, the previous checkpoint remains intact.
+        If the process is interrupted mid-save, the previous checkpoint
+        remains intact.
 
         Files are written without indentation (compact JSON) to keep them
         ~4x smaller than pretty-printed versions (~50MB vs ~200MB).
@@ -1263,27 +1635,27 @@ class NeuralNetwork:
             "embedding":     to_list(self.embedding)     if self.use_embedding else None,
             "pos_embedding": to_list(self.pos_embedding) if self.use_embedding else None,
             # ---- Transformer weights ------------------------------------
-            "Wout": to_list(self.Wout) if not self.weight_tying else None,
-            "bout": to_list(self.bout),
+            "Wout":   to_list(self.Wout) if not self.weight_tying else None,
+            "bout":   to_list(self.bout),
             "ln_f_g": to_list(self.ln_f_g),
             "ln_f_b": to_list(self.ln_f_b),
             "blocks": [{k: to_list(v) for k, v in blk.items()}
                        for blk in self.blocks],
             # ---- Adam state ---------------------------------------------
-            "adam_t":      self._adam_t if self._adam_init else 0,
-            "adam_mWout":  to_list(self._mWout) if (self._adam_init and not self.weight_tying) else None,
-            "adam_vWout":  to_list(self._vWout) if (self._adam_init and not self.weight_tying) else None,
-            "adam_mbout":  to_list(self._mbout) if self._adam_init else None,
-            "adam_vbout":  to_list(self._vbout) if self._adam_init else None,
-            "adam_me":     to_list(self._me)  if (self._adam_init and self.use_embedding) else None,
-            "adam_ve":     to_list(self._ve)  if (self._adam_init and self.use_embedding) else None,
-            "adam_mpe":    to_list(self._mpe) if (self._adam_init and self.use_embedding) else None,
-            "adam_vpe":    to_list(self._vpe) if (self._adam_init and self.use_embedding) else None,
+            "adam_t":        self._adam_t if self._adam_init else 0,
+            "adam_mWout":    to_list(self._mWout) if (self._adam_init and not self.weight_tying) else None,
+            "adam_vWout":    to_list(self._vWout) if (self._adam_init and not self.weight_tying) else None,
+            "adam_mbout":    to_list(self._mbout) if self._adam_init else None,
+            "adam_vbout":    to_list(self._vbout) if self._adam_init else None,
+            "adam_me":       to_list(self._me)    if (self._adam_init and self.use_embedding) else None,
+            "adam_ve":       to_list(self._ve)    if (self._adam_init and self.use_embedding) else None,
+            "adam_mpe":      to_list(self._mpe)   if (self._adam_init and self.use_embedding) else None,
+            "adam_vpe":      to_list(self._vpe)   if (self._adam_init and self.use_embedding) else None,
             "adam_m_ln_f_g": to_list(self._m_ln_f_g) if self._adam_init else None,
             "adam_v_ln_f_g": to_list(self._v_ln_f_g) if self._adam_init else None,
             "adam_m_ln_f_b": to_list(self._m_ln_f_b) if self._adam_init else None,
             "adam_v_ln_f_b": to_list(self._v_ln_f_b) if self._adam_init else None,
-            "adam_blocks": adam_blocks,
+            "adam_blocks":   adam_blocks,
         }
 
         # Atomic write: temp file in same dir, then os.replace (atomic on Linux)
@@ -1299,10 +1671,6 @@ class NeuralNetwork:
 
         print(f"Weights saved to '{filename}'.")
 
-    # ==========================================================================
-    #  Load
-    # ==========================================================================
-
     def load_weights(self, filename: str = "weights.json") -> None:
         """
         Load weights, hyperparameters, and Adam state from a JSON file.
@@ -1317,8 +1685,7 @@ class NeuralNetwork:
 
         When loading an old file into the new architecture:
           - LN params are initialised to identity (gamma=1, beta=0).
-            These are essentially no-ops initially and will be learned.
-          - num_heads defaults to 1 (single-head, safe for old Wqkv shapes).
+          - num_heads defaults to 1 (safe for old Wqkv shapes).
           - weight_tying defaults to False (old files have a separate Wout).
         """
         if not os.path.exists(filename):
@@ -1340,8 +1707,7 @@ class NeuralNetwork:
         self.context_size  = data.get("context_size",  0)
         self.embed_dim     = data.get("embed_dim",     64)
         self.num_blocks    = data.get("num_blocks",    2)
-        # Old files default to 1 head (single-head safe for old Wqkv shapes)
-        self.num_heads     = data.get("num_heads",     1)
+        self.num_heads     = data.get("num_heads",     1)   # old files default to 1 head
         self.dropout       = data.get("dropout",       0.0)
         self.weight_tying  = data.get("weight_tying",  False)
         self.grad_clip     = data.get("grad_clip",     1.0)
@@ -1349,12 +1715,13 @@ class NeuralNetwork:
         self._head_dim     = self.embed_dim // self.num_heads
         self._scale_head   = 1.0 / (self._head_dim ** 0.5)
 
+        _f32 = np.float32
+
         # ---- Legacy dense weights -------------------------------------------
         self.weights = [np.array(w) for w in data["weights"]]
         self.biases  = [np.array(b) for b in data["biases"]]
 
         # ---- Embeddings -----------------------------------------------------
-        _f32 = np.float32
         self.embedding     = np.array(data["embedding"],     dtype=_f32) if data.get("embedding")     else None
         self.pos_embedding = np.array(data["pos_embedding"], dtype=_f32) if data.get("pos_embedding") else None
 
@@ -1382,12 +1749,10 @@ class NeuralNetwork:
 
                 # Upgrade old separate Wq/Wk/Wv -> fused Wqkv
                 if "Wq" in b and "Wqkv" not in b:
-                    import numpy as _nl
-                    def _cpu(a): return np.asnumpy(a) if _DEVICE == "gpu" else a
-                    Wq = _cpu(b.pop("Wq"))
-                    Wk = _cpu(b.pop("Wk"))
-                    Wv = _cpu(b.pop("Wv"))
-                    b["Wqkv"] = np.array(_nl.concatenate([Wq, Wk, Wv], axis=1), dtype=_f32)
+                    Wq = _np_cpu.array(b.pop("Wq") if _DEVICE == "cpu" else np.asnumpy(b.pop("Wq")))
+                    Wk = _np_cpu.array(b.pop("Wk") if _DEVICE == "cpu" else np.asnumpy(b.pop("Wk")))
+                    Wv = _np_cpu.array(b.pop("Wv") if _DEVICE == "cpu" else np.asnumpy(b.pop("Wv")))
+                    b["Wqkv"] = np.array(_np_cpu.concatenate([Wq, Wk, Wv], axis=1), dtype=_f32)
 
                 # Add LN params if missing (old file without LayerNorm)
                 if "ln1_g" not in b:
@@ -1398,19 +1763,18 @@ class NeuralNetwork:
 
                 self.blocks.append(b)
         else:
-            # Very old single-weight format
-            import numpy as _nl
+            # Very old single-weight format: replicate shared weights per block
             self.blocks = []
             for _ in range(self.num_blocks):
-                Wq = _nl.array(data["Wq"], dtype=_nl.float32)
-                Wk = _nl.array(data["Wk"], dtype=_nl.float32)
-                Wv = _nl.array(data["Wv"], dtype=_nl.float32)
+                Wq = _np_cpu.array(data["Wq"], dtype=_np_cpu.float32)
+                Wk = _np_cpu.array(data["Wk"], dtype=_np_cpu.float32)
+                Wv = _np_cpu.array(data["Wv"], dtype=_np_cpu.float32)
                 self.blocks.append({
-                    "Wqkv": np.array(_nl.concatenate([Wq, Wk, Wv], axis=1), dtype=_f32),
-                    "W1":   np.array(data["W1"], dtype=_f32),
-                    "b1":   np.array(data["b1"], dtype=_f32),
-                    "W2":   np.array(data["W2"], dtype=_f32),
-                    "b2":   np.array(data["b2"], dtype=_f32),
+                    "Wqkv":  np.array(_np_cpu.concatenate([Wq, Wk, Wv], axis=1), dtype=_f32),
+                    "W1":    np.array(data["W1"], dtype=_f32),
+                    "b1":    np.array(data["b1"], dtype=_f32),
+                    "W2":    np.array(data["W2"], dtype=_f32),
+                    "b2":    np.array(data["b2"], dtype=_f32),
                     "ln1_g": np.ones(D, dtype=_f32), "ln1_b": np.zeros(D, dtype=_f32),
                     "ln2_g": np.ones(D, dtype=_f32), "ln2_b": np.zeros(D, dtype=_f32),
                 })
@@ -1463,3 +1827,183 @@ class NeuralNetwork:
             f"Wout={wt}, causal=True, all_positions=True, "
             f"lr={self.learning_rate}, device='{self.device}')"
         )
+
+    # ==========================================================================
+    #  Autoregressive generation  (+ KV-cache helpers)
+    # ==========================================================================
+
+    def generate(
+        self,
+        prompt_ids:  List[int],
+        max_new:     int = 200,
+        temperature: float = 1.0,
+        top_k:       int = 0,
+        kv_cache:    Optional[_KVCacheBase] = None,
+    ) -> List[int]:
+        """
+        Autoregressive generation with optional KV-cache acceleration.
+
+        Without a cache every new token reruns the full context through all
+        blocks (O(T²) work per step).  With a cache each step is O(1) in
+        context length: we store K and V from past positions and only compute
+        Q for the new token, then look up K/V from the cache.
+
+        Parameters
+        ----------
+        prompt_ids  : list of integer token indices (the prompt).
+        max_new     : how many new tokens to sample.
+        temperature : softmax temperature (1.0 = unchanged, <1 = sharper).
+        top_k       : if > 0, restrict sampling to the top-k logits.
+        kv_cache    : a TurboQuantKVCache or PolarQuantKVCache instance, or
+                      None to use the plain full-context forward pass.
+
+        Returns
+        -------
+        List of generated token indices (not including the prompt).
+        """
+        ctx = self.context_size
+        ids = list(prompt_ids[-ctx:])          # seed context (trimmed to ctx)
+        out = []
+
+        if kv_cache is not None:
+            kv_cache.reset()
+            self._kv_prefill(ids, kv_cache)
+
+        for _ in range(max_new):
+            if kv_cache is not None:
+                # Incremental: only the last token needs a new Q projection.
+                logits = self._kv_decode_step(ids[-1], len(ids) - 1, kv_cache)
+            else:
+                # Fallback: full recompute every step.
+                toks      = _np_cpu.array(ids, dtype=_np_cpu.int32).reshape(-1, 1)
+                probs_all, _ = self._transformer_forward(
+                    np.array(toks), training=False
+                )
+                if _DEVICE == "gpu":
+                    probs_all = np.asnumpy(probs_all)
+                logits = probs_all[0, -1, :]     # (vocab,)  already softmax'd
+                # Undo softmax so temperature / top-k apply cleanly below.
+                logits = _np_cpu.log(logits + 1e-9)
+
+            # Temperature + top-k sampling
+            logits = _np_cpu.array(logits, dtype=_np_cpu.float32)
+            logits /= max(temperature, 1e-6)
+            if top_k > 0:
+                kth = _np_cpu.partition(logits, -top_k)[-top_k]
+                logits[logits < kth] = -1e9
+            logits -= logits.max()
+            probs   = _np_cpu.exp(logits)
+            probs  /= probs.sum()
+            token   = int(_np_cpu.random.choice(len(probs), p=probs))
+
+            out.append(token)
+            ids.append(token)
+            if len(ids) > ctx:
+                ids = ids[-ctx:]
+
+        return out
+
+    def _kv_prefill(self, ids: List[int], kv_cache: _KVCacheBase) -> None:
+        """Run all prompt tokens through every block, storing K and V."""
+        D  = self.embed_dim
+        H  = self.num_heads
+        dh = D // H
+
+        toks_np = _np_cpu.array(ids, dtype=_np_cpu.int32).reshape(-1, 1)
+        toks    = np.array(toks_np)           # (T, 1)
+        T       = len(ids)
+
+        x    = self.embedding[toks.T[0]] + self.pos_embedding[:T]  # (T, D)
+        x    = x[None]                                               # (1, T, D)
+        mask = self._causal_mask(T)
+
+        for layer_idx, blk in enumerate(self.blocks):
+            ln1_out, _ = self._ln_forward(x, blk["ln1_g"], blk["ln1_b"])
+            QKV = (ln1_out.reshape(T, D) @ blk["Wqkv"]).reshape(T, 3, H, dh)
+            K = QKV[:, 1].transpose((1, 0, 2))   # (H, T, dh)
+            V = QKV[:, 2].transpose((1, 0, 2))   # (H, T, dh)
+
+            if _DEVICE == "gpu":
+                K = np.asnumpy(K)
+                V = np.asnumpy(V)
+
+            for t in range(T):
+                kv_cache.append(layer_idx,
+                                K[:, t, :],   # (H, dh)
+                                V[:, t, :])   # (H, dh)
+
+            # Run the full block forward so x is correct for the next layer.
+            x, _ = self._block_forward(x, blk, training=False, mask=mask)
+
+    def _kv_decode_step(
+        self,
+        token_id: int,
+        pos:      int,
+        kv_cache: _KVCacheBase,
+    ) -> "_np_cpu.ndarray":
+        """
+        Single-token incremental decode.
+
+        Projects the new token to Q/K/V, appends K/V to the cache,
+        then computes attention over the full cached history for each layer.
+        Returns raw (pre-softmax) logits of shape (vocab,).
+        """
+        D  = self.embed_dim
+        H  = self.num_heads
+        dh = D // H
+
+        tok_emb = self.embedding[token_id] + self.pos_embedding[pos]  # (D,)
+        x       = tok_emb[None, None]    # (1, 1, D)
+
+        for layer_idx, blk in enumerate(self.blocks):
+            ln1_out, _ = self._ln_forward(x, blk["ln1_g"], blk["ln1_b"])
+            qkv = (ln1_out.reshape(1, D) @ blk["Wqkv"]).reshape(3, H, dh)
+            Q   = qkv[0]   # (H, dh)
+            K_t = qkv[1]   # (H, dh)  -- new key
+            V_t = qkv[2]   # (H, dh)  -- new value
+
+            if _DEVICE == "gpu":
+                K_t_cpu = np.asnumpy(K_t)
+                V_t_cpu = np.asnumpy(V_t)
+                Q_cpu   = np.asnumpy(Q)
+            else:
+                K_t_cpu, V_t_cpu, Q_cpu = K_t, V_t, Q
+
+            kv_cache.append(layer_idx, K_t_cpu, V_t_cpu)
+            K_all, V_all = kv_cache.get(layer_idx)  # (H, T_so_far, dh)
+
+            if _DEVICE == "gpu":
+                K_all = np.array(K_all)
+                V_all = np.array(V_all)
+                Q_gpu = Q
+            else:
+                Q_gpu = Q_cpu
+
+            # Scaled dot-product attention: Q (H, dh) × K^T (H, dh, T)
+            scale  = self._scale_head
+            scores = (Q_gpu[:, None, :] * K_all).sum(axis=-1) * scale  # (H, T)
+            scores -= scores.max(axis=-1, keepdims=True)
+            exp_s  = np.exp(scores)
+            A      = exp_s / exp_s.sum(axis=-1, keepdims=True)          # (H, T)
+
+            # Weighted sum of values: (H, T) × (H, T, dh) -> (H, dh)
+            attn_out = (A[:, :, None] * V_all).sum(axis=1)              # (H, dh)
+            attn_out = attn_out.reshape(1, 1, D)                         # (1, 1, D)
+
+            x_attn = x + attn_out
+
+            ln2_out, _ = self._ln_forward(x_attn, blk["ln2_g"], blk["ln2_b"])
+            h  = np.maximum(0.0, ln2_out @ blk["W1"] + blk["b1"])
+            ff = h @ blk["W2"] + blk["b2"]
+            x  = x_attn + ff
+
+        x, _ = self._ln_forward(x, self.ln_f_g, self.ln_f_b)
+
+        if self.weight_tying:
+            logits = (x.reshape(D) @ self.embedding.T) + self.bout
+        else:
+            logits = (x.reshape(D) @ self.Wout) + self.bout
+
+        if _DEVICE == "gpu":
+            logits = np.asnumpy(logits)
+        return _np_cpu.array(logits, dtype=_np_cpu.float32)
