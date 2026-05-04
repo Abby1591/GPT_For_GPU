@@ -1027,18 +1027,311 @@ def fetch_reddit(
 
 
 # =============================================================================
-#  Phase 8: Tool training data  (delegated to tool_definitions.py)
+#  Phase 8: Tool training data
 # =============================================================================
 #
-# All tool executors, template banks, example generators, and the
-# TOOL_REGISTRY live in tool_definitions.py.  See that file for:
+# Generates Toolformer-style training examples in the format:
 #
-#   - The [TOOL:name|arg][RESULT:...] format specification
-#   - How to add a new tool (step-by-step guide in the module docstring)
-#   - How to register tools for inference with NeuralNetwork
-#   - Quality guidelines for tool training data
+#   [TOOL:name|argument][RESULT:result text]
+#
+# Each example is a short self-contained passage:
+#   <context sentence(s)>
+#   [TOOL:name|query][RESULT:result]
+#   <continuation sentence(s)>
+#
+# The continuation after RESULT matters: it teaches the model to USE the
+# result rather than ignore it (key Toolformer finding).
+#
+# Executors are imported from tool_definitions so training and inference
+# always produce identical results for the same input.
 
-from tool_definitions import fetch_tool_training  # noqa: E402
+from tool_definitions import (  # noqa: E402
+    _tool_exec_calc,
+    _tool_exec_convert,
+    _tool_exec_date,
+    _tool_exec_search,
+    TOOL_MAX_RESULT,
+    TOOL_REGISTRY,
+    TOOL_WEIGHTS,
+)
+
+_SEARCH_SEED_TOPICS = (
+    LGBTQ_ARTICLES[:20] + LEFT_ARTICLES[:20] +
+    DIVERSE_ARTICLES[:20] + ACADEMIC_ARTICLES[:20]
+)
+
+# ---------------------------------------------------------------------------
+#  Template banks
+#  (context_template, query_template, continuation_template)
+#  continuation MUST contain [TOOL:name|...][RESULT:{result}].
+# ---------------------------------------------------------------------------
+
+_CALC_TEMPLATES = [
+    ("The total cost was {a} items at {b} dollars each.",
+     "{a}*{b}",
+     "The calculation confirms the total is [TOOL:calc|{a}*{b}][RESULT:{result}] dollars."),
+    ("A rectangle measures {a} metres by {b} metres.",
+     "{a}*{b}",
+     "Its area is [TOOL:calc|{a}*{b}][RESULT:{result}] square metres."),
+    ("If you divide {a} equally among {b} people,",
+     "{a}/{b}",
+     "each person receives [TOOL:calc|{a}/{b}][RESULT:{result}]."),
+    ("The sum of {a} and {b} is",
+     "{a}+{b}",
+     "[TOOL:calc|{a}+{b}][RESULT:{result}]."),
+    ("To find the square root of {a},",
+     "sqrt({a})",
+     "we compute [TOOL:calc|sqrt({a})][RESULT:{result}]."),
+    ("Raising {a} to the power of {b} gives",
+     "{a}**{b}",
+     "[TOOL:calc|{a}**{b}][RESULT:{result}]."),
+    ("{a} percent of {b} is",
+     "{a}/100*{b}",
+     "[TOOL:calc|{a}/100*{b}][RESULT:{result}]."),
+    ("She owed {a} dollars and paid back {b}.",
+     "{a}-{b}",
+     "The remaining balance was [TOOL:calc|{a}-{b}][RESULT:{result}] dollars."),
+    ("At {b} miles per hour, covering {a} miles takes",
+     "{a}/{b}",
+     "[TOOL:calc|{a}/{b}][RESULT:{result}] hours."),
+]
+
+_CONVERT_TEMPLATES = [
+    ("The distance between the two cities is {a} kilometres.",
+     "{a} km to miles",
+     "That is [TOOL:convert|{a} km to miles][RESULT:{result}]."),
+    ("The package weighs {a} kilograms.",
+     "{a} kg to lbs",
+     "In pounds, that is [TOOL:convert|{a} kg to lbs][RESULT:{result}]."),
+    ("The temperature outside was {a} degrees Celsius.",
+     "{a} C to F",
+     "In Fahrenheit that is [TOOL:convert|{a} C to F][RESULT:{result}]."),
+    ("The recipe calls for {a} litres of water.",
+     "{a} l to gal",
+     "That is approximately [TOOL:convert|{a} l to gal][RESULT:{result}]."),
+    ("The shelf is {a} feet long.",
+     "{a} ft to m",
+     "In metric units that is [TOOL:convert|{a} ft to m][RESULT:{result}] metres."),
+    ("The download is {a} gigabytes.",
+     "{a} gb to mb",
+     "That equals [TOOL:convert|{a} gb to mb][RESULT:{result}] megabytes."),
+    ("The athlete ran {a} miles.",
+     "{a} miles to km",
+     "That is [TOOL:convert|{a} miles to km][RESULT:{result}] kilometres."),
+    ("The oven was set to {a} degrees Fahrenheit.",
+     "{a} F to C",
+     "That is [TOOL:convert|{a} F to C][RESULT:{result}] degrees Celsius."),
+]
+
+_DATE_TEMPLATES = [
+    ("To determine the current date,",
+     "what is today's date",
+     "we check: [TOOL:date|what is today's date][RESULT:{result}]."),
+    ("The event is scheduled for this year.",
+     "what is the current year",
+     "Specifically, [TOOL:date|what is the current year][RESULT:{result}]."),
+    ("She asked what day of the week it was.",
+     "day of the week today",
+     "The answer was [TOOL:date|day of the week today][RESULT:{result}]."),
+    ("February {y} had a specific number of days.",
+     "days in February {y}",
+     "There were [TOOL:date|days in February {y}][RESULT:{result}] days in February {y}."),
+    ("The number of days between {d1} and {d2} matters for the calculation.",
+     "{d1} to {d2}",
+     "There are [TOOL:date|{d1} to {d2}][RESULT:{result}] days between those dates."),
+    ("The project started on {d1} and ended on {d2}.",
+     "{d1} to {d2}",
+     "It lasted [TOOL:date|{d1} to {d2}][RESULT:{result}]."),
+    ("She needed to know how many days were in March {y}.",
+     "days in March {y}",
+     "[TOOL:date|days in March {y}][RESULT:{result}] days made up that month."),
+]
+
+_SEARCH_TEMPLATES = [
+    ("The article discussed {q}.",
+     "{q}",
+     "[TOOL:search|{q}][RESULT:{result}] This background helped readers understand the topic."),
+    ("Many people wondered about {q}.",
+     "{q}",
+     "According to available information, [TOOL:search|{q}][RESULT:{result}]"),
+    ("To answer the question about {q},",
+     "{q}",
+     "one can look it up: [TOOL:search|{q}][RESULT:{result}]"),
+    ("The student researched {q} for her essay.",
+     "{q}",
+     "She found that [TOOL:search|{q}][RESULT:{result}]"),
+    ("He wanted to fact-check the claim about {q}.",
+     "{q}",
+     "The search confirmed: [TOOL:search|{q}][RESULT:{result}]"),
+]
+
+_LOOKUP_TEMPLATES = [
+    ("The author mentioned {e} in passing.",
+     "{e}",
+     "To clarify: [TOOL:lookup|{e}][RESULT:{result}]"),
+    ("Few people knew who {e} was.",
+     "{e}",
+     "[TOOL:lookup|{e}][RESULT:{result}] This context is important."),
+    ("The concept of {e} was central to the argument.",
+     "{e}",
+     "Specifically, [TOOL:lookup|{e}][RESULT:{result}]"),
+    ("The professor asked the class about {e}.",
+     "{e}",
+     "The definition: [TOOL:lookup|{e}][RESULT:{result}]"),
+]
+
+# ---------------------------------------------------------------------------
+#  Generators
+# ---------------------------------------------------------------------------
+
+def _generate_calc_examples(n: int) -> List[str]:
+    examples = []
+    for _ in range(n):
+        ctx_t, expr_t, cont_t = random.choice(_CALC_TEMPLATES)
+        a, b = random.randint(2, 999), random.randint(2, 99)
+        if "{a}/{b}" in expr_t and random.random() < 0.5:
+            a = b * random.randint(2, 20)
+        expr   = expr_t.format(a=a, b=b)
+        result = _tool_exec_calc(expr)
+        if result.startswith("error"):
+            continue
+        examples.append(f"{ctx_t.format(a=a, b=b)}\n{cont_t.format(a=a, b=b, result=result)}")
+    return examples
+
+
+def _generate_convert_examples(n: int) -> List[str]:
+    examples = []
+    for _ in range(n):
+        ctx_t, q_t, cont_t = random.choice(_CONVERT_TEMPLATES)
+        a = int(round(random.uniform(1, 500))) if random.random() < 0.6 \
+            else round(random.uniform(1, 500), 1)
+        result = _tool_exec_convert(q_t.format(a=a))
+        if "unknown" in result or "error" in result:
+            continue
+        examples.append(f"{ctx_t.format(a=a)}\n{cont_t.format(a=a, result=result)}")
+    return examples
+
+
+def _generate_date_examples(n: int) -> List[str]:
+    import datetime as _dt
+    examples = []
+    years = list(range(1990, 2025))
+    pairs = []
+    for _ in range(40):
+        d = _dt.date(random.randint(2000, 2023), random.randint(1, 12), random.randint(1, 28))
+        pairs.append((str(d), str(d + _dt.timedelta(days=random.randint(10, 500)))))
+    for _ in range(n):
+        ctx_t, q_t, cont_t = random.choice(_DATE_TEMPLATES)
+        if "{y}" in q_t:
+            y = random.choice(years)
+            result = _tool_exec_date(q_t.format(y=y))
+            ctx, cont = ctx_t.format(y=y), cont_t.format(y=y, result=result)
+        elif "{d1}" in q_t:
+            d1, d2 = random.choice(pairs)
+            result = _tool_exec_date(q_t.format(d1=d1, d2=d2))
+            ctx, cont = ctx_t.format(d1=d1, d2=d2), cont_t.format(d1=d1, d2=d2, result=result)
+        else:
+            result = _tool_exec_date(q_t)
+            ctx, cont = ctx_t, cont_t.format(result=result)
+        if result == "unknown date query":
+            continue
+        examples.append(f"{ctx}\n{cont}")
+    return examples
+
+
+def _generate_search_examples(n: int, live: bool = True) -> List[str]:
+    examples = []
+    topics = random.sample(_SEARCH_SEED_TOPICS, min(n * 3, len(_SEARCH_SEED_TOPICS)))
+    for topic in topics:
+        if len(examples) >= n:
+            break
+        result = _tool_exec_search(topic) if live else f"{topic} is a notable subject."
+        if result == "no result":
+            continue
+        if random.random() < 0.5:
+            ctx_t, _, cont_t = random.choice(_SEARCH_TEMPLATES)
+            examples.append(f"{ctx_t.format(q=topic)}\n"
+                            f"{cont_t.format(q=topic, result=result[:TOOL_MAX_RESULT])}")
+        else:
+            ctx_t, _, cont_t = random.choice(_LOOKUP_TEMPLATES)
+            examples.append(f"{ctx_t.format(e=topic)}\n"
+                            f"{cont_t.format(e=topic, result=result[:TOOL_MAX_RESULT])}")
+        print(f"    search/lookup OK: {topic[:55]}")
+    return examples
+
+
+def fetch_tool_training(
+    target_chars: int,
+    live_search:  bool  = True,
+    weights:      Optional[dict] = None,
+) -> List[str]:
+    """
+    Phase 8: generate Toolformer-style tool-training examples.
+
+    Produces a mix of calc, convert, date, and search/lookup examples
+    in the ``[TOOL:name|arg][RESULT:...]`` format.
+
+    Also calls ``ensure_tool_vocab`` on a sentinel dict to print a reminder
+    about which characters must be present in the model's vocabulary.
+
+    :param target_chars: Total character budget for this phase.
+    :param live_search: Fetch real Wikipedia snippets for search/lookup
+        examples.  Set ``False`` to use placeholders (faster, lower quality).
+    :param weights: ``{tool_name: fraction}`` override.  Defaults to
+        ``TOOL_WEIGHTS`` from ``tool_definitions``.  Must sum to ~1.0.
+    """
+    from Neural_Network import ensure_tool_vocab  # type: ignore
+
+    print(f"\n[8/8] Tool training  (target {target_chars:,} chars, "
+          f"live_search={'yes' if live_search else 'no'})")
+
+    # Remind the caller which vocab chars are required at inference.
+    # We pass a dummy dict so ensure_tool_vocab can report missing chars
+    # without touching any real model state.
+    _dummy = {c: i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz ")}
+    _extended = ensure_tool_vocab(_dummy)
+    added = set(_extended) - set(_dummy)
+    if added:
+        print(f"  NOTE: train your model on a vocab that includes: {sorted(added)}")
+        print(f"        or call ensure_tool_vocab(char2idx) before building the model.")
+
+    w = weights if weights is not None else TOOL_WEIGHTS
+    avg_chars = 220
+    n_total   = max(50, target_chars // avg_chars)
+    n_calc    = int(n_total * w.get("calc",    0.30))
+    n_convert = int(n_total * w.get("convert", 0.20))
+    n_date    = int(n_total * w.get("date",    0.15))
+    n_search  = n_total - n_calc - n_convert - n_date
+
+    print(f"  Generating ~{n_total} examples: "
+          f"calc={n_calc} convert={n_convert} date={n_date} search/lookup={n_search}")
+
+    all_examples: List[str] = []
+    print(f"  calc ({n_calc})...")
+    all_examples.extend(_generate_calc_examples(n_calc))
+    print(f"  convert ({n_convert})...")
+    all_examples.extend(_generate_convert_examples(n_convert))
+    print(f"  date ({n_date})...")
+    all_examples.extend(_generate_date_examples(n_date))
+    print(f"  search/lookup ({n_search}, live={live_search})...")
+    all_examples.extend(_generate_search_examples(n_search, live=live_search))
+
+    random.shuffle(all_examples)
+    chunks, total = [], 0
+    for ex in all_examples:
+        if total >= target_chars:
+            break
+        chunks.append(ex)
+        total += len(ex)
+
+    tool_counts: Counter = Counter()
+    for ex in chunks:
+        for m in re.finditer(r'\[TOOL:(\w+)\|', ex):
+            tool_counts[m.group(1)] += 1
+
+    print(f"  Tool training done: {len(chunks):,} examples  ({total:,} chars)")
+    print(f"  Tool call counts: " + "  ".join(f"{k}={v}" for k, v in tool_counts.items()))
+    return chunks
 
 
 # =============================================================================
@@ -1165,12 +1458,14 @@ def build_dataset(
 
     if not no_tools:
         c = fetch_tool_training(
-            target_chars  = int(target_chars * 0.07),
-            live_search   = tools_live_search,
-            calc_weight   = tools_calc_weight,
-            convert_weight= tools_convert_weight,
-            date_weight   = tools_date_weight,
-            search_weight = tools_search_weight,
+            target_chars = int(target_chars * 0.07),
+            live_search  = tools_live_search,
+            weights      = {
+                "calc":    tools_calc_weight,
+                "convert": tools_convert_weight,
+                "date":    tools_date_weight,
+                "search":  tools_search_weight,
+            },
         )
         if c:
             chunks.extend(c)

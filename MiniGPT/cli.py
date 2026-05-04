@@ -15,9 +15,17 @@ Resume training from a checkpoint (continues where you left off)::
 
     python cli.py --train wiki_dataset.txt --resume gpt_weights_v4.json --epochs 200 --lr 0.0003 --save gpt_weights_v5.json
 
-Generate text::
+Generate text (tools are on by default if the model was trained with tool data)::
 
     python cli.py --load gpt_weights.json --prompt "Democracy is" --length 300
+
+Disable all tools::
+
+    python cli.py --load gpt_weights.json --prompt "..." --no_tools
+
+Disable specific tools::
+
+    python cli.py --load gpt_weights.json --prompt "..." --skip_tool search lookup
 
 All flags::
 
@@ -28,6 +36,7 @@ from __future__ import annotations
 import argparse
 from model import MiniGPT
 from data import simplify_text
+from tool_definitions import TOOL_REGISTRY
 
 _DEMO_TEXT = (
     "democracy is the foundation of freedom. "
@@ -130,6 +139,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Characters to generate. (default: 300)")
     gg.add_argument("--temperature", type=float, default=0.6,
                     help="< 1.0 focused, > 1.0 creative. (default: 0.6)")
+    gg.add_argument("--no_tools", action="store_true",
+                    help="Disable all tool calling during generation.\n"
+                         "Tools are ON by default when the model was trained\n"
+                         "with tool data; use this flag to suppress them.")
+    gg.add_argument("--skip_tool", nargs="+", metavar="TOOL",
+                    help="Disable specific tools by name. Others stay active.\n"
+                         f"Available: {', '.join(TOOL_REGISTRY.keys())}\n"
+                         "E.g. --skip_tool search lookup")
 
     return p
 
@@ -169,14 +186,22 @@ def main() -> None:
     parser = _build_parser()
     args   = parser.parse_args()
 
+    # Build active tool registry: all tools minus any skipped ones.
+    # None means tools are fully disabled (plain generation).
+    if args.no_tools:
+        active_tools = None
+    else:
+        skip = set(args.skip_tool) if args.skip_tool else set()
+        unknown = skip - set(TOOL_REGISTRY)
+        if unknown:
+            print(f"WARNING: unknown tool(s) in --skip_tool ignored: {', '.join(sorted(unknown))}")
+        active_tools = {k: v for k, v in TOOL_REGISTRY.items() if k not in skip} or None
+
     # ── Resume mode: load checkpoint then keep training ───────────────────────
     if args.train and args.resume:
         print(f"Resuming from '{args.resume}'...")
         model = MiniGPT.load(args.resume)
 
-        # -- Learning rate override logic ------------------------------------
-        # --force_lr: hard override regardless of Adam state (intentional restart)
-        # --lr:       only applied if no Adam state (safe default behaviour)
         if args.force_lr is not None:
             old_lr = model.nn.learning_rate
             model.nn.learning_rate = args.force_lr
@@ -187,12 +212,8 @@ def main() -> None:
         elif args.lr != 0.001 and model.nn._adam_init:
             print(f"Adam state restored -- keeping saved lr={model.nn.learning_rate:.6f}, ignoring --lr {args.lr}")
 
-        # --reset_adam: wipe momentum state so old gradients don't cause spikes.
-        # Critical when boosting lr by more than ~2x -- without this, momentum
-        # built at the old (low) lr gets applied at the new (high) lr, making
-        # the first few steps far too large and spiking the loss badly.
         if args.reset_adam and model.nn._adam_init:
-            model.nn._adam_init = False  # forces _init_adam() on next train()
+            model.nn._adam_init = False
             print(f"Adam state reset -- fresh momentum at lr={model.nn.learning_rate:.6f}")
 
         model.train(
@@ -208,9 +229,9 @@ def main() -> None:
         if not args.no_save:
             model.save(args.save)
         print("\n-- Sample generation --------------------------------------------------")
-        print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature))
+        print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature, tool_registry=active_tools))
 
-    # ---- Train from scratch -------------------------------------------------
+    # ── Train from scratch ────────────────────────────────────────────────────
     elif args.train:
         model = MiniGPT(
             context_size  = args.context,
@@ -238,14 +259,16 @@ def main() -> None:
         if not args.no_save:
             model.save(args.save)
         print("\n── Sample generation ──────────────────────────────────────────")
-        print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature))
+        print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature, tool_registry=active_tools))
 
     # ── Generate only ─────────────────────────────────────────────────────────
     elif args.load:
         model = MiniGPT.load(args.load)
-        print(f"\nGenerating {args.length} chars  (temperature={args.temperature})...\n")
+        tool_label = ("tools=" + ",".join(active_tools)) if active_tools else "no tools"
+        print(f"\nGenerating {args.length} chars  "
+              f"(temperature={args.temperature}, {tool_label})...\n")
         print("── Output ─────────────────────────────────────────────────────")
-        print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature))
+        print(model.generate(prompt=args.prompt, length=args.length, temperature=args.temperature, tool_registry=active_tools))
         print("───────────────────────────────────────────────────────────────")
 
     # ── Demo ──────────────────────────────────────────────────────────────────
@@ -256,6 +279,7 @@ def main() -> None:
         model = MiniGPT(context_size=6, hidden_layers=[64, 32], learning_rate=0.001)
         model.train(_DEMO_TEXT, epochs=10, max_samples=2_000)
         print("\n── Generated text ─────────────────────────────────────────────")
+        # Demo always uses plain generation — model wasn't trained on tool data.
         print(model.generate(prompt="demo", length=150, temperature=0.7))
 
 

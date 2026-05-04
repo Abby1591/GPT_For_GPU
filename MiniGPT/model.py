@@ -13,9 +13,19 @@ Typical usage::
     model.train("wiki_dataset.txt", epochs=5)
     model.save("gpt_weights.json")
 
-    # --- Generate ---
+    # --- Generate (tools on by default when trained with tool data) ---
     model = MiniGPT.load("gpt_weights.json")
     print(model.generate(prompt="Democracy is", length=300))
+
+    # --- Opt out of tools ---
+    print(model.generate(prompt="Democracy is", tool_registry=None))
+
+    # --- Skip specific tools ---
+    from tool_definitions import TOOL_REGISTRY
+    print(model.generate(
+        prompt       = "5 km equals",
+        skip_tools   = {"search", "lookup"},
+    ))
 """
 
 from __future__ import annotations
@@ -317,100 +327,140 @@ class MiniGPT:
 
     def generate(
         self,
-        prompt:      str   = "",
-        length:      int   = 200,
-        temperature: float = 0.8,
+        prompt:         str              = "",
+        length:         int              = 200,
+        temperature:    float            = 0.8,
+        tool_registry:  "Optional[dict]" = "DEFAULT",
+        skip_tools:     "Optional[set]"  = None,
+        max_tool_calls: int              = 8,
+        verbose:        bool             = True,
     ) -> str:
         """
         Generate new text autoregressively from an optional seed prompt.
 
-        **How autoregressive generation works:**
+        Pass ``tool_registry`` to enable Toolformer-style interleaved tool
+        execution; leave it as ``None`` (the default) for plain generation.
 
-        At each step the model:
+        **When NOT to use tools**
 
-        1. Takes the last ``context_size`` characters as input.
-        2. One-hot encodes them into a flat feature vector.
-        3. Runs a forward pass through the NeuralNetwork.
-        4. Applies temperature scaling to the output probabilities.
-        5. Samples the next character from the scaled distribution.
-        6. Appends it to the output and repeats.
+        - The model was trained on plain text only (no ``[TOOL:...]``
+          patterns in the dataset) — tool delimiters will never appear in
+          the output so there is no benefit.
+        - You want deterministic / reproducible output for tests or evals.
+        - You are generating very short snippets where a tool call would
+          dominate the output.
+        - You are benchmarking speed — the tool path has small overhead
+          from the pattern scanner even when no calls fire.
 
-        :param prompt: Seed text to start generation from.
-            Can be any string.  Characters not in the vocabulary are
-            silently dropped.  If empty, generation starts from a random
-            character.
+        In all other cases it is safe to pass a registry; if the model was
+        trained with tool data it will call tools when useful, and if not
+        it simply won't emit the delimiter pattern.
+
+        **How autoregressive generation works**
+
+        At each step the model takes the last ``context_size`` characters,
+        runs a forward pass, applies temperature scaling, and samples the
+        next character.  When ``tool_registry`` is supplied, the output
+        tail is scanned after each token; a complete ``[TOOL:name|arg]``
+        pattern triggers the executor and injects ``[RESULT:...]`` back
+        into context before generation continues.
+
+        :param prompt: Seed text.  Characters absent from the vocabulary
+            are silently dropped.  Empty → start from a random character.
         :type prompt: str
-
-        :param length: Number of *new* characters to generate (the
-            prompt itself is not counted).
+        :param length: New characters to generate (prompt not counted).
+            Injected tool result tokens do not count toward this budget.
         :type length: int
-
-        :param temperature: Controls how random the output is.
-
-            - ``< 1.0`` (e.g. ``0.5``) -- more focused and repetitive.
-              The model favours its top predictions strongly.
-            - ``1.0`` -- unmodified probabilities.
-            - ``> 1.0`` (e.g. ``1.5``) -- more diverse and creative, but
-              also more likely to produce nonsense.
-
-            A value of ``0.7-0.9`` is usually a good starting point.
+        :param temperature: Sampling temperature.
+            ``< 1.0`` focused, ``1.0`` raw, ``> 1.0`` creative/noisy.
+            ``0.6–0.9`` is a good starting range.
         :type temperature: float
-
-        :return: The prompt (if any) followed by ``length`` generated
-            characters.
+        :param tool_registry: ``{name: ToolDef}`` from
+            ``tool_definitions.TOOL_REGISTRY``, or a subset.
+            ``None`` (default) disables tool use entirely.
+        :type tool_registry: dict[str, ToolDef] | None
+        :param max_tool_calls: Hard cap on tool invocations per call.
+            Ignored when ``tool_registry`` is ``None``.
+        :type max_tool_calls: int
+        :param verbose: Print a summary line for each tool call when
+            tools are active.  Ignored otherwise.
+        :type verbose: bool
+        :return: Prompt (if any) followed by generated characters.
         :rtype: str
-        :raises RuntimeError: If called before :meth:`train` or
-            :meth:`load`.
+        :raises RuntimeError: If called before :meth:`train` / :meth:`load`.
 
-        **Example:**
+        **Examples:**
 
         .. code-block:: python
 
-            # Focused output
+            # Plain generation — no tools needed
             print(model.generate("Democracy", length=300, temperature=0.6))
 
-            # Creative / varied output
-            print(model.generate("Science", length=300, temperature=1.2))
+            # All tools enabled (model must have been trained with tool data)
+            from tool_definitions import TOOL_REGISTRY
+            print(model.generate(
+                "The square root of 144 is",
+                tool_registry = TOOL_REGISTRY,
+            ))
 
-            # No seed -- starts from a random character
-            print(model.generate(length=200))
+            # Single tool
+            print(model.generate(
+                "5 km equals",
+                tool_registry = {"convert": TOOL_REGISTRY["convert"]},
+            ))
         """
+        from tool_definitions import TOOL_REGISTRY as _DEFAULT_REGISTRY  # type: ignore
+
         if self.nn is None or self.tokenizer is None:
             raise RuntimeError(
                 "Model is not ready. Call train() or MiniGPT.load() first."
             )
 
+        # Resolve active registry: default→all, None→disabled, skip→subset
+        if tool_registry == "DEFAULT":
+            tool_registry = dict(_DEFAULT_REGISTRY)
+        if tool_registry and skip_tools:
+            tool_registry = {k: v for k, v in tool_registry.items()
+                             if k not in skip_tools} or None
+
         tok = self.tokenizer
-
-        # Build the initial context window from the prompt
         seed_indices = tok.encode(prompt) if prompt else [random.randint(0, tok.size - 1)]
-
-        # Truncate to the last context_size characters, left-pad if shorter
         ctx = seed_indices[-self.context_size:]
         while len(ctx) < self.context_size:
             ctx = [0] + ctx
 
+        # ── Tool-enabled path ──────────────────────────────────────────────
+        if tool_registry:
+            from Neural_Network import ensure_tool_vocab  # type: ignore
+            tok.char2idx = ensure_tool_vocab(tok.char2idx)
+            tok.idx2ch   = {v: k for k, v in tok.char2idx.items()}
+            for name, tdef in tool_registry.items():
+                self.nn.register_tool(name, tdef.executor)
+            out_ids, tool_log = self.nn.generate_with_tools(
+                context        = ctx,
+                idx2char       = tok.idx2ch,
+                char2idx       = tok.char2idx,
+                max_new        = length,
+                temperature    = temperature,
+                max_tool_calls = max_tool_calls,
+            )
+            if verbose and tool_log:
+                for entry in tool_log:
+                    print(f"[tool] {entry['tool']}({entry['arg']!r}) → {entry['result']!r}")
+            generated = "".join(tok.idx2ch.get(i, "") for i in out_ids)
+            return (prompt + generated) if prompt else generated
+
+        # ── Plain generation path ──────────────────────────────────────────
         generated = list(prompt) if prompt else []
-
         for _ in range(length):
-            # Fast path: pass integer indices directly — no one_hot() loop,
-            # no argmax decode inside forward().  The (T,1) reshape and
-            # _transformer_forward call are done once inside nn.forward().
             _, _, probs = self.nn.predict(ctx)
-
-            # Temperature scaling
             if temperature != 1.0:
                 logits = np.log(np.array(probs) + 1e-9) / temperature
                 probs  = np.exp(logits - logits.max())
                 probs /= probs.sum()
-
-            # Sample next character
             next_idx = int(np.random.choice(len(probs), p=probs))
             generated.append(tok.idx2ch[next_idx])
-
-            # Slide the context window one step to the right
             ctx = ctx[1:] + [next_idx]
-
         return "".join(generated)
 
     # ------------------------------------------------------------------
