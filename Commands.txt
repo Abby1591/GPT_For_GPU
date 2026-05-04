@@ -1,0 +1,1 @@
+python miniGPT/cli.py --train wiki_dataset.txt --epochs 100 --samples 2048 --context 16 --embed_dim 128 --num_blocks 2 --batch_size 512 --simple_vocab --no_save

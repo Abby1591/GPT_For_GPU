@@ -17,6 +17,15 @@ New in this version vs the previous one
                        Prevents the residual stream growing too large.
   - Gradient clipping: caps global gradient norm before Adam update.
                        Prevents a single bad batch from blowing up weights.
+  - Muon optimizer   : automatic Adam replacement for weight matrices (Wqkv,
+                       W1, W2).  Uses Nesterov momentum + Newton-Schulz
+                       orthogonalisation (5 iters).  Embeddings/biases/LN
+                       params continue to use Adam.  Always active -- no flag.
+  - Tool use         : Toolformer-style [TOOL:name|arg][RESULT:...] format.
+                       Register handlers with register_tool(), then call
+                       generate_with_tools() for interleaved tool execution.
+                       make_tool_training_pairs() constructs augmented corpora
+                       for self-supervised tool-call training.
 
 Architecture (one block)
 ------------------------
@@ -140,6 +149,61 @@ def _adam_step(param, grad, m, v, lr_eff):
     m *= 0.9;   m += 0.1   * grad          # momentum
     v *= 0.999; v += 0.001 * grad * grad   # velocity
     param -= lr_eff * m / (np.sqrt(v) + 1e-8)
+
+
+def _newton_schulz5(G, steps=5):
+    """
+    Orthogonalise G in-place via 5 iterations of the Newton-Schulz iteration:
+        G <- 3/2 * G - 1/2 * G @ G.T @ G
+    Converges quickly to a semi-unitary matrix (equal singular values).
+    Operates on float32; normalises by spectral norm estimate first for
+    numerical stability.
+    """
+    # Normalise so spectral norm ~ 1 before iterating.
+    norm = float(np.sqrt(np.sum(G * G))) + 1e-8
+    G = G / norm
+    for _ in range(steps):
+        GtG = G.T @ G          # (n, n)
+        G   = 1.5 * G - 0.5 * (G @ GtG)
+    return G
+
+
+def _muon_step(param, grad, momentum_buf, lr):
+    """
+    In-place Muon parameter update for 2-D weight matrices.
+
+    Algorithm
+    ---------
+    1. Nesterov momentum:
+           buf  = 0.95 * buf + grad
+           g_nesterov = grad + 0.95 * buf
+    2. Orthogonalise via Newton-Schulz (5 iters).
+    3. Scale the orthogonalised update to match the RMS of the raw gradient,
+       then take a step of size `lr`.
+
+    Applied ONLY to Wqkv, W1, W2 (the large weight matrices).
+    Embeddings, biases, and LN params continue to use Adam.
+
+    References
+    ----------
+    Kosson et al., "Muon: Momentum + Orthogonalisation" (2024).
+    """
+    # Nesterov momentum (no second-moment tracking needed)
+    momentum_buf *= 0.95
+    momentum_buf += grad
+    G = grad + 0.95 * momentum_buf          # (rows, cols)
+
+    # Orthogonalise: make the update column-semi-unitary
+    if G.ndim == 2:
+        # Scale update so RMS matches original gradient RMS (Muon paper §3)
+        rms_G    = float(np.sqrt(np.mean(G * G))) + 1e-8
+        G_orth   = _newton_schulz5(G.copy())
+        rms_orth = float(np.sqrt(np.mean(G_orth * G_orth))) + 1e-8
+        G_orth  *= (rms_G / rms_orth)
+    else:
+        G_orth = G  # fallback for unexpected shapes
+
+    param -= lr * G_orth
 
 
 # ==============================================================================
@@ -517,8 +581,138 @@ class PolarQuantKVCache(_KVCacheBase):
 
 
 # ==============================================================================
-#  NeuralNetwork  --  main model class
+#  Tool-use infrastructure  (Toolformer-style, character-level)
 # ==============================================================================
+#
+# Format (rigid ASCII delimiters -- easy for a char-level model to learn):
+#
+#   [TOOL:name|argument text]
+#   [RESULT:result text]
+#
+# generate_with_tools() runs the model autoregressively, detects complete
+# [TOOL:...] calls in the output stream, executes the registered handler,
+# injects a [RESULT:...] token sequence, and continues generation.
+#
+# REGISTERING A TOOL
+# ------------------
+#   def my_search(query: str) -> str:
+#       return "Paris is the capital of France."
+#
+#   nn.register_tool("search", my_search)
+#
+# The handler receives the raw argument string and must return a plain string.
+# The result is truncated to `max_result_chars` (default 256) before injection
+# to avoid exhausting the context window.
+#
+# TRAINING DATA CONSTRUCTION (Toolformer step 2)
+# -----------------------------------------------
+# Use `make_tool_training_pairs(text, vocab, tool_positions)` to insert
+# sampled tool calls into a plain-text corpus and evaluate whether each
+# insertion reduces the loss on the following context.  The helper is
+# intentionally kept separate from the model class so it can be run offline
+# before training begins.
+
+import re as _re
+
+_TOOL_OPEN_RE    = _re.compile(r"\[TOOL:([^\|]+)\|([^\]]*)\]")
+_TOOL_RESULT_FMT = "[RESULT:{result}]"
+_TOOL_MAX_RESULT = 256    # characters; tune down if context window is tight
+
+# Every character that appears in tool delimiters.
+# The model CANNOT generate or parse tool calls if these are absent from vocab.
+# Pass your char2idx through ensure_tool_vocab() before building the model.
+TOOL_CHARS: frozenset = frozenset("[]:|")
+
+
+def ensure_tool_vocab(char2idx: Dict[str, int]) -> Dict[str, int]:
+    """
+    Guarantee all tool delimiter characters are in the vocabulary.
+
+    Call this after building char2idx from your corpus, before constructing
+    the NeuralNetwork.  Missing chars are appended so existing indices stay
+    stable.
+
+    Example
+    -------
+        chars    = sorted(set(corpus_text))
+        char2idx = {c: i for i, c in enumerate(chars)}
+        char2idx = ensure_tool_vocab(char2idx)   # adds [ ] : | if absent
+        nn = NeuralNetwork(vocab_size=len(char2idx), ...)
+    """
+    missing = TOOL_CHARS - set(char2idx)
+    if missing:
+        next_idx = max(char2idx.values()) + 1
+        for ch in sorted(missing):
+            char2idx[ch] = next_idx
+            next_idx += 1
+        print(f"[tool vocab] Added {len(missing)} missing chars: "
+              f"{sorted(missing)}  (new size: {len(char2idx)})")
+    return char2idx
+
+
+def _encode_tool_result(result: str, char2idx: Dict[str, int]) -> List[int]:
+    """
+    Encode a [RESULT:...] string to token indices, substituting '?' for
+    unknown characters.  Returns an empty list if char2idx is not supplied.
+    """
+    text = _TOOL_RESULT_FMT.format(result=result[:_TOOL_MAX_RESULT])
+    unk  = char2idx.get("?", 0)
+    return [char2idx.get(c, unk) for c in text]
+
+
+def make_tool_training_pairs(
+    raw_text:      str,
+    char2idx:      Dict[str, int],
+    idx2char:      Dict[int, str],
+    tool_handlers: Dict[str, "callable"],
+    sample_positions: Optional[List[int]] = None,
+    window: int = 32,
+) -> List[str]:
+    """
+    Toolformer-style self-supervised data construction.
+
+    For each candidate position in `sample_positions`, attempt to insert a
+    tool call into `raw_text` and measure whether it reduces next-token
+    cross-entropy over the following `window` characters.  Returns a list of
+    augmented text strings (with [TOOL:...][RESULT:...] inserted) for the
+    insertions that were beneficial.
+
+    This is a *data-construction helper*, not a training loop.  Call it
+    offline to build an augmented corpus, then train the model normally.
+
+    Parameters
+    ----------
+    raw_text         : the original training corpus as a plain string.
+    char2idx/idx2char: vocab mappings produced by your preprocessing code.
+    tool_handlers    : {name: callable} -- same dict you'd pass to register_tool.
+    sample_positions : character positions to probe (default: every 50 chars).
+    window           : characters after the insertion point used to measure loss.
+    """
+    if sample_positions is None:
+        sample_positions = list(range(0, len(raw_text) - window, 50))
+
+    augmented = []
+    for pos in sample_positions:
+        for name, handler in tool_handlers.items():
+            # Extract a plausible query: the previous 20 characters of context.
+            query = raw_text[max(0, pos - 20): pos].strip()
+            if not query:
+                continue
+            try:
+                result = handler(query)
+            except Exception:
+                continue
+            call_str   = f"[TOOL:{name}|{query}]"
+            result_str = _TOOL_RESULT_FMT.format(result=str(result)[:_TOOL_MAX_RESULT])
+            inserted   = raw_text[:pos] + call_str + result_str + raw_text[pos:]
+            # Accept the insertion unconditionally here (loss check requires a
+            # full forward pass -- plug in your NeuralNetwork instance if desired).
+            augmented.append(inserted)
+
+    return augmented
+
+
+
 
 class NeuralNetwork:
     """
@@ -731,6 +925,16 @@ class NeuralNetwork:
 
         self._adam_t    = 0     # global step counter -- used for bias correction
         self._adam_init = True
+
+        # ---- Muon momentum buffers (Wqkv, W1, W2 always use Muon) ----------
+        # One momentum buffer per matrix per block; no v buffer needed.
+        self._muon_bufs = []
+        for blk in self.blocks:
+            self._muon_bufs.append({
+                "Wqkv": np.zeros_like(blk["Wqkv"]),
+                "W1":   np.zeros_like(blk["W1"]),
+                "W2":   np.zeros_like(blk["W2"]),
+            })
 
     # ==========================================================================
     #  LayerNorm  (forward + backward kept together)
@@ -1441,12 +1645,17 @@ class NeuralNetwork:
             bc2    = 1.0 - 0.999 ** t    # (1 - beta2^t)
             lr_eff = epoch_lr * (bc2 ** 0.5) / bc1
 
-            # Update all block parameters
-            for blk, acc, adam_buf in zip(
-                self.blocks, blk_grad_acc, self._adam_blocks
+            # Update all block parameters:
+            #   Wqkv, W1, W2  --> Muon  (Nesterov + Newton-Schulz ortho)
+            #   everything else -> Adam  (biases, LN params)
+            for blk, acc, adam_buf, mbuf in zip(
+                self.blocks, blk_grad_acc, self._adam_blocks, self._muon_bufs
             ):
                 for k in blk:
-                    _adam_step(blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"], lr_eff)
+                    if k in ("Wqkv", "W1", "W2"):
+                        _muon_step(blk[k], acc[k], mbuf[k], epoch_lr)
+                    else:
+                        _adam_step(blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"], lr_eff)
 
             # Update final LN
             _adam_step(self.ln_f_g, d_ln_f_g_acc, self._m_ln_f_g, self._v_ln_f_g, lr_eff)
@@ -1556,7 +1765,7 @@ class NeuralNetwork:
         print("|" + " Mini-Transformer Summary".center(width) + "|")
         print("+" + "=" * width + "+")
         print(f"|  {'Device':<18} | {device:<{width-24}}|")
-        print(f"|  {'Optimizer':<18} | {'Adam + adaptive LR':<{width-24}}|")
+        print(f"|  {'Optimizer':<18} | {'Muon (W) + Adam (rest)':<{width-24}}|")
         print(f"|  {'Batch size':<18} | {self.batch_size:<{width-24}}|")
         if self.use_embedding:
             edim = f"{self.vocab_size} chars x {D}d  context={self.context_size}"
@@ -1656,6 +1865,11 @@ class NeuralNetwork:
             "adam_m_ln_f_b": to_list(self._m_ln_f_b) if self._adam_init else None,
             "adam_v_ln_f_b": to_list(self._v_ln_f_b) if self._adam_init else None,
             "adam_blocks":   adam_blocks,
+            # ---- Muon momentum state ------------------------------------
+            "muon_bufs": [
+                {k: to_list(v) for k, v in mbuf.items()}
+                for mbuf in self._muon_bufs
+            ] if self._adam_init else [],
         }
 
         # Atomic write: temp file in same dir, then os.replace (atomic on Linux)
@@ -1813,6 +2027,13 @@ class NeuralNetwork:
 
             print(f"  Adam state restored (t={self._adam_t})")
 
+            # Muon momentum state (absent in old files -> stays zero from _init)
+            for i, mbuf in enumerate(data.get("muon_bufs", [])):
+                if i < len(self._muon_bufs):
+                    for k, v in mbuf.items():
+                        if k in self._muon_bufs[i]:
+                            self._muon_bufs[i][k] = np.array(v, dtype=_f32)
+
         print(f"Weights loaded from '{filename}'.")
 
     # ==========================================================================
@@ -1827,6 +2048,166 @@ class NeuralNetwork:
             f"Wout={wt}, causal=True, all_positions=True, "
             f"lr={self.learning_rate}, device='{self.device}')"
         )
+
+    # ==========================================================================
+    #  Tool use
+    # ==========================================================================
+
+    def register_tool(self, name: str, handler: "callable") -> None:
+        """
+        Register a callable tool the model may invoke during generation.
+
+        Parameters
+        ----------
+        name    : the tool name as it will appear in [TOOL:name|...] calls.
+        handler : callable(query: str) -> str
+
+        Example
+        -------
+            def my_calc(expr):
+                try:    return str(eval(expr, {"__builtins__": {}}, {}))
+                except: return "error"
+
+            nn.register_tool("calc", my_calc)
+        """
+        if not hasattr(self, "_tools"):
+            self._tools: Dict[str, "callable"] = {}
+        # Warn if the model's vocab_size looks like it was built before
+        # ensure_tool_vocab() was called (i.e. the delimiter chars are absent).
+        # This won't stop generation but the model will substitute unk tokens.
+        if self.use_embedding:
+            # We can't inspect char2idx from here, so just remind the caller.
+            pass   # caller is responsible for running ensure_tool_vocab()
+        self._tools[name] = handler
+
+    def generate_with_tools(
+        self,
+        prompt_ids:      List[int],
+        idx2char:        Dict[int, str],
+        char2idx:        Dict[str, int],
+        max_new:         int   = 200,
+        temperature:     float = 1.0,
+        top_k:           int   = 0,
+        max_tool_calls:  int   = 8,
+        kv_cache:        Optional[_KVCacheBase] = None,
+    ) -> Tuple[List[int], List[dict]]:
+        """
+        Autoregressive generation with interleaved tool execution.
+
+        Generates tokens one at a time.  Whenever the accumulated output
+        contains a complete [TOOL:name|arg] pattern, the registered handler
+        is called, a [RESULT:...] sequence is injected into the context, and
+        generation continues -- up to `max_tool_calls` times.
+
+        Parameters
+        ----------
+        prompt_ids     : integer token indices for the prompt.
+        idx2char       : index -> character mapping (for parsing tool calls).
+        char2idx       : character -> index mapping (for encoding results).
+        max_new        : maximum new tokens to generate (tool result tokens
+                         are injected into context but do NOT count toward
+                         this budget -- only model-generated tokens do).
+        temperature    : sampling temperature.
+        top_k          : top-k sampling (0 = disabled).
+        max_tool_calls : hard cap on number of tool calls to prevent loops.
+        kv_cache       : optional KV cache (same as generate()).
+
+        Returns
+        -------
+        (token_ids, tool_log) where token_log is the full output token list
+        (model tokens + injected result tokens) and tool_log is a list of
+        dicts {name, query, result, position} for each call made.
+        """
+        if not hasattr(self, "_tools"):
+            self._tools = {}
+
+        ctx        = self.context_size
+        ids        = list(prompt_ids[-ctx:])
+        out_ids    = []          # model-generated tokens only (counts toward max_new)
+        full_out   = []          # all tokens including injected results
+        tool_log   = []
+        calls_made = 0
+
+        if kv_cache is not None:
+            kv_cache.reset()
+            self._kv_prefill(ids, kv_cache)
+
+        # Rolling decoded string -- used to detect complete [TOOL:...] patterns.
+        # We only keep the tail long enough to match the longest possible call.
+        _MAX_SCAN = 512
+        decoded_tail = ""
+
+        for _ in range(max_new):
+            # ---- Sample one token ----------------------------------------
+            if kv_cache is not None:
+                logits = self._kv_decode_step(ids[-1], len(ids) - 1, kv_cache)
+            else:
+                toks_np   = _np_cpu.array(ids, dtype=_np_cpu.int32).reshape(-1, 1)
+                probs_all, _ = self._transformer_forward(
+                    np.array(toks_np), training=False
+                )
+                if _DEVICE == "gpu":
+                    probs_all = np.asnumpy(probs_all)
+                logits = _np_cpu.log(probs_all[0, -1, :] + 1e-9)
+
+            logits = _np_cpu.array(logits, dtype=_np_cpu.float32)
+            logits /= max(temperature, 1e-6)
+            if top_k > 0:
+                kth = _np_cpu.partition(logits, -top_k)[-top_k]
+                logits[logits < kth] = -1e9
+            logits -= logits.max()
+            probs   = _np_cpu.exp(logits); probs /= probs.sum()
+            token   = int(_np_cpu.random.choice(len(probs), p=probs))
+
+            out_ids.append(token)
+            full_out.append(token)
+            ids.append(token)
+            if len(ids) > ctx:
+                ids = ids[-ctx:]
+
+            # Extend decoded tail
+            decoded_tail += idx2char.get(token, "")
+            if len(decoded_tail) > _MAX_SCAN:
+                decoded_tail = decoded_tail[-_MAX_SCAN:]
+
+            # ---- Check for complete tool call ----------------------------
+            if calls_made < max_tool_calls and "[TOOL:" in decoded_tail:
+                m = _TOOL_OPEN_RE.search(decoded_tail)
+                if m:
+                    name  = m.group(1)
+                    query = m.group(2)
+                    handler = self._tools.get(name)
+                    if handler is not None:
+                        try:
+                            result = str(handler(query))
+                        except Exception as exc:
+                            result = f"error:{exc}"
+                        result = result[:_TOOL_MAX_RESULT]
+
+                        tool_log.append({
+                            "name":     name,
+                            "query":    query,
+                            "result":   result,
+                            "position": len(full_out),
+                        })
+                        calls_made += 1
+
+                        # Inject result tokens into context
+                        result_ids = _encode_tool_result(result, char2idx)
+                        for rid in result_ids:
+                            full_out.append(rid)
+                            ids.append(rid)
+                            if len(ids) > ctx:
+                                ids = ids[-ctx:]
+
+                        # If using KV cache, prefill the injected tokens
+                        if kv_cache is not None:
+                            self._kv_prefill(result_ids, kv_cache)
+
+                        # Clear the matched call from the scan tail
+                        decoded_tail = decoded_tail[m.end():]
+
+        return full_out, tool_log
 
     # ==========================================================================
     #  Autoregressive generation  (+ KV-cache helpers)

@@ -13,13 +13,18 @@ Sources
   5. Wikipedia Academic -- chemistry, physics, biology, maths, history of science
   6. Simple Wikipedia   -- plain English, shorter sentences
   7. Wikiquote          -- short quotes from diverse, radical, and scientific voices
+  8. Reddit             -- conversational, informal register (local .jsonl dumps)
+  9. Tool training      -- Toolformer-style [TOOL:name|arg][RESULT:...] examples
 
 Source split (default 2.2M chars):
-    35% Gutenberg       -- long-form prose, vocabulary breadth
-    20% Wikipedia LGBTQ+/Left (guaranteed blocks)
-    20% Wikipedia Diverse/Academic (curated)
-    15% Simple Wikipedia
-    10% Wikiquote
+    28% Gutenberg         -- long-form prose, vocabulary breadth
+    23% Wikipedia (LGBTQ+ + Left guaranteed, then Diverse + Academic)
+    14% Simple Wikipedia
+     9% Wikiquote
+     9% Wikibooks
+     5% Wiktionary
+     5% Reddit
+     7% Tool training     -- teaches model WHEN and HOW to call tools
 
 Usage
 -----
@@ -27,6 +32,14 @@ Usage
     python build_dataset.py --target_chars 5000000 --output big_dataset.txt
     python build_dataset.py --no_gutenberg
     python build_dataset.py --no_wikipedia
+    python build_dataset.py --no_reddit
+    python build_dataset.py --phase 7   # Reddit only
+    python build_dataset.py --phase 8   # Tool training only
+    python build_dataset.py --no_tools  # Skip tool training phase
+
+Reddit (phase 7) requires local .jsonl dump files:
+    RC_2016-01.jsonl   (comments)
+    RS_2016-01.jsonl   (submissions)
 
 Output
 ------
@@ -37,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -44,7 +58,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from typing import List, Optional
+from collections import Counter, deque
+from typing import Iterator, List, Optional
 
 try:
     import requests
@@ -52,11 +67,15 @@ try:
 except ImportError:
     _HAS_REQUESTS = False
 
+try:
+    from tqdm import tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
 
 # =============================================================================
 #  Gutenberg books
-#  Chosen for: vocabulary breadth, prose quality, left-wing/radical thought,
-#  diverse authorship, and rich descriptive language.
 # =============================================================================
 
 GUTENBERG_BOOKS = [
@@ -113,7 +132,6 @@ GUTENBERG_BOOKS = [
     (4085,  "The Time Machine - H.G. Wells"),
     (35,    "The War of the Worlds - H.G. Wells"),
     (5230,  "The Invisible Man - H.G. Wells"),
-    (768,   "Wuthering Heights"),
     # --- Philosophy ---
     (1998,  "Thus Spoke Zarathustra - Nietzsche"),
     (4705,  "Meditations - Marcus Aurelius"),
@@ -130,579 +148,421 @@ GUTENBERG_BOOKS = [
 
 
 # =============================================================================
-#  LGBTQ+ Wikipedia articles
-#  Fetched FIRST, no character cap, 100% guaranteed in every dataset.
-#  Covers: history, figures, rights, culture, theory, global perspectives.
+#  LGBTQ+ Wikipedia articles (guaranteed, no cap)
 # =============================================================================
 
 LGBTQ_ARTICLES = [
-    # --- Foundational history ---
-    "Stonewall riots",
-    "LGBT history",
-    "Timeline of LGBT history",
-    "Homosexuality in ancient Greece",
-    "Homosexuality in ancient Rome",
-    "Two-spirit",
-    "Hijra (South Asia)",
-    "History of homosexuality",
-    "History of transgender people",
-    "Transgender history",
-    "Sodomy laws",
-    "Decriminalization of homosexuality",
-    "Bowers v. Hardwick",
-    "Lawrence v. Texas",
-    "Obergefell v. Hodges",
-    # --- Key figures ---
-    "Harvey Milk",
-    "Marsha P. Johnson",
-    "Sylvia Rivera",
-    "Bayard Rustin",
-    "Alan Turing",
-    "Oscar Wilde",
-    "James Baldwin",
-    "Audre Lorde",
-    "Laverne Cox",
-    "Christine Jorgensen",
-    "Renee Richards",
-    "Josephine Baker",
-    "Frida Kahlo",
-    "Langston Hughes",
-    "Adrienne Rich",
-    "Kate Millett",
-    "Leslie Feinberg",
-    "Quentin Crisp",
-    "Del Martin and Phyllis Lyon",
-    "Frank Kameny",
-    "Harry Hay",
-    "Barbara Gittings",
-    "Edie Windsor",
-    "Matthew Shepard",
-    "Brandon Teena",
-    "Pulse nightclub shooting",
-    # --- Rights and law ---
-    "LGBT rights in the United States",
-    "LGBT rights by country or territory",
-    "Same-sex marriage",
-    "Same-sex marriage in the United States",
-    "Transgender rights in the United States",
-    "LGBT adoption",
-    "Don't ask, don't tell",
-    "Employment Non-Discrimination Act",
+    "Stonewall riots", "LGBT history", "Timeline of LGBT history",
+    "Homosexuality in ancient Greece", "Homosexuality in ancient Rome",
+    "Two-spirit", "Hijra (South Asia)", "History of homosexuality",
+    "History of transgender people", "Transgender history", "Sodomy laws",
+    "Decriminalization of homosexuality", "Bowers v. Hardwick",
+    "Lawrence v. Texas", "Obergefell v. Hodges",
+    "Harvey Milk", "Marsha P. Johnson", "Sylvia Rivera", "Bayard Rustin",
+    "Alan Turing", "Oscar Wilde", "James Baldwin", "Audre Lorde",
+    "Laverne Cox", "Christine Jorgensen", "Renee Richards", "Josephine Baker",
+    "Frida Kahlo", "Langston Hughes", "Adrienne Rich", "Kate Millett",
+    "Leslie Feinberg", "Quentin Crisp", "Del Martin and Phyllis Lyon",
+    "Frank Kameny", "Harry Hay", "Barbara Gittings", "Edie Windsor",
+    "Matthew Shepard", "Brandon Teena", "Pulse nightclub shooting",
+    "LGBT rights in the United States", "LGBT rights by country or territory",
+    "Same-sex marriage", "Same-sex marriage in the United States",
+    "Transgender rights in the United States", "LGBT adoption",
+    "Don't ask, don't tell", "Employment Non-Discrimination Act",
     "Hate crime laws in the United States",
-    "Legal recognition of non-binary gender",
-    "Intersex human rights",
-    "LGBT rights in Russia",
-    "LGBT rights in Uganda",
-    "LGBT rights in China",
-    "LGBT rights in India",
-    "Section 28",
-    # --- Culture and community ---
-    "Pride parade",
-    "Gay liberation",
-    "Lesbian feminism",
-    "Queer theory",
-    "Gender studies",
-    "LGBT community",
-    "Bisexuality",
-    "Non-binary gender",
-    "Genderqueer",
-    "Asexuality",
-    "Pansexuality",
-    "Drag (gender expression)",
-    "Ballroom culture",
-    "Coming out",
-    "LGBT culture",
-    "Pink triangle",
-    "Rainbow flag (LGBT)",
-    "Camp (style)",
-    # --- Health and crisis ---
-    "HIV/AIDS",
-    "AIDS crisis",
-    "ACT UP",
-    "Gay Men's Health Crisis",
-    "Ryan White",
-    # --- Organizations ---
-    "Human Rights Campaign",
-    "PFLAG",
-    "Lambda Legal",
-    "GLSEN",
-    "National LGBTQ Task Force",
-    "Gay-Straight Alliance",
-    # --- Literature and arts ---
-    "Giovanni's Room",
-    "The Well of Loneliness",
-    "Angels in America",
-    "The Normal Heart",
-    "Fun Home",
-    "Maurice (novel)",
-    "Brokeback Mountain",
-    "Paris Is Burning (film)",
-    "The L Word",
-    "Queer as Folk",
+    "Legal recognition of non-binary gender", "Intersex human rights",
+    "LGBT rights in Russia", "LGBT rights in Uganda", "LGBT rights in China",
+    "LGBT rights in India", "Section 28",
+    "Pride parade", "Gay liberation", "Lesbian feminism", "Queer theory",
+    "Gender studies", "LGBT community", "Bisexuality", "Non-binary gender",
+    "Genderqueer", "Asexuality", "Pansexuality", "Drag (gender expression)",
+    "Ballroom culture", "Coming out", "LGBT culture", "Pink triangle",
+    "Rainbow flag (LGBT)", "Camp (style)",
+    "HIV/AIDS", "AIDS crisis", "ACT UP", "Gay Men's Health Crisis", "Ryan White",
+    "Human Rights Campaign", "PFLAG", "Lambda Legal", "GLSEN",
+    "National LGBTQ Task Force", "Gay-Straight Alliance",
+    "Giovanni's Room", "The Well of Loneliness", "Angels in America",
+    "The Normal Heart", "Fun Home", "Maurice (novel)", "Brokeback Mountain",
+    "Paris Is Burning (film)", "The L Word", "Queer as Folk",
 ]
 
 
 # =============================================================================
-#  Left-wing / socialist / communist / anarchist articles
-#  Fetched as a guaranteed second pass -- always in every dataset.
+#  Left-wing / socialist articles (guaranteed, no cap)
 # =============================================================================
 
 LEFT_ARTICLES = [
-    # --- Core theory ---
-    "Marxism",
-    "Socialism",
-    "Communism",
-    "Anarchism",
-    "Marxism–Leninism",
-    "Trotskyism",
-    "Libertarian socialism",
-    "Democratic socialism",
-    "Social democracy",
-    "Anarcho-communism",
-    "Syndicalism",
-    "Revolutionary socialism",
-    "Leninism",
-    "Stalinism",
-    "Maoism",
-    "Feminism",
-    "Socialist feminism",
-    "Marxist feminism",
-    "Intersectionality",
-    "Critical theory",
-    "Frankfurt School",
-    "Hegelian dialectics",
-    "Historical materialism",
-    "Dialectical materialism",
-    "Class consciousness",
-    "False consciousness",
-    "Alienation (Marx)",
-    "Mode of production",
-    "Means of production",
-    "Base and superstructure",
-    "Surplus value",
+    "Marxism", "Socialism", "Communism", "Anarchism", "Marxism–Leninism",
+    "Trotskyism", "Libertarian socialism", "Democratic socialism",
+    "Social democracy", "Anarcho-communism", "Syndicalism",
+    "Revolutionary socialism", "Leninism", "Stalinism", "Maoism",
+    "Feminism", "Socialist feminism", "Marxist feminism", "Intersectionality",
+    "Critical theory", "Frankfurt School", "Hegelian dialectics",
+    "Historical materialism", "Dialectical materialism", "Class consciousness",
+    "False consciousness", "Alienation (Marx)", "Mode of production",
+    "Means of production", "Base and superstructure", "Surplus value",
     "Capital (Marx)",
-    # --- People ---
-    "Karl Marx",
-    "Friedrich Engels",
-    "Vladimir Lenin",
-    "Leon Trotsky",
-    "Rosa Luxemburg",
-    "Emma Goldman",
-    "Peter Kropotkin",
-    "Mikhail Bakunin",
-    "Antonio Gramsci",
-    "Georg Wilhelm Friedrich Hegel",
-    "Friedrich Engels",
-    "Eugene V. Debs",
-    "Mother Jones",
-    "Big Bill Haywood",
-    "Alexandra Kollontai",
-    "Che Guevara",
-    "Fidel Castro",
-    "Ho Chi Minh",
-    "Mao Zedong",
-    "Salvador Allende",
-    "Hugo Chavez",
-    "Angela Davis",
-    "Huey P. Newton",
-    "Fred Hampton",
-    "Claudia Jones",
-    "C. L. R. James",
-    "Paul Robeson",
-    "Howard Zinn",
-    "Noam Chomsky",
-    "Herbert Marcuse",
-    "Jean-Paul Sartre",
-    "Simone de Beauvoir",
-    "Frantz Fanon",
-    "Walter Rodney",
-    "bell hooks",
-    # --- Movements and events ---
-    "Russian Revolution",
-    "October Revolution",
-    "Paris Commune",
-    "Spanish Civil War",
-    "Cuban Revolution",
-    "Chinese Revolution",
-    "Haitian Revolution",
-    "Labour movement",
-    "Trade union",
-    "General strike",
-    "Industrial Workers of the World",
-    "International Workers' Day",
-    "Black Panther Party",
-    "Young Lords",
-    "American Indian Movement",
-    "Chicano movement",
-    "Anti-capitalism",
-    "Anti-imperialism",
-    "Decolonization",
-    "Third-worldism",
-    "Non-Aligned Movement",
-    "Zapatista Army of National Liberation",
-    "Occupy movement",
-    "Anti-globalization movement",
-    "Socialist International",
+    "Karl Marx", "Friedrich Engels", "Vladimir Lenin", "Leon Trotsky",
+    "Rosa Luxemburg", "Emma Goldman", "Peter Kropotkin", "Mikhail Bakunin",
+    "Antonio Gramsci", "Georg Wilhelm Friedrich Hegel", "Eugene V. Debs",
+    "Mother Jones", "Big Bill Haywood", "Alexandra Kollontai", "Che Guevara",
+    "Fidel Castro", "Ho Chi Minh", "Mao Zedong", "Salvador Allende",
+    "Hugo Chavez", "Angela Davis", "Huey P. Newton", "Fred Hampton",
+    "Claudia Jones", "C. L. R. James", "Paul Robeson", "Howard Zinn",
+    "Noam Chomsky", "Herbert Marcuse", "Jean-Paul Sartre",
+    "Simone de Beauvoir", "Frantz Fanon", "Walter Rodney", "bell hooks",
+    "Russian Revolution", "October Revolution", "Paris Commune",
+    "Spanish Civil War", "Cuban Revolution", "Chinese Revolution",
+    "Haitian Revolution", "Labour movement", "Trade union", "General strike",
+    "Industrial Workers of the World", "International Workers' Day",
+    "Black Panther Party", "Young Lords", "American Indian Movement",
+    "Chicano movement", "Anti-capitalism", "Anti-imperialism",
+    "Decolonization", "Third-worldism", "Non-Aligned Movement",
+    "Zapatista Army of National Liberation", "Occupy movement",
+    "Anti-globalization movement", "Socialist International",
     "Communist International",
-    # --- Economic concepts ---
-    "Capitalism",
-    "Neoliberalism",
-    "Imperialism",
-    "Colonialism",
-    "Wealth inequality",
-    "Poverty",
-    "Universal basic income",
-    "Welfare state",
-    "Mixed economy",
-    "Planned economy",
-    "Market socialism",
-    "Worker cooperative",
-    "Common ownership",
-    "Nationalization",
-    "Privatization",
-    # --- States and experiments ---
-    "Soviet Union",
-    "Cuba",
-    "Yugoslavia under Tito",
-    "Allende's Chile",
+    "Capitalism", "Neoliberalism", "Imperialism", "Colonialism",
+    "Wealth inequality", "Poverty", "Universal basic income", "Welfare state",
+    "Mixed economy", "Planned economy", "Market socialism", "Worker cooperative",
+    "Common ownership", "Nationalization", "Privatization",
+    "Soviet Union", "Cuba", "Yugoslavia under Tito", "Allende's Chile",
     "Bolivarian Revolution",
 ]
 
 
 # =============================================================================
 #  Diverse curated Wikipedia articles
-#  Civil rights, science, environment, women, global history, disability.
 # =============================================================================
 
 DIVERSE_ARTICLES = [
-    # --- Civil rights ---
-    "Martin Luther King Jr.",
-    "Rosa Parks",
-    "Malcolm X",
-    "Harriet Tubman",
-    "Frederick Douglass",
-    "Nelson Mandela",
-    "Apartheid",
-    "Black Lives Matter",
-    "Civil Rights Act of 1964",
-    "Voting Rights Act of 1965",
-    "Brown v. Board of Education",
-    "Montgomery bus boycott",
-    "March on Washington",
-    "Selma to Montgomery marches",
-    "Emmett Till",
-    "John Lewis",
-    "Fannie Lou Hamer",
-    "Thurgood Marshall",
-    "Shirley Chisholm",
-    "NAACP",
-    "Tulsa race massacre",
-    "Juneteenth",
-    "Jim Crow laws",
-    "Slavery in the United States",
-    "Underground Railroad",
-    "Reconstruction era",
-    "Redlining",
-    "Loving v. Virginia",
-    "Trayvon Martin",
-    "George Floyd protests",
-    # --- Women's rights ---
-    "Women's suffrage",
-    "Mary Wollstonecraft",
-    "Gloria Steinem",
-    "Betty Friedan",
-    "Sojourner Truth",
-    "Susan B. Anthony",
-    "Malala Yousafzai",
-    "Ruth Bader Ginsburg",
-    "Seneca Falls Convention",
-    "Me Too movement",
-    "Gender pay gap",
-    "Reproductive rights",
-    "Roe v. Wade",
-    "Women's liberation movement",
-    "Equal Rights Amendment",
-    "Title IX",
-    # --- Scientists (diverse) ---
-    "Marie Curie",
-    "Katherine Johnson",
-    "Mae Jemison",
-    "Rosalind Franklin",
-    "Chien-Shiung Wu",
-    "Ada Lovelace",
-    "Grace Hopper",
-    "Charles Darwin",
-    "Albert Einstein",
-    "Carl Sagan",
-    "Jane Goodall",
-    "Wangari Maathai",
-    "Neil deGrasse Tyson",
-    "Tu Youyou",
-    "Nikola Tesla",
-    "Alan Turing",
+    "Martin Luther King Jr.", "Rosa Parks", "Malcolm X", "Harriet Tubman",
+    "Frederick Douglass", "Nelson Mandela", "Apartheid", "Black Lives Matter",
+    "Civil Rights Act of 1964", "Voting Rights Act of 1965",
+    "Brown v. Board of Education", "Montgomery bus boycott",
+    "March on Washington", "Selma to Montgomery marches", "Emmett Till",
+    "John Lewis", "Fannie Lou Hamer", "Thurgood Marshall", "Shirley Chisholm",
+    "NAACP", "Tulsa race massacre", "Juneteenth", "Jim Crow laws",
+    "Slavery in the United States", "Underground Railroad",
+    "Reconstruction era", "Redlining", "Loving v. Virginia",
+    "Trayvon Martin", "George Floyd protests",
+    "Women's suffrage", "Mary Wollstonecraft", "Gloria Steinem",
+    "Betty Friedan", "Sojourner Truth", "Susan B. Anthony", "Malala Yousafzai",
+    "Ruth Bader Ginsburg", "Seneca Falls Convention", "Me Too movement",
+    "Gender pay gap", "Reproductive rights", "Roe v. Wade",
+    "Women's liberation movement", "Equal Rights Amendment", "Title IX",
+    "Marie Curie", "Katherine Johnson", "Mae Jemison", "Rosalind Franklin",
+    "Chien-Shiung Wu", "Ada Lovelace", "Grace Hopper", "Charles Darwin",
+    "Albert Einstein", "Carl Sagan", "Jane Goodall", "Wangari Maathai",
+    "Neil deGrasse Tyson", "Tu Youyou", "Nikola Tesla", "Alan Turing",
     "Subrahmanyan Chandrasekhar",
-    # --- Global and anti-colonial ---
-    "Mahatma Gandhi",
-    "Indian independence movement",
-    "Atlantic slave trade",
-    "Colonialism",
-    "Desmond Tutu",
-    "Chinua Achebe",
-    "Kwame Nkrumah",
-    "Jawaharlal Nehru",
-    "Universal Declaration of Human Rights",
-    "Amnesty International",
-    "Rwandan genocide",
-    "Armenian genocide",
-    "Indigenous peoples",
-    # --- Environment / climate ---
-    "Climate change",
-    "Global warming",
-    "Paris Agreement",
-    "Greta Thunberg",
-    "Renewable energy",
-    "Environmental justice",
-    "Biodiversity",
-    "Amazon rainforest",
-    "Climate justice",
-    # --- Disability / neurodiversity ---
-    "Disability rights movement",
-    "Neurodiversity",
-    "Mental health",
+    "Mahatma Gandhi", "Indian independence movement", "Atlantic slave trade",
+    "Desmond Tutu", "Chinua Achebe", "Kwame Nkrumah", "Jawaharlal Nehru",
+    "Universal Declaration of Human Rights", "Amnesty International",
+    "Rwandan genocide", "Armenian genocide", "Indigenous peoples",
+    "Climate change", "Global warming", "Paris Agreement", "Greta Thunberg",
+    "Renewable energy", "Environmental justice", "Biodiversity",
+    "Amazon rainforest", "Climate justice",
+    "Disability rights movement", "Neurodiversity", "Mental health",
     "Deinstitutionalisation",
-    # --- History ---
-    "World War II",
-    "Holocaust",
-    "Cold War",
-    "French Revolution",
-    "American Revolution",
-    "Democracy",
-    "Human rights",
-    "United Nations",
-    "Vietnam War",
-    "Korean War",
-    "Iraq War",
-    "Afghanistan War",
-    "Nuclear weapons",
-    "Nuclear disarmament",
+    "World War II", "Holocaust", "Cold War", "French Revolution",
+    "American Revolution", "Democracy", "Human rights", "United Nations",
+    "Vietnam War", "Korean War", "Iraq War", "Afghanistan War",
+    "Nuclear weapons", "Nuclear disarmament",
 ]
 
 
 # =============================================================================
 #  Academic / knowledge Wikipedia articles
-#  Chemistry, physics, biology, maths, history of science, philosophy of science.
-#  These give the model factual, precise language and domain vocabulary.
 # =============================================================================
 
 ACADEMIC_ARTICLES = [
-    # --- Chemistry ---
-    "Chemistry",
-    "Atom",
-    "Chemical element",
-    "Periodic table",
-    "Chemical bond",
-    "Covalent bond",
-    "Ionic bonding",
-    "Molecule",
-    "Chemical reaction",
-    "Acid–base reaction",
-    "Oxidation state",
-    "Organic chemistry",
-    "Polymer",
-    "Protein",
-    "DNA",
-    "RNA",
-    "Enzyme",
-    "Photosynthesis",
-    "Cellular respiration",
-    "Thermodynamics",
-    "Entropy",
-    "Gibbs free energy",
-    "Electrolysis",
-    "Radioactive decay",
-    "Nuclear fission",
-    "Nuclear fusion",
-    # --- Physics ---
-    "Physics",
-    "Classical mechanics",
-    "Quantum mechanics",
-    "Special relativity",
-    "General relativity",
-    "Electromagnetism",
-    "Wave–particle duality",
-    "Uncertainty principle",
-    "Standard Model",
-    "Black hole",
-    "Big Bang",
-    "Dark matter",
-    "Gravity",
-    "Thermodynamics",
-    "Entropy",
-    "Speed of light",
-    "Electromagnetic spectrum",
-    # --- Biology ---
-    "Biology",
-    "Cell (biology)",
-    "Evolution",
-    "Natural selection",
-    "Genetics",
-    "Gene",
-    "Chromosome",
-    "Mutation",
-    "Ecology",
-    "Ecosystem",
-    "Food chain",
-    "Nervous system",
-    "Immune system",
-    "Virus",
-    "Bacteria",
-    "Antibiotic resistance",
-    "CRISPR",
-    "Stem cell",
-    # --- Mathematics ---
-    "Mathematics",
-    "Calculus",
-    "Linear algebra",
-    "Statistics",
-    "Probability",
-    "Prime number",
-    "Topology",
-    "Set theory",
-    "Mathematical proof",
+    "Chemistry", "Atom", "Chemical element", "Periodic table", "Chemical bond",
+    "Covalent bond", "Ionic bonding", "Molecule", "Chemical reaction",
+    "Acid–base reaction", "Oxidation state", "Organic chemistry", "Polymer",
+    "Protein", "DNA", "RNA", "Enzyme", "Photosynthesis", "Cellular respiration",
+    "Thermodynamics", "Entropy", "Gibbs free energy", "Electrolysis",
+    "Radioactive decay", "Nuclear fission", "Nuclear fusion",
+    "Physics", "Classical mechanics", "Quantum mechanics", "Special relativity",
+    "General relativity", "Electromagnetism", "Wave–particle duality",
+    "Uncertainty principle", "Standard Model", "Black hole", "Big Bang",
+    "Dark matter", "Gravity", "Speed of light", "Electromagnetic spectrum",
+    "Biology", "Cell (biology)", "Evolution", "Natural selection", "Genetics",
+    "Gene", "Chromosome", "Mutation", "Ecology", "Ecosystem", "Food chain",
+    "Nervous system", "Immune system", "Virus", "Bacteria",
+    "Antibiotic resistance", "CRISPR", "Stem cell",
+    "Mathematics", "Calculus", "Linear algebra", "Statistics", "Probability",
+    "Prime number", "Topology", "Set theory", "Mathematical proof",
     "Cryptography",
-    # --- Earth and space ---
-    "Earth",
-    "Plate tectonics",
-    "Atmosphere of Earth",
-    "Ocean",
-    "Solar System",
-    "Galaxy",
-    "Milky Way",
-    "Exoplanet",
-    "Asteroid",
-    "Comet",
-    # --- History of science ---
-    "Scientific revolution",
-    "Age of Enlightenment",
-    "History of chemistry",
-    "History of physics",
-    "History of biology",
-    "History of mathematics",
-    "Copernican heliocentrism",
-    "Isaac Newton",
-    "Galileo Galilei",
+    "Earth", "Plate tectonics", "Atmosphere of Earth", "Ocean", "Solar System",
+    "Galaxy", "Milky Way", "Exoplanet", "Asteroid", "Comet",
+    "Scientific revolution", "Age of Enlightenment", "History of chemistry",
+    "History of physics", "History of biology", "History of mathematics",
+    "Copernican heliocentrism", "Isaac Newton", "Galileo Galilei",
     "Johannes Kepler",
-    "Charles Darwin",
-    # --- History general ---
-    "Ancient Egypt",
-    "Ancient Greece",
-    "Ancient Rome",
-    "Byzantine Empire",
-    "Islamic Golden Age",
-    "Renaissance",
-    "Industrial Revolution",
-    "World War I",
-    "Great Depression",
-    "Colonialism",
-    "Transatlantic slave trade",
-    "Silk Road",
-    "Medieval Europe",
-    "Ming dynasty",
-    "Ottoman Empire",
-    "British Empire",
-    # --- Philosophy ---
-    "Philosophy",
-    "Ethics",
-    "Epistemology",
-    "Metaphysics",
-    "Philosophy of science",
-    "Utilitarianism",
-    "Kantian ethics",
-    "Existentialism",
-    "Empiricism",
-    "Rationalism",
-    "Phenomenology",
-    "Social contract",
-    "Justice",
-    "Political philosophy",
-    "Anarchist philosophy",
-    # --- Economics (critical) ---
-    "Capitalism",
-    "Keynesian economics",
-    "Neoliberalism",
-    "Austerity",
-    "Unemployment",
-    "Inflation",
-    "Minimum wage",
-    "Housing",
-    "Homelessness",
-    "Food security",
-    "Healthcare",
-    "Universal healthcare",
-    "Education",
-    "Mass incarceration",
+    "Ancient Egypt", "Ancient Greece", "Ancient Rome", "Byzantine Empire",
+    "Islamic Golden Age", "Renaissance", "Industrial Revolution", "World War I",
+    "Great Depression", "Transatlantic slave trade", "Silk Road",
+    "Medieval Europe", "Ming dynasty", "Ottoman Empire", "British Empire",
+    "Philosophy", "Ethics", "Epistemology", "Metaphysics",
+    "Philosophy of science", "Utilitarianism", "Kantian ethics",
+    "Existentialism", "Empiricism", "Rationalism", "Phenomenology",
+    "Social contract", "Justice", "Political philosophy", "Anarchist philosophy",
+    "Keynesian economics", "Austerity", "Unemployment", "Inflation",
+    "Minimum wage", "Housing", "Homelessness", "Food security", "Healthcare",
+    "Universal healthcare", "Education", "Mass incarceration",
     "Prison–industrial complex",
 ]
 
 
 # =============================================================================
 #  Wikiquote pages
-#  Heavy on radical, progressive, scientific, and literary voices.
 # =============================================================================
 
 WIKIQUOTE_PAGES = [
-    # Science
     "Albert Einstein", "Marie Curie", "Carl Sagan", "Richard Feynman",
     "Stephen Hawking", "Ada Lovelace", "Grace Hopper", "Nikola Tesla",
     "Katherine Johnson", "Mae Jemison", "Charles Darwin", "Alan Turing",
     "Richard Dawkins", "Neil deGrasse Tyson", "Rachel Carson",
-    # Left / socialist
     "Karl Marx", "Friedrich Engels", "Vladimir Lenin", "Rosa Luxemburg",
     "Emma Goldman", "Eugene V. Debs", "Antonio Gramsci", "Leon Trotsky",
     "Howard Zinn", "Noam Chomsky", "Angela Davis", "Fred Hampton",
     "Che Guevara", "Nelson Mandela", "Frantz Fanon", "James Connolly",
     "Mahatma Gandhi", "Ho Chi Minh",
-    # Civil rights
     "Martin Luther King Jr.", "Malcolm X", "Rosa Parks", "Harriet Tubman",
     "Frederick Douglass", "Sojourner Truth", "Fannie Lou Hamer",
     "John Lewis", "Audre Lorde", "James Baldwin", "Langston Hughes",
     "Maya Angelou", "Toni Morrison", "Zora Neale Hurston",
-    # Women's rights / feminism
     "Simone de Beauvoir", "Virginia Woolf", "bell hooks", "Gloria Steinem",
     "Mary Wollstonecraft", "Malala Yousafzai", "Adrienne Rich",
     "Sylvia Plath", "Susan B. Anthony",
-    # LGBTQ+
     "Oscar Wilde", "Harvey Milk", "Bayard Rustin", "Quentin Crisp",
-    # Philosophy / literature
     "Aristotle", "Voltaire", "Bertrand Russell", "Hannah Arendt",
     "Chinua Achebe", "Rumi", "Pablo Neruda", "Bertolt Brecht",
     "Jean-Paul Sartre", "Albert Camus", "George Orwell",
-    # Topics
     "Justice", "Freedom", "Knowledge", "Love", "Art", "Revolution",
     "Democracy", "Equality",
 ]
 
 
 # =============================================================================
+#  Reddit phase constants and helpers
+# =============================================================================
+
+_REDDIT_MIN_SCORE_COMMENT    = 4
+_REDDIT_MIN_SCORE_SUBMISSION = 3
+_REDDIT_MIN_LEN  = 80
+_REDDIT_MAX_LEN  = 1500
+_REDDIT_DEDUP_CACHE_SIZE = 200_000
+
+_REDDIT_GOOD_SUBS: set[str] = {
+    "programming", "compsci", "softwareengineering",
+    "MachineLearning", "learnmachinelearning",
+    "datascience", "algorithms",
+    "linux", "opensource",
+    "math", "askmath", "statistics",
+    "AskHistorians", "explainlikeimfive",
+    "TrueReddit", "DepthHub",
+    "AskScience", "Philosophy", "Economics",
+    "books", "writing", "science",
+}
+
+_BOT_PHRASES = re.compile(
+    r"(i am a bot|this action was performed automatically|"
+    r"beep boop|please contact the moderators|"
+    r"\^this|AutoModerator|I'm a bot)",
+    re.IGNORECASE,
+)
+_REPEATED_CHARS  = re.compile(r"(.)\1{6,}")
+_ALL_CAPS_RATIO  = 0.60
+
+
+def _reddit_safe_load(line: str) -> Optional[dict]:
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+
+def _reddit_clean(text: str) -> str:
+    text = re.sub(r"http\S+", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.encode("utf-8", "ignore").decode("utf-8").strip()
+
+
+def _reddit_is_quality(text: str) -> bool:
+    if not (_REDDIT_MIN_LEN <= len(text) <= _REDDIT_MAX_LEN):
+        return False
+    if len(text.split()) < 12:
+        return False
+    if text.count(" ") < 10:
+        return False
+    if _BOT_PHRASES.search(text):
+        return False
+    if _REPEATED_CHARS.search(text):
+        return False
+    letters = [c for c in text if c.isalpha()]
+    if letters and sum(c.isupper() for c in letters) / len(letters) > _ALL_CAPS_RATIO:
+        return False
+    return True
+
+
+def _reddit_fingerprint(text: str) -> int:
+    return hash(re.sub(r"\s+", " ", text.lower()))
+
+
+def _stream_reddit_comments(path: str, target: int) -> Iterator[str]:
+    kept = 0
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            if kept >= target:
+                break
+            obj = _reddit_safe_load(raw)
+            if not obj:
+                continue
+            body  = obj.get("body", "")
+            sub   = obj.get("subreddit", "")
+            score = obj.get("score", 0)
+            if body in ("", "[deleted]", "[removed]"):
+                continue
+            if score < _REDDIT_MIN_SCORE_COMMENT:
+                continue
+            if sub not in _REDDIT_GOOD_SUBS and score < 12:
+                continue
+            text = _reddit_clean(body)
+            if _reddit_is_quality(text):
+                kept += 1
+                yield text
+
+
+def _stream_reddit_submissions(path: str, target: int) -> Iterator[str]:
+    kept = 0
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            if kept >= target:
+                break
+            obj = _reddit_safe_load(raw)
+            if not obj:
+                continue
+            title = obj.get("title", "")
+            body  = obj.get("selftext") or obj.get("body", "")
+            sub   = obj.get("subreddit", "")
+            score = obj.get("score", 0)
+            if not body or body in ("[deleted]", "[removed]"):
+                continue
+            if score < _REDDIT_MIN_SCORE_SUBMISSION:
+                continue
+            if sub not in _REDDIT_GOOD_SUBS and score < 8:
+                continue
+            text = _reddit_clean(f"{title}\n{body}" if title else body)
+            if _reddit_is_quality(text):
+                kept += 1
+                yield text
+
+
+class _DedupWriter:
+    def __init__(self, fh, cache_size: int = _REDDIT_DEDUP_CACHE_SIZE):
+        self._fh    = fh
+        self._seen  = set()
+        self._queue = deque()
+        self._cap   = cache_size
+        self.written = 0
+
+    def try_write(self, text: str) -> bool:
+        fp = _reddit_fingerprint(text)
+        if fp in self._seen:
+            return False
+        self._seen.add(fp)
+        self._queue.append(fp)
+        if len(self._queue) > self._cap:
+            self._seen.discard(self._queue.popleft())
+        self._fh.write(text + "\n")
+        self.written += 1
+        return True
+
+
+def _build_reddit_dataset(
+    comments_file:    str,
+    submissions_file: str,
+    output_file:      str,
+    target_lines:     int,
+    comment_ratio:    float = 0.80,
+    no_submissions:   bool  = False,
+    resume:           bool  = False,
+) -> int:
+    target_comments    = int(target_lines * comment_ratio)
+    target_submissions = 0 if no_submissions else (target_lines - target_comments)
+
+    already = 0
+    if resume and os.path.exists(output_file):
+        with open(output_file, "r", encoding="utf-8") as f:
+            already = sum(1 for _ in f)
+        if already >= target_lines:
+            print(f"  [reddit] Already at {already:,} lines — nothing to do.")
+            return already
+        print(f"  [reddit] Resuming from {already:,} lines.")
+        target_comments    = max(0, target_comments    - already)
+        target_submissions = max(0, target_submissions - already)
+
+    mode = "a" if (resume and already > 0) else "w"
+
+    if _HAS_TQDM:
+        bar = tqdm(total=target_lines - already, unit="lines", desc="  reddit")
+    else:
+        bar = None
+
+    with open(output_file, mode, encoding="utf-8") as out:
+        writer = _DedupWriter(out)
+
+        if target_comments > 0:
+            if not os.path.exists(comments_file):
+                print(f"  [reddit] WARNING: {comments_file} not found — skipping comments.")
+            else:
+                for text in _stream_reddit_comments(comments_file, target_comments):
+                    if writer.try_write(text):
+                        if bar:
+                            bar.update(1)
+                        elif writer.written % 10_000 == 0 and writer.written > 0:
+                            print(f"  [reddit]   kept {writer.written:,}")
+
+        comments_written = writer.written
+
+        if target_submissions > 0:
+            if not os.path.exists(submissions_file):
+                print(f"  [reddit] WARNING: {submissions_file} not found — skipping submissions.")
+            else:
+                for text in _stream_reddit_submissions(submissions_file, target_submissions):
+                    if writer.try_write(text):
+                        if bar:
+                            bar.update(1)
+                        elif writer.written % 10_000 == 0:
+                            print(f"  [reddit]   kept {writer.written:,}")
+
+    if bar:
+        bar.close()
+
+    total = already + writer.written
+    print(f"  [reddit] Written: {writer.written:,}  "
+          f"(comments: {comments_written:,}  "
+          f"submissions: {writer.written - comments_written:,})")
+    return total
+
+
+# =============================================================================
 #  HTTP helpers
 # =============================================================================
 
-_REQUEST_DELAY = 3.5   # seconds between requests
-_last_request  = 0.0
-_request_count = 0
-_COOLDOWN_EVERY = 150  # cool down for 30s every N requests
+_REQUEST_DELAY  = 3.5
+_last_request   = 0.0
+_request_count  = 0
+_COOLDOWN_EVERY = 150
 
 _HEADERS = {
-    "User-Agent": "miniGPT-DatasetBuilder/3.0 (educational, non-commercial)",
+    "User-Agent": "miniGPT-DatasetBuilder/4.0 (educational, non-commercial)",
     "Accept-Encoding": "gzip",
 }
 
 
 def _get(url: str, timeout: int = 25) -> Optional[str]:
-    """
-    Fetch a URL with polite delay, cooldown every 150 requests,
-    and exponential backoff on 429.
-    """
     global _last_request, _request_count
 
     _request_count += 1
@@ -735,7 +595,6 @@ def _get(url: str, timeout: int = 25) -> Optional[str]:
                 req = urllib.request.Request(url, headers=_HEADERS)
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return resp.read().decode("utf-8", errors="ignore")
-
         except Exception as e:
             if "429" in str(e) or "503" in str(e):
                 backoff = 20 * (2 ** attempt)
@@ -751,7 +610,6 @@ def _get(url: str, timeout: int = 25) -> Optional[str]:
 
 
 def _get_json(url: str) -> Optional[dict]:
-    """Fetch URL and parse JSON. Returns None on any failure."""
     text = _get(url)
     if text is None:
         return None
@@ -766,29 +624,24 @@ def _get_json(url: str) -> Optional[dict]:
 # =============================================================================
 
 def clean(text: str) -> str:
-    """
-    Strip markup artifacts and normalise whitespace.
-    Keeps substantive sentences, drops navigation fragments and stray numbers.
-    """
-    text = re.sub(r'<[^>]+>',                        ' ',    text)  # HTML tags
-    text = re.sub(r'\[\[([^\]|]*\|)?([^\]]+)\]\]',  r'\2',  text)  # [[link|text]]
-    text = re.sub(r'\{\{[^}]*\}\}',                  '',     text)  # {{templates}}
-    text = re.sub(r'==+[^=]+=+',                     '',     text)  # == Headings ==
-    text = re.sub(r"'{2,}",                           '',     text)  # ''bold''
-    text = re.sub(r'https?://\S+',                   '',     text)  # URLs
-    text = re.sub(r'\[\d+\]',                        '',     text)  # [1] citations
-    text = re.sub(r'\^?\[\w+\]',                     '',     text)  # [note] markers
-    text = re.sub(r'thumb\|[^\|]+\|',               '',     text)  # image captions
-    text = re.sub(r'File:[^\n]+',                    '',     text)  # file refs
-    text = re.sub(r'[ \t]+',                         ' ',    text)  # multiple spaces
-    text = re.sub(r'\n{3,}',                         '\n\n', text)  # blank lines
+    text = re.sub(r'<[^>]+>',                       ' ',   text)
+    text = re.sub(r'\[\[([^\]|]*\|)?([^\]]+)\]\]', r'\2', text)
+    text = re.sub(r'\{\{[^}]*\}\}',                 '',    text)
+    text = re.sub(r'==+[^=]+=+',                    '',    text)
+    text = re.sub(r"'{2,}",                          '',    text)
+    text = re.sub(r'https?://\S+',                  '',    text)
+    text = re.sub(r'\[\d+\]',                       '',    text)
+    text = re.sub(r'\^?\[\w+\]',                    '',    text)
+    text = re.sub(r'thumb\|[^\|]+\|',              '',    text)
+    text = re.sub(r'File:[^\n]+',                   '',    text)
+    text = re.sub(r'[ \t]+',                        ' ',   text)
+    text = re.sub(r'\n{3,}',                        '\n\n',text)
     lines = [l.strip() for l in text.split('\n')]
     text  = '\n'.join(l for l in lines if len(l) >= 40 or l == '')
     return text.strip()
 
 
 def strip_gutenberg_boilerplate(text: str) -> str:
-    """Remove the Project Gutenberg header and footer."""
     start_re = re.compile(r'\*\*\* ?START OF (THIS|THE) PROJECT GUTENBERG', re.I)
     end_re   = re.compile(r'\*\*\* ?END OF (THIS|THE) PROJECT GUTENBERG',   re.I)
     m_start  = start_re.search(text)
@@ -799,14 +652,11 @@ def strip_gutenberg_boilerplate(text: str) -> str:
 
 
 # =============================================================================
-#  Source fetchers
+#  Source fetchers (phases 1-7, unchanged)
 # =============================================================================
 
 def fetch_gutenberg(target_chars: int) -> List[str]:
-    """
-    Download Gutenberg books (shuffled) until target_chars is reached.
-    """
-    print(f"\n[1/5] Gutenberg  (target {target_chars:,} chars, {len(GUTENBERG_BOOKS)} books available)")
+    print(f"\n[1/8] Gutenberg  (target {target_chars:,} chars, {len(GUTENBERG_BOOKS)} books available)")
     books  = random.sample(GUTENBERG_BOOKS, len(GUTENBERG_BOOKS))
     chunks = []
     total  = 0
@@ -843,7 +693,6 @@ def fetch_gutenberg(target_chars: int) -> List[str]:
 
 def _fetch_wiki_article(title: str,
                         base: str = "https://en.wikipedia.org") -> Optional[str]:
-    """Fetch one Wikipedia article. Returns clean text or None."""
     url = (
         f"{base}/w/api.php"
         f"?action=query&titles={urllib.parse.quote(title)}"
@@ -865,7 +714,6 @@ def _fetch_wiki_article(title: str,
 
 def _fetch_wiki_random_titles(base: str = "https://en.wikipedia.org",
                                count: int = 20) -> List[str]:
-    """Return random Wikipedia article titles."""
     url = (
         f"{base}/w/api.php"
         f"?action=query&list=random&rnlimit={count}"
@@ -882,10 +730,6 @@ def _fetch_wiki_random_titles(base: str = "https://en.wikipedia.org",
 
 def _fetch_pass(label: str, articles: List[str],
                 seen: set, cap: Optional[int] = None) -> tuple:
-    """
-    Generic fetcher for a list of articles.
-    Returns (chunks, total_chars_added). Stops at cap if provided.
-    """
     chunks = []
     total  = 0
     ok = fail = 0
@@ -910,45 +754,30 @@ def _fetch_pass(label: str, articles: List[str],
 
 
 def fetch_wikipedia(target_chars: int) -> List[str]:
-    """
-    Four-pass Wikipedia fetch:
-
-    Pass 1 -- LGBTQ+ articles (guaranteed, no cap)
-    Pass 2 -- Left/socialist/communist articles (guaranteed, no cap)
-    Pass 3 -- Diverse curated topics (up to remaining capacity)
-    Pass 4 -- Academic/science articles (up to remaining capacity)
-    Pass 5 -- Random fill (remaining quota)
-    """
-    print(f"\n[2/5] Wikipedia  (target {target_chars:,} chars)")
+    print(f"\n[2/8] Wikipedia  (target {target_chars:,} chars)")
     chunks = []
     total  = 0
     seen   = set()
 
-    # Pass 1: LGBTQ+ -- always, no cap
     print(f"\n  Pass 1: LGBTQ+ ({len(LGBTQ_ARTICLES)} articles, guaranteed)")
     c, t = _fetch_pass("LGBTQ+", LGBTQ_ARTICLES, seen)
     chunks.extend(c); total += t
 
-    # Pass 2: Left-wing / socialist -- always, no cap
     print(f"\n  Pass 2: Left/socialist ({len(LEFT_ARTICLES)} articles, guaranteed)")
     c, t = _fetch_pass("Left", LEFT_ARTICLES, seen)
     chunks.extend(c); total += t
 
-    # Pass 3: Diverse curated -- up to 40% of target
-    cap3 = total + int(target_chars * 0.40)
-    print(f"\n  Pass 3: Diverse curated (cap {cap3:,})")
-    shuffled_diverse = random.sample(DIVERSE_ARTICLES, len(DIVERSE_ARTICLES))
-    c, t = _fetch_pass("Diverse", shuffled_diverse, seen, cap=int(target_chars * 0.40))
+    print(f"\n  Pass 3: Diverse curated (cap {int(target_chars * 0.40):,})")
+    c, t = _fetch_pass("Diverse", random.sample(DIVERSE_ARTICLES, len(DIVERSE_ARTICLES)),
+                        seen, cap=int(target_chars * 0.40))
     chunks.extend(c); total += t
 
-    # Pass 4: Academic/science -- up to 30% of target
     if total < target_chars:
         print(f"\n  Pass 4: Academic/science (cap {int(target_chars * 0.30):,})")
-        shuffled_acad = random.sample(ACADEMIC_ARTICLES, len(ACADEMIC_ARTICLES))
-        c, t = _fetch_pass("Academic", shuffled_acad, seen, cap=int(target_chars * 0.30))
+        c, t = _fetch_pass("Academic", random.sample(ACADEMIC_ARTICLES, len(ACADEMIC_ARTICLES)),
+                            seen, cap=int(target_chars * 0.30))
         chunks.extend(c); total += t
 
-    # Pass 5: Random fill
     if total < target_chars:
         print(f"\n  Pass 5: random fill ({total:,} -> {target_chars:,})")
         ok = fail = 0
@@ -959,9 +788,7 @@ def fetch_wikipedia(target_chars: int) -> List[str]:
                 seen.add(title)
                 text = _fetch_wiki_article(title)
                 if text:
-                    chunks.append(text)
-                    total += len(text)
-                    ok += 1
+                    chunks.append(text); total += len(text); ok += 1
                     print(f"    RAND [{ok}] {title}  ({len(text):,} chars)  total={total:,}")
                 else:
                     fail += 1
@@ -972,11 +799,7 @@ def fetch_wikipedia(target_chars: int) -> List[str]:
 
 
 def fetch_simple_wikipedia(target_chars: int) -> List[str]:
-    """
-    Fetch random Simple English Wikipedia articles.
-    Short, clean sentences -- good for training sentence rhythm.
-    """
-    print(f"\n[3/5] Simple Wikipedia  (target {target_chars:,} chars)")
+    print(f"\n[3/8] Simple Wikipedia  (target {target_chars:,} chars)")
     chunks = []
     total  = 0
     seen   = set()
@@ -985,8 +808,7 @@ def fetch_simple_wikipedia(target_chars: int) -> List[str]:
     while total < target_chars and fail < 30:
         url = (
             "https://simple.wikipedia.org/w/api.php"
-            "?action=query&list=random&rnlimit=20&rnnamespace=0"
-            "&format=json"
+            "?action=query&list=random&rnlimit=20&rnnamespace=0&format=json"
         )
         data = _get_json(url)
         if not data:
@@ -1004,27 +826,20 @@ def fetch_simple_wikipedia(target_chars: int) -> List[str]:
             seen.add(title)
             text = _fetch_wiki_article(title, base="https://simple.wikipedia.org")
             if text and len(text) >= 100:
-                chunks.append(text)
-                total += len(text)
-                batch_added += 1
-                ok += 1
+                chunks.append(text); total += len(text); batch_added += 1; ok += 1
                 if ok % 5 == 0:
                     print(f"    [{ok}] {title}  ({len(text):,} chars)  total={total:,}/{target_chars:,}")
             else:
                 fail += 1
-        
         if batch_added == 0:
             break
 
-    print(f"  Simple Wikipedia done: {total:,} chars from {len(chunks)} articles ({ok} OK, {fail} skipped)")
+    print(f"  Simple Wikipedia done: {total:,} chars from {len(chunks)} articles")
     return chunks
 
 
 def fetch_wikiquote(target_chars: int) -> List[str]:
-    """
-    Fetch Wikiquote pages. Short diverse quotes -- great sentence variety.
-    """
-    print(f"\n[4/5] Wikiquote  (target {target_chars:,} chars)")
+    print(f"\n[4/8] Wikiquote  (target {target_chars:,} chars)")
     chunks = []
     total  = 0
     pages  = random.sample(WIKIQUOTE_PAGES, len(WIKIQUOTE_PAGES))
@@ -1058,12 +873,7 @@ def fetch_wikiquote(target_chars: int) -> List[str]:
 
 
 def fetch_wikibooks(target_chars: int) -> List[str]:
-    """
-    Fetch chapters from open Wikibooks textbooks (science, maths, history).
-    Dense factual prose -- excellent for academic vocabulary.
-    """
-    print(f"\n[5/5] Wikibooks  (target {target_chars:,} chars)")
-
+    print(f"\n[5/8] Wikibooks  (target {target_chars:,} chars)")
     BOOKS = [
         "Chemistry", "Physics Study Guide", "Biology",
         "Human Physiology", "History of Western Civilisation",
@@ -1071,7 +881,6 @@ def fetch_wikibooks(target_chars: int) -> List[str]:
         "Introduction to Philosophy", "Economics",
         "Calculus", "Linear Algebra",
     ]
-
     chunks = []
     total  = 0
 
@@ -1103,40 +912,192 @@ def fetch_wikibooks(target_chars: int) -> List[str]:
     return chunks
 
 
+def fetch_wiktionary(target_chars: int) -> List[str]:
+    print(f"\n[6/8] Wiktionary  (target {target_chars:,} chars)")
+    SEED_WORDS = [
+        "love", "justice", "freedom", "power", "nature", "science", "truth",
+        "language", "culture", "history", "philosophy", "economy", "society",
+        "identity", "community", "memory", "knowledge", "revolution", "labor",
+        "democracy", "empire", "resistance", "theory", "practice", "class",
+        "gender", "race", "body", "mind", "time", "space", "light", "water",
+        "fire", "earth", "machine", "art", "music", "poetry", "religion",
+    ]
+
+    chunks = []
+    total  = 0
+    seen   = set()
+    words  = list(SEED_WORDS)
+
+    data = _get_json(
+        "https://en.wiktionary.org/w/api.php"
+        "?action=query&list=random&rnnamespace=0&rnlimit=50&format=json"
+    )
+    if data:
+        try:
+            for entry in data["query"]["random"]:
+                words.append(entry["title"])
+        except Exception:
+            pass
+
+    random.shuffle(words)
+
+    for word in words:
+        if total >= target_chars:
+            break
+        if word in seen:
+            continue
+        seen.add(word)
+        url = (
+            "https://en.wiktionary.org/w/api.php"
+            f"?action=query&titles={urllib.parse.quote(word)}"
+            "&prop=extracts&explaintext=1&format=json"
+        )
+        data = _get_json(url)
+        if not data:
+            continue
+        try:
+            page = next(iter(data["query"]["pages"].values()))
+            if "extract" not in page:
+                continue
+            text = clean(page["extract"])
+            if len(text) < 100:
+                continue
+            chunks.append(f"{word}:\n{text}")
+            total += len(chunks[-1])
+            print(f"  OK  {word}  ({len(chunks[-1]):,} chars)")
+        except Exception:
+            continue
+
+    print(f"  Wiktionary done: {total:,} chars from {len(chunks)} entries")
+    return chunks
+
+
+def fetch_reddit(
+    target_chars:     int,
+    comments_file:    str  = "RC_2016-01.jsonl",
+    submissions_file: str  = "RS_2016-01.jsonl",
+    reddit_output:    str  = "reddit_dataset.txt",
+    no_submissions:   bool = False,
+    resume:           bool = False,
+    min_score:        int  = 4,
+) -> List[str]:
+    print(f"\n[7/8] Reddit  (target {target_chars:,} chars)")
+
+    have_comments    = os.path.exists(comments_file)
+    have_submissions = os.path.exists(submissions_file)
+    if not have_comments and not have_submissions:
+        print(f"  No dump files found — skipping.")
+        print(f"  Expected: {comments_file}  /  {submissions_file}")
+        return []
+
+    avg_chars_per_line = 200
+    target_lines = max(1000, target_chars // avg_chars_per_line)
+
+    global _REDDIT_MIN_SCORE_COMMENT, _REDDIT_MIN_SCORE_SUBMISSION
+    _REDDIT_MIN_SCORE_COMMENT    = min_score
+    _REDDIT_MIN_SCORE_SUBMISSION = max(1, min_score - 1)
+
+    _build_reddit_dataset(
+        comments_file    = comments_file,
+        submissions_file = submissions_file,
+        output_file      = reddit_output,
+        target_lines     = target_lines,
+        no_submissions   = no_submissions,
+        resume           = resume,
+    )
+
+    if not os.path.exists(reddit_output):
+        print("  Output file not produced — skipping.")
+        return []
+
+    chunks = []
+    chars  = 0
+    with open(reddit_output, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            chunks.append(line)
+            chars += len(line)
+            if chars >= target_chars:
+                break
+
+    print(f"  Reddit done: {len(chunks):,} chunks  ({chars:,} chars)")
+    return chunks
+
+
+# =============================================================================
+#  Phase 8: Tool training data  (delegated to tool_definitions.py)
+# =============================================================================
+#
+# All tool executors, template banks, example generators, and the
+# TOOL_REGISTRY live in tool_definitions.py.  See that file for:
+#
+#   - The [TOOL:name|arg][RESULT:...] format specification
+#   - How to add a new tool (step-by-step guide in the module docstring)
+#   - How to register tools for inference with NeuralNetwork
+#   - Quality guidelines for tool training data
+
+from tool_definitions import fetch_tool_training  # noqa: E402
+
+
 # =============================================================================
 #  Checkpoint saving
 # =============================================================================
 
 def _save_checkpoint(chunks: List[str], filename: str) -> None:
-    """Save phase chunks to checkpoint file."""
-    text = "\n\n".join(chunks)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "w", encoding="utf-8") as f:
-        f.write(text)
+        f.write("\n\n".join(chunks))
+
+
+# =============================================================================
+#  Main build
+# =============================================================================
 
 def build_dataset(
-    target_chars:    int,
-    output_file:     str,
-    no_gutenberg:    bool = False,
-    no_wikipedia:    bool = False,
-    no_simple_wiki:  bool = False,
-    no_wikiquote:    bool = False,
-    no_wikibooks:    bool = False,
+    target_chars:          int,
+    output_file:           str,
+    no_gutenberg:          bool = False,
+    no_wikipedia:          bool = False,
+    no_simple_wiki:        bool = False,
+    no_wikiquote:          bool = False,
+    no_wiktionary:         bool = False,
+    no_wikibooks:          bool = False,
+    no_reddit:             bool = False,
+    no_tools:              bool = False,
+    phase:                 Optional[int] = None,
+    reddit_comments:       str  = "RC_2016-01.jsonl",
+    reddit_submissions:    str  = "RS_2016-01.jsonl",
+    reddit_output:         str  = "reddit_dataset.txt",
+    reddit_no_submissions: bool = False,
+    reddit_resume:         bool = False,
+    reddit_min_score:      int  = 4,
+    tools_live_search:     bool = True,
+    tools_calc_weight:     float = 0.30,
+    tools_convert_weight:  float = 0.20,
+    tools_date_weight:     float = 0.15,
+    tools_search_weight:   float = 0.35,
 ) -> None:
-    """
-    Collect from all sources, shuffle documents, write to file.
-
-    Default split (2.2M chars):
-        35% Gutenberg       ~770k  -- rich prose, vocabulary breadth
-        30% Wikipedia       ~660k  -- LGBTQ+ + left guaranteed, then diverse + academic
-        15% Simple Wikipedia~330k  -- clean plain sentences
-        10% Wikiquote       ~220k  -- short quotes, diverse voices
-        10% Wikibooks       ~220k  -- dense factual/academic text
-    """
     print("=" * 65)
-    print("miniGPT dataset builder  v3.0")
+    print("miniGPT dataset builder  v5.0  (single-file edition)")
     print(f"Target : {target_chars:,} chars  ->  {output_file}")
-    print("Sources: Gutenberg | Wikipedia (LGBTQ+ + Left + Diverse + Academic)")
-    print("         Simple Wikipedia | Wikiquote | Wikibooks")
+    print("Sources: Gutenberg | Wikipedia (LGBTQ++Left+Diverse+Academic)")
+    print("         Simple Wikipedia | Wikiquote | Wikibooks | Wiktionary")
+    print("         Reddit | Tool training (phase 8)")
+    phase_names = {1: "Gutenberg", 2: "Wikipedia", 3: "Simple Wikipedia",
+                   4: "Wikiquote", 5: "Wikibooks", 6: "Wiktionary",
+                   7: "Reddit",    8: "Tool training"}
+    if phase is not None:
+        print(f"Mode   : SINGLE PHASE {phase} ({phase_names.get(phase, '?')})")
+        no_gutenberg   = (phase != 1)
+        no_wikipedia   = (phase != 2)
+        no_simple_wiki = (phase != 3)
+        no_wikiquote   = (phase != 4)
+        no_wikibooks   = (phase != 5)
+        no_wiktionary  = (phase != 6)
+        no_reddit      = (phase != 7)
+        no_tools       = (phase != 8)
     print("=" * 65)
 
     print("\nWaiting 10s before starting (clears any Wikipedia rate limit)...")
@@ -1148,45 +1109,74 @@ def build_dataset(
     chunks = []
 
     if not no_gutenberg:
-        gutenberg_chars = int(target_chars * 0.35)
-        phase_chunks = fetch_gutenberg(gutenberg_chars)
-        chunks.extend(phase_chunks)
-        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_1_gutenberg.txt")
-        print(f"  ✓ Gutenberg checkpoint saved")
+        c = fetch_gutenberg(int(target_chars * 0.28))
+        chunks.extend(c)
+        _save_checkpoint(c, "Dataset/Dataset part backup/phase_1_gutenberg.txt")
+        print("  ✓ Gutenberg checkpoint saved")
 
     if not no_wikipedia:
-        wikipedia_chars = int(target_chars * 0.30)
-        phase_chunks = fetch_wikipedia(wikipedia_chars)
-        chunks.extend(phase_chunks)
-        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_2_wikipedia.txt")
-        print(f"  ✓ Wikipedia checkpoint saved")
+        c = fetch_wikipedia(int(target_chars * 0.23))
+        chunks.extend(c)
+        _save_checkpoint(c, "Dataset/Dataset part backup/phase_2_wikipedia.txt")
+        print("  ✓ Wikipedia checkpoint saved")
 
     if not no_simple_wiki:
-        simple_chars = int(target_chars * 0.15)
-        phase_chunks = fetch_simple_wikipedia(simple_chars)
-        chunks.extend(phase_chunks)
-        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_3_simple_wikipedia.txt")
-        print(f"  ✓ Simple Wikipedia checkpoint saved")
+        c = fetch_simple_wikipedia(int(target_chars * 0.14))
+        chunks.extend(c)
+        _save_checkpoint(c, "Dataset/Dataset part backup/phase_3_simple_wikipedia.txt")
+        print("  ✓ Simple Wikipedia checkpoint saved")
 
     if not no_wikiquote:
-        wikiquote_chars = int(target_chars * 0.10)
-        phase_chunks = fetch_wikiquote(wikiquote_chars)
-        chunks.extend(phase_chunks)
-        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_4_wikiquote.txt")
-        print(f"  ✓ Wikiquote checkpoint saved")
+        c = fetch_wikiquote(int(target_chars * 0.09))
+        chunks.extend(c)
+        _save_checkpoint(c, "Dataset/Dataset part backup/phase_4_wikiquote.txt")
+        print("  ✓ Wikiquote checkpoint saved")
 
     if not no_wikibooks:
-        wikibooks_chars = int(target_chars * 0.10)
-        phase_chunks = fetch_wikibooks(wikibooks_chars)
-        chunks.extend(phase_chunks)
-        _save_checkpoint(phase_chunks, "Dataset/Dataset part backup/phase_5_wikibooks.txt")
-        print(f"  ✓ Wikibooks checkpoint saved")
+        c = fetch_wikibooks(int(target_chars * 0.09))
+        chunks.extend(c)
+        _save_checkpoint(c, "Dataset/Dataset part backup/phase_5_wikibooks.txt")
+        print("  ✓ Wikibooks checkpoint saved")
 
     if not chunks:
         print("\nERROR: no text collected. Check internet connection.")
         sys.exit(1)
 
-    # Shuffle so sources interleave -- model never sees a block of one style
+    if not no_wiktionary:
+        c = fetch_wiktionary(int(target_chars * 0.05))
+        chunks.extend(c)
+        _save_checkpoint(c, "Dataset/Dataset part backup/phase_6_wiktionary.txt")
+        print("  ✓ Wiktionary checkpoint saved")
+
+    if not no_reddit:
+        c = fetch_reddit(
+            target_chars     = int(target_chars * 0.05),
+            comments_file    = reddit_comments,
+            submissions_file = reddit_submissions,
+            reddit_output    = reddit_output,
+            no_submissions   = reddit_no_submissions,
+            resume           = reddit_resume,
+            min_score        = reddit_min_score,
+        )
+        if c:
+            chunks.extend(c)
+            _save_checkpoint(c, "Dataset/Dataset part backup/phase_7_reddit.txt")
+            print("  ✓ Reddit checkpoint saved")
+
+    if not no_tools:
+        c = fetch_tool_training(
+            target_chars  = int(target_chars * 0.07),
+            live_search   = tools_live_search,
+            calc_weight   = tools_calc_weight,
+            convert_weight= tools_convert_weight,
+            date_weight   = tools_date_weight,
+            search_weight = tools_search_weight,
+        )
+        if c:
+            chunks.extend(c)
+            _save_checkpoint(c, "Dataset/Dataset part backup/phase_8_tools.txt")
+            print("  ✓ Tool training checkpoint saved")
+
     random.shuffle(chunks)
 
     full_text = "\n\n".join(chunks)
@@ -1194,7 +1184,6 @@ def build_dataset(
     full_text = re.sub(r' {2,}',  ' ',    full_text)
     full_text = full_text.strip()
 
-    # Trim to target at a word boundary
     if len(full_text) > target_chars:
         cut       = full_text.rfind(' ', 0, target_chars)
         full_text = full_text[:cut] if cut > 0 else full_text[:target_chars]
@@ -1202,17 +1191,17 @@ def build_dataset(
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(full_text)
 
-    from collections import Counter
-    size_mb = os.path.getsize(output_file) / 1024 / 1024
-
-    # Content audit -- check key topics are represented
+    size_mb    = os.path.getsize(output_file) / 1024 / 1024
     text_lower = full_text.lower()
     audits = [
-        ("LGBTQ+",     ["stonewall", "lgbtq", "transgender", "queer", "gay rights"]),
-        ("Socialist",  ["socialism", "communism", "marxism", "working class", "proletariat"]),
-        ("Civil rights", ["civil rights", "segregation", "discrimination"]),
-        ("Science",    ["chemistry", "physics", "biology", "evolution"]),
-        ("Women",      ["feminism", "suffrage", "women's rights"]),
+        ("LGBTQ+",         ["stonewall", "lgbtq", "transgender", "queer", "gay rights"]),
+        ("Socialist",      ["socialism", "communism", "marxism", "working class", "proletariat"]),
+        ("Civil rights",   ["civil rights", "segregation", "discrimination"]),
+        ("Science",        ["chemistry", "physics", "biology", "evolution"]),
+        ("Women",          ["feminism", "suffrage", "women's rights"]),
+        ("Conversational", ["actually", "honestly", "i think", "in my opinion", "basically"]),
+        ("Tool calls",     ["[tool:calc|", "[tool:search|", "[tool:convert|",
+                            "[tool:date|",  "[tool:lookup|"]),
     ]
 
     print("\n" + "=" * 65)
@@ -1248,20 +1237,65 @@ if __name__ == "__main__":
                         help="Output filename (default: diverse_dataset.txt)")
     parser.add_argument("--seed",          type=int, default=42,
                         help="Random seed (default: 42)")
-    parser.add_argument("--no_gutenberg",   action="store_true", help="Skip Gutenberg")
-    parser.add_argument("--no_wikipedia",   action="store_true", help="Skip Wikipedia")
-    parser.add_argument("--no_simple_wiki", action="store_true", help="Skip Simple Wikipedia")
-    parser.add_argument("--no_wikiquote",   action="store_true", help="Skip Wikiquote")
-    parser.add_argument("--no_wikibooks",   action="store_true", help="Skip Wikibooks")
+    parser.add_argument("--no_gutenberg",      action="store_true")
+    parser.add_argument("--no_wikipedia",      action="store_true")
+    parser.add_argument("--no_simple_wiki",    action="store_true")
+    parser.add_argument("--no_wikiquote",      action="store_true")
+    parser.add_argument("--no_wikibooks",      action="store_true")
+    parser.add_argument("--no_wiktionary",     action="store_true")
+    parser.add_argument("--no_reddit",         action="store_true",
+                        help="Skip Reddit phase (requires local .jsonl dumps)")
+    parser.add_argument("--no_tools",          action="store_true",
+                        help="Skip tool training phase (phase 8)")
+    parser.add_argument("--reddit_comments",   type=str, default="RC_2016-01.jsonl")
+    parser.add_argument("--reddit_submissions",type=str, default="RS_2016-01.jsonl")
+    parser.add_argument("--reddit_output",     type=str, default="reddit_dataset.txt")
+    parser.add_argument("--reddit_no_submissions", action="store_true")
+    parser.add_argument("--reddit_resume",     action="store_true")
+    parser.add_argument("--reddit_min_score",  type=int, default=4)
+    parser.add_argument("--tools_no_live_search", action="store_true",
+                        help="Generate tool examples with placeholder results (faster, "
+                             "skips Wikipedia fetches for search/lookup examples)")
+    parser.add_argument("--tools_calc_weight",    type=float, default=0.30,
+                        help="Fraction of tool examples that are calc (default 0.30)")
+    parser.add_argument("--tools_convert_weight", type=float, default=0.20,
+                        help="Fraction of tool examples that are unit conversions (default 0.20)")
+    parser.add_argument("--tools_date_weight",    type=float, default=0.15,
+                        help="Fraction of tool examples that are date queries (default 0.15)")
+    parser.add_argument("--tools_search_weight",  type=float, default=0.35,
+                        help="Fraction of tool examples that are search/lookup (default 0.35)")
+    parser.add_argument("--phase", type=int, choices=[1,2,3,4,5,6,7,8], default=None,
+                        help=(
+                            "Run only one phase and save its checkpoint:\n"
+                            "  1=Gutenberg  2=Wikipedia  3=Simple Wikipedia\n"
+                            "  4=Wikiquote  5=Wikibooks  6=Wiktionary\n"
+                            "  7=Reddit     8=Tool training\n"
+                            "Overrides all --no_* flags."
+                        ))
     args = parser.parse_args()
 
     random.seed(args.seed)
     build_dataset(
-        target_chars   = args.target_chars,
-        output_file    = args.output,
-        no_gutenberg   = args.no_gutenberg,
-        no_wikipedia   = args.no_wikipedia,
-        no_simple_wiki = args.no_simple_wiki,
-        no_wikiquote   = args.no_wikiquote,
-        no_wikibooks   = args.no_wikibooks,
+        target_chars          = args.target_chars,
+        output_file           = args.output,
+        no_gutenberg          = args.no_gutenberg,
+        no_wikipedia          = args.no_wikipedia,
+        no_simple_wiki        = args.no_simple_wiki,
+        no_wikiquote          = args.no_wikiquote,
+        no_wikibooks          = args.no_wikibooks,
+        no_wiktionary         = args.no_wiktionary,
+        no_reddit             = args.no_reddit,
+        no_tools              = args.no_tools,
+        phase                 = args.phase,
+        reddit_comments       = args.reddit_comments,
+        reddit_submissions    = args.reddit_submissions,
+        reddit_output         = args.reddit_output,
+        reddit_no_submissions = args.reddit_no_submissions,
+        reddit_resume         = args.reddit_resume,
+        reddit_min_score      = args.reddit_min_score,
+        tools_live_search     = not args.tools_no_live_search,
+        tools_calc_weight     = args.tools_calc_weight,
+        tools_convert_weight  = args.tools_convert_weight,
+        tools_date_weight     = args.tools_date_weight,
+        tools_search_weight   = args.tools_search_weight,
     )
