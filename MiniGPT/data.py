@@ -1,8 +1,20 @@
 """
 data.py
 =======
-Dataset utilities for miniGPT: loading text files and building
-(input, label) training pairs from a tokenized corpus.
+Dataset utilities for MiniGPT: loading text and building integer-array
+training batches from a tokenised corpus.
+
+Two batching paths
+------------------
+make_index_arrays()  (fast, recommended)
+    Returns raw (X_idx, Y_idx) int32 arrays of shape (T, N) using numpy
+    stride tricks -- builds all sliding windows in a single zero-copy view.
+    10-50x faster than make_samples() and uses negligible extra memory.
+    This is what the NeuralNetwork training loop uses directly.
+
+make_samples()  (legacy, kept for reference)
+    Returns Python lists of (one-hot-vector, label) pairs.  Useful for
+    debugging or for external training code that expects that format.
 
 Typical usage::
 
@@ -13,7 +25,7 @@ Typical usage::
     tok      = CharTokenizer(text)
     encoded  = tok.encode(text)
     samples  = make_samples(encoded, context_size=8, tokenizer=tok)
-    # samples[0] → ([0.0, 1.0, 0.0, ...], 14)
+    # samples[0] -> ([0.0, 1.0, 0.0, ...], 14)
 """
 
 from __future__ import annotations
@@ -91,18 +103,23 @@ def make_index_arrays(
     """
     Build X_idx (T, N) and Y_idx (T, N) integer arrays from the encoded corpus.
 
-    No one-hot vectors, no Python sample loop — uses numpy stride tricks to
-    build all windows at once. 10-50x faster than make_samples() for large
-    datasets.
+    Uses numpy stride tricks to construct all sliding windows simultaneously
+    in a single zero-copy view over the source array -- no Python loop, no
+    extra allocations.  10-50x faster than make_samples() for large corpora.
 
     How it works
     ------------
-    A sliding window of size context_size+1 moves through the corpus.
-    numpy's as_strided() creates a view of ALL windows simultaneously with
-    zero extra memory (just a different stride pattern over the same buffer).
-    We then sample evenly-spaced rows up to max_samples.
+    A sliding window of width (context_size + 1) moves through the corpus.
+    numpy's as_strided() exposes ALL such windows as a 2-D view with shape
+    (n - W + 1, W) by changing the stride pattern without copying data.
+    We then subsample evenly to respect max_samples, and split each window
+    into inputs (first T cols) and targets (cols shifted by 1).
+    Axes are transposed to (T, N) layout for the batched training loop.
 
-    :return: Tuple of (X_idx, Y_idx) as numpy int32 arrays, shape (T, N).
+    :param encoded: Full corpus as integer token indices (from CharTokenizer).
+    :param context_size: Number of input tokens per sample (T).
+    :param max_samples: Cap on the number of training windows (N).
+    :return: Tuple (X_idx, Y_idx) as numpy int32 arrays, shape (T, N).
     """
     import numpy as _np
     from numpy.lib.stride_tricks import as_strided

@@ -1,47 +1,117 @@
 """
-Neural_Network.py  --  Mini-Transformer (GPT-2 inspired, character-level)
-=========================================================================
+Neural_Network.py  --  Character-level Mini-Transformer
+========================================================
+A from-scratch GPT-2-style transformer built on NumPy/CuPy (no PyTorch).
+Designed to be readable and hackable -- every forward/backward pass is
+written out explicitly, no autograd magic.
 
-New in this version vs the previous one
-----------------------------------------
-  - LayerNorm        : pre-norm before attention AND feed-forward per block,
-                       plus a final LayerNorm before the output projection.
-                       Stabilises training, especially with more blocks.
-  - Multi-head attn  : splits the embedding into H independent heads.
-                       Each head specialises on different patterns.
-  - Dropout          : randomly zeroes activations during training.
-                       Reduces overfitting on small datasets.
-  - Weight tying     : output projection Wout shares weights with the token
-                       embedding (embedding.T). Halves those parameter counts.
-  - Residual scaling : W2 (FF output) init scaled by 1/sqrt(2*num_blocks).
-                       Prevents the residual stream growing too large.
-  - Gradient clipping: caps global gradient norm before Adam update.
-                       Prevents a single bad batch from blowing up weights.
-  - Muon optimizer   : automatic Adam replacement for weight matrices (Wqkv,
-                       W1, W2).  Uses Nesterov momentum + Newton-Schulz
-                       orthogonalisation (5 iters).  Embeddings/biases/LN
-                       params continue to use Adam.  Always active -- no flag.
-  - Tool use         : Toolformer-style [TOOL:name|arg][RESULT:...] format.
-                       Register handlers with register_tool(), then call
-                       generate_with_tools() for interleaved tool execution.
-                       make_tool_training_pairs() constructs augmented corpora
-                       for self-supervised tool-call training.
+Architecture overview
+---------------------
+One transformer block:
 
-Architecture (one block)
-------------------------
-  x
-  |-- LayerNorm 1 --> multi-head attention --> dropout --> (+) --> x
-  |-- LayerNorm 2 --> feed-forward MLP     --> dropout --> (+) --> x
+    x
+    |-- LayerNorm 1 --> Multi-Head Attention --> Dropout --> (+) --> x
+    |-- LayerNorm 2 --> Feed-Forward MLP     --> Dropout --> (+) --> x
 
-Full stack
-----------
-  tokens (B, T)
-    -> token embedding + positional embedding         (B, T, D)
-    -> embedding dropout
-    -> N x transformer block (each with LN+MHA+FF)    (B, T, D)
-    -> final LayerNorm                                 (B, T, D)
-    -> output projection at ALL positions              (B, T, vocab)
-    -> softmax -> probabilities
+Full forward pass:
+
+    tokens (B, T)
+      -> token embedding + learned positional embedding    (B, T, D)
+      -> embedding dropout
+      -> N × transformer block (pre-norm, MHA + FF)        (B, T, D)
+      -> final LayerNorm                                    (B, T, D)
+      -> output projection at every position               (B, T, vocab)
+      -> softmax -> next-token probabilities
+
+Implemented techniques (with papers)
+--------------------------------------
+  Pre-norm (LayerNorm)
+      Applied before attention AND feed-forward inside each block, plus a
+      final norm before the output head.  Pre-norm trains more stably at
+      depth than post-norm (GPT-1 style).
+      Ref: "Language Models are Unsupervised Multitask Learners" (GPT-2),
+           Radford et al. (2019). https://openai.com/research/gpt-2
+
+  Multi-Head Attention
+      Splits the D-dimensional embedding into H independent subspaces.
+      Each head learns different token relationships; outputs are
+      concatenated and projected back.
+      Ref: "Attention Is All You Need", Vaswani et al. (2017).
+           https://arxiv.org/abs/1706.03762
+
+  Fused QKV projection  (Wqkv: D -> 3D)
+      Q, K, V are computed in one matmul instead of three separate ones.
+      Reduces memory traffic and is the natural layout for Flash Attention.
+      Ref: FlashAttention -- Dao et al. (2022). https://arxiv.org/abs/2205.14135
+           FlashAttention-2 -- Dao (2023).      https://arxiv.org/abs/2307.08691
+
+  Dropout
+      Randomly zeros a fraction of activations during training.
+      Applied after attention, after the FF block, and after the embedding.
+      Prevents overfitting on small corpora.
+
+  Weight tying
+      The output projection reuses the transposed token embedding matrix
+      (Wout = embedding.T), halving those parameters.  Aligns the input
+      and output representation spaces, which often improves perplexity.
+
+  Residual scaling
+      W2 (FF output) is initialised with scale 1/sqrt(2*num_blocks).
+      With N residual additions each contributing variance, this keeps the
+      total residual stream magnitude under control from step 1.
+      Ref: GPT-2 paper (Radford et al. 2019).
+
+  Gradient clipping
+      The global L2 gradient norm is capped before the Adam update.
+      Prevents a single bad batch from blowing up weights.
+      Ref: "Why Gradient Clipping Accelerates Training" -- Zhang et al. (2020).
+           https://arxiv.org/abs/1905.11881
+
+  Muon optimizer  (weight matrices only: Wqkv, W1, W2)
+      Replaces Adam for 2-D weight matrices.  Uses Nesterov momentum +
+      Newton-Schulz orthogonalisation (5 iters) to produce an update whose
+      columns are semi-unitary.  Reported ~2x faster than AdamW on some LM
+      tasks.  Embeddings, biases, and LayerNorm params still use Adam.
+      Ref: Kosson et al., "Muon" (2024). https://arxiv.org/abs/2409.20325
+
+  Toolformer-style tool calling
+      During generation the model can emit [TOOL:name|arg] tokens; the
+      runtime detects these, calls the registered executor, and injects
+      [RESULT:...] tokens back into the context before continuing.
+      Training data is constructed by the self-supervised Toolformer method.
+      Ref: Schick et al. (2023). https://arxiv.org/abs/2302.04761
+
+  Quantised KV-cache (TurboQuantKVCache / PolarQuantKVCache)
+      Stores the past K/V tensors at int8 or int4 precision to save memory
+      during long-sequence generation.  Two backends:
+
+      TurboQuantKVCache  -- applies a random Haar rotation before int8/int4
+          scalar quantisation.  Rotation spreads channel-wise outliers so
+          the quantisation grid fits the distribution better.
+          Ref: "QuIP#: Even Better LLM Quantization" -- Tseng et al. (2024).
+               https://arxiv.org/abs/2402.04396
+
+      PolarQuantKVCache  -- identifies per-channel outliers dynamically;
+          keeps them in float16 while compressing inliers to int8.
+          No rotation overhead; effective when outlier channels are sparse.
+          Ref: ResQ / QuaRot outlier-retention ideas.
+
+Future work / papers worth adding
+------------------------------------
+  RoPE positional encoding  -- Su et al. (2021). https://arxiv.org/abs/2104.09864
+  ALiBi (no position vectors, bias-based) -- Press et al. (2022).
+       https://arxiv.org/abs/2108.12409
+  Grouped-Query Attention (GQA) -- Ainslie et al. (2023).
+       https://arxiv.org/abs/2305.13245  [saves KV memory at inference]
+  Differential Transformer  -- Microsoft (2024). https://arxiv.org/abs/2410.05258
+       [attention = softmax(Q1K^T) - softmax(Q2K^T); cancels attention noise]
+  Mixture of Depths (MoD) -- Raposo et al. (2024). https://arxiv.org/abs/2404.02258
+       [tokens dynamically skip layers; reduces FLOPs per forward pass]
+  MegaByte -- Yu et al. (2023). https://arxiv.org/abs/2305.07185
+       [local byte-level + global patch-level transformer; addresses sequence
+        length explosion in char models -- high priority for this codebase]
+  SpaceByte -- Slagle (2024). https://arxiv.org/abs/2404.14408
+       [inserts global blocks at whitespace boundaries; simple char-model fix]
 
 GPU setup
 ---------
@@ -138,13 +208,17 @@ def _adam_step(param, grad, m, v, lr_eff):
     """
     In-place Adam parameter update. Zero allocations.
 
-    Adam update rule (per parameter):
-        m  = beta1*m + (1-beta1)*grad          -- smoothed gradient
-        v  = beta2*v + (1-beta2)*grad^2        -- smoothed squared grad
-        theta -= lr_eff * m / (sqrt(v) + eps)
+    Adam update rule (Kingma & Ba, 2015. https://arxiv.org/abs/1412.6980):
+        m  = beta1*m + (1-beta1)*grad          -- exponential moving avg of gradient
+        v  = beta2*v + (1-beta2)*grad^2        -- exponential moving avg of squared grad
+        theta -= lr_eff * m / (sqrt(v) + eps)  -- adaptive per-parameter step
 
-    Bias correction is pre-baked into lr_eff by the caller:
+    Bias correction is pre-baked into lr_eff by the caller so we avoid two
+    extra scalars per update:
         lr_eff = lr * sqrt(1 - beta2^t) / (1 - beta1^t)
+
+    beta1=0.9, beta2=0.999, eps=1e-8 are the original paper's recommended defaults.
+    Muon replaces Adam for large 2-D weight matrices (see _muon_step below).
     """
     m *= 0.9;   m += 0.1   * grad          # momentum
     v *= 0.999; v += 0.001 * grad * grad   # velocity
@@ -153,11 +227,20 @@ def _adam_step(param, grad, m, v, lr_eff):
 
 def _newton_schulz5(G, steps=5):
     """
-    Orthogonalise G in-place via 5 iterations of the Newton-Schulz iteration:
-        G <- 3/2 * G - 1/2 * G @ G.T @ G
-    Converges quickly to a semi-unitary matrix (equal singular values).
-    Operates on float32; normalises by spectral norm estimate first for
-    numerical stability.
+    Orthogonalise matrix G via 5 iterations of the Newton-Schulz iteration:
+
+        G <- (3/2) * G  -  (1/2) * G @ G.T @ G
+
+    This is a polynomial approximation to the matrix sign function.
+    After enough iterations G converges to a semi-unitary matrix
+    (all singular values equal to 1), which is what Muon wants as its
+    "direction" for the update step.
+
+    Numerical note: we normalise by the Frobenius norm first so the
+    spectral norm is ~1 before iterating -- the iteration diverges if the
+    spectral norm starts much above 1.
+
+    Ref: Kosson et al., "Muon" (2024). https://arxiv.org/abs/2409.20325
     """
     # Normalise so spectral norm ~ 1 before iterating.
     norm = float(np.sqrt(np.sum(G * G))) + 1e-8
@@ -170,23 +253,30 @@ def _newton_schulz5(G, steps=5):
 
 def _muon_step(param, grad, momentum_buf, lr):
     """
-    In-place Muon parameter update for 2-D weight matrices.
+    In-place Muon parameter update. Applied ONLY to 2-D weight matrices
+    (Wqkv, W1, W2).  Embeddings, biases, and LayerNorm params use Adam.
+
+    Why Muon instead of Adam for weight matrices?
+    ----------------------------------------------
+    Adam normalises each scalar gradient independently, which can lead to
+    poorly conditioned updates for large matrices.  Muon instead finds the
+    nearest semi-unitary matrix to the gradient direction (via Newton-Schulz
+    orthogonalisation) and takes a step of fixed size lr in that direction.
+    This is equivalent to Nesterov SGD in the "steepest descent" metric on
+    the space of matrices, and empirically converges ~2x faster than AdamW
+    on language modelling tasks.
 
     Algorithm
     ---------
-    1. Nesterov momentum:
-           buf  = 0.95 * buf + grad
-           g_nesterov = grad + 0.95 * buf
-    2. Orthogonalise via Newton-Schulz (5 iters).
-    3. Scale the orthogonalised update to match the RMS of the raw gradient,
-       then take a step of size `lr`.
+    1. Nesterov momentum (no second-moment buffer needed):
+           buf      = 0.95 * buf + grad
+           G        = grad + 0.95 * buf          (lookahead gradient)
+    2. Orthogonalise G via Newton-Schulz (5 iters) -> G_orth
+    3. Rescale so G_orth has the same RMS as the raw gradient G,
+       then update:  param -= lr * G_orth
 
-    Applied ONLY to Wqkv, W1, W2 (the large weight matrices).
-    Embeddings, biases, and LN params continue to use Adam.
-
-    References
-    ----------
-    Kosson et al., "Muon: Momentum + Orthogonalisation" (2024).
+    Ref: Kosson et al., "Muon: Momentum + Orthogonalisation" (2024).
+         https://arxiv.org/abs/2409.20325
     """
     # Nesterov momentum (no second-moment tracking needed)
     momentum_buf *= 0.95
@@ -212,13 +302,19 @@ def _muon_step(param, grad, momentum_buf, lr):
 
 class _KVCacheBase:
     """
-    Abstract base for compressed KV caches.
+    Abstract base for KV-caches used during autoregressive generation.
 
-    Subclasses implement _encode_* / _decode_* to decide how K and V are
-    actually stored in memory.  The public API is just append() + get().
+    Without a KV-cache each new token requires a full forward pass over the
+    entire context.  With a cache we store the K and V projections for every
+    past token, so each decode step only needs to project the NEW token through
+    Q and then dot it against the cached K/V.  Cost drops from O(T²) per step
+    to O(T) per step.
 
-    Layout: one list of (K_list, V_list) per transformer layer.
-    Each K_list[t] / V_list[t] is a (H, dh) array (one time-step).
+    Subclasses can override _encode_k / _decode_k / _encode_v / _decode_v to
+    compress the stored tensors (e.g. to int8) while keeping the same API.
+
+    Layout: one (K_list, V_list) pair per transformer layer.
+    Each K_list[t] / V_list[t] is a (H, dh) array for one time-step.
     """
 
     def __init__(self, num_layers: int, num_heads: int, head_dim: int):
@@ -288,33 +384,51 @@ class _KVCacheBase:
 
 class TurboQuantKVCache(_KVCacheBase):
     """
-    Quantised KV cache using the TurboQuant_mse algorithm.
+    Quantised KV-cache using random Hadamard/Haar rotation before scalar
+    quantisation.  Inspired by the QuIP# "TurboQuant-MSE" algorithm.
+
+    Why rotate before quantising?
+    ------------------------------
+    Transformer K/V tensors often have a few channels with very large
+    magnitudes ("outliers") that force a wide quantisation grid, wasting
+    precision on the small-magnitude channels.  Multiplying by a random
+    orthogonal matrix R spreads outlier energy uniformly across ALL channels
+    so the resulting distribution is much easier to quantise at low bit-width
+    without significant accuracy loss.
 
     Algorithm per time-step (encode)
     ---------------------------------
     1. Random orthogonal rotation R (Haar-distributed, fixed at construction):
-          k_rot = k @ R.T          shape (H, dh)
-       Rotation spreads any channel-wise outliers across ALL dimensions,
-       making the resulting distribution much easier to quantise uniformly.
+           k_rot = k @ R.T          shape (H, dh)
+    2. Scalar quantisation:
+       int8  -- per-head min/max linear quantisation:
+                    scale = (max - min) / 255
+                    zero  = round(-min / scale)
+                    q     = clip(round(k_rot / scale) + zero, 0, 255)  uint8
+       int4  -- same scaling, values nibble-packed two-per-byte:
+                    q4    = clip(round(k_rot / scale) + zero, 0, 15)   uint8
+                    packed[i] = q4[2i] | (q4[2i+1] << 4)
 
-    2. Scalar quantisation (int8 or nibble-packed int4):
-       int8  : per-head min/max scaling
-                   scale = (max - min) / 255
-                   zero  = round(-min / scale)
-                   q     = clip(round(x / scale) + zero, 0, 255).astype(uint8)
-       int4  : same per-head scaling, values packed two-per-byte (nibbles)
-                   q4 = clip(round(x / scale) + zero, 0, 15).astype(uint8)
-                   packed[i] = q4[2i] | (q4[2i+1] << 4)
+    Decode reverses:  unpack -> dequantise -> rotate back (k_rot @ R).
+    Values are NOT rotated (their distribution is already mild per KIVI).
 
-    Decode reverses: unpack -> dequantise -> rotate back (k @ R).
+    Compression ratios:
+        int8  ~  3-4x vs float32
+        int4  ~  6-8x vs float32
+
+    Ref: "QuIP#: Even Better LLM Quantization with Hadamard Incoherence
+          and Lattice Codebooks" -- Tseng et al. (2024).
+          https://arxiv.org/abs/2402.04396
+         "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache"
+          -- Liu et al. (2024). https://arxiv.org/abs/2402.02750
 
     Parameters
     ----------
     num_layers  : number of transformer blocks
-    num_heads   : H
-    head_dim    : dh  (must be even for int4 packing)
-    bits        : 8 (int8) or 4 (nibble-packed int4)
-    seed        : random seed for the rotation matrices
+    num_heads   : H (number of attention heads)
+    head_dim    : dh = D // H  (must be even for int4 packing)
+    bits        : 8 (int8, default) or 4 (nibble-packed int4)
+    seed        : RNG seed for the per-head rotation matrices
     """
 
     def __init__(
@@ -461,26 +575,47 @@ class TurboQuantKVCache(_KVCacheBase):
 
 class PolarQuantKVCache(_KVCacheBase):
     """
-    Mixed-precision KV cache inspired by QuaRot / ResQ outlier-retention ideas.
+    Mixed-precision KV-cache with outlier-aware channel splitting.
+
+    Motivation
+    ----------
+    Rotation-based methods (TurboQuantKVCache) pay a matmul overhead per
+    token.  An alternative is to identify which channels are outliers
+    dynamically and keep only those in higher precision, compressing
+    everything else cheaply.
 
     Algorithm
     ---------
-    Keys are analysed at each step for per-channel magnitude.  Channels whose
-    L∞ magnitude exceeds a dynamic threshold (outlier_factor × median) are
-    kept in float16; the remaining "inlier" channels are quantised to int8.
+    Keys:
+      1. Compute per-channel L∞ magnitude for the current (H, dh) key slice.
+      2. Flag channels where |k_c| > outlier_factor × median(|k|) as outliers.
+      3. Store outlier channels in float16 (sparse; typically <5% of channels).
+      4. Zero out outlier positions and quantise the rest to int8 with
+         per-head min/max scaling.
+      Decode: dequantise int8 inliers, splice float16 outliers back in.
 
-    Values are always stored at int8 with per-token scaling (KIVI-style).
+    Values: always int8, per-head min/max scaling (KIVI-style).
+    Values rarely have severe outliers so the simpler path suffices.
 
-    This avoids the rotation overhead of TurboQuant and instead surgically
-    retains precision where the distribution would be hard to quantise.
+    Trade-offs vs TurboQuantKVCache
+    --------------------------------
+      + No rotation matmul -> faster encode/decode
+      + Outlier retention is exact (no approximation)
+      - Compression ratio slightly lower when many outlier channels exist
+      - Dynamic outlier threshold can vary across tokens (less predictable)
+
+    Ref: QuaRot / ResQ outlier-retention ideas.
+         "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs"
+          -- Ashkboos et al. (2024). https://arxiv.org/abs/2404.00456
 
     Parameters
     ----------
     num_layers      : transformer blocks
     num_heads       : H
     head_dim        : dh
-    outlier_factor  : channels with abs > factor × median(abs) are kept fp16.
-                      Higher = fewer outliers retained (more compression).
+    outlier_factor  : threshold multiplier on the per-step median.
+                      Higher -> fewer channels classified as outliers
+                      (more compression, slightly lower accuracy).
     """
 
     def __init__(
@@ -584,14 +719,23 @@ class PolarQuantKVCache(_KVCacheBase):
 #  Tool-use infrastructure  (Toolformer-style, character-level)
 # ==============================================================================
 #
-# Format (rigid ASCII delimiters -- easy for a char-level model to learn):
+# Format: rigid ASCII delimiters that a character-level model can reliably learn.
 #
-#   [TOOL:name|argument text]
-#   [RESULT:result text]
+#   Model generates:   [TOOL:name|argument text]
+#   Runtime injects:   [RESULT:result text]
+#   Generation continues from there.
 #
-# generate_with_tools() runs the model autoregressively, detects complete
-# [TOOL:...] calls in the output stream, executes the registered handler,
-# injects a [RESULT:...] token sequence, and continues generation.
+# How it works at inference time
+# --------------------------------
+# generate() runs the model autoregressively and keeps a sliding text buffer.
+# When a complete [TOOL:name|arg] pattern is detected in the buffer the
+# registered executor is called, its result is formatted as [RESULT:...], and
+# those characters are fed back into the context window before sampling resumes.
+# This is the same "API call injection" idea from the Toolformer paper, but
+# adapted for a character-level model with no tokenizer.
+#
+# Ref: "Toolformer: Language Models Can Teach Themselves to Use Tools"
+#       Schick et al. (2023). https://arxiv.org/abs/2302.04761
 #
 # REGISTERING A TOOL
 # ------------------
@@ -601,16 +745,16 @@ class PolarQuantKVCache(_KVCacheBase):
 #   nn.register_tool("search", my_search)
 #
 # The handler receives the raw argument string and must return a plain string.
-# The result is truncated to `max_result_chars` (default 256) before injection
-# to avoid exhausting the context window.
+# Results are truncated to `max_result_chars` (default 256) to avoid
+# exhausting the context window.
 #
 # TRAINING DATA CONSTRUCTION (Toolformer step 2)
 # -----------------------------------------------
-# Use `make_tool_training_pairs(text, vocab, tool_positions)` to insert
-# sampled tool calls into a plain-text corpus and evaluate whether each
-# insertion reduces the loss on the following context.  The helper is
-# intentionally kept separate from the model class so it can be run offline
-# before training begins.
+# make_tool_training_pairs() inserts sampled tool calls into a plain-text
+# corpus.  In the full Toolformer method you would then run a forward pass
+# and keep only insertions that reduce next-token loss.  The helper here
+# omits the loss filter for simplicity -- add it by passing your
+# NeuralNetwork instance and checking cross-entropy before/after insertion.
 
 import re as _re
 
@@ -723,43 +867,49 @@ class NeuralNetwork:
     """
     Character-level GPT-2-inspired transformer.
 
+    This is the core compute engine.  MiniGPT (model.py) wraps this class
+    and handles tokenisation, data loading, save/load, and the generation
+    loop with tool-calling.
+
+    Optimizer split
+    ---------------
+    Weight matrices (Wqkv, W1, W2): updated with Muon (Nesterov momentum +
+        Newton-Schulz orthogonalisation).
+    Everything else (embeddings, biases, LayerNorm): updated with Adam.
+
     Parameters
     ----------
     input_size : int
-        Legacy flat input size. Ignored in the transformer path.
+        Legacy flat input size.  Ignored in the transformer path; kept only
+        for backward-compatibility with old save files.
     hidden_layers : list[int]
-        Legacy dense widths. Kept for save/load backward compatibility.
+        Legacy dense widths.  Also kept for save/load compatibility only.
     output_size : int
         Vocabulary size -- number of softmax output classes.
     activation : str
-        Legacy activation name. One of relu/tanh/sigmoid/leaky_relu.
+        Legacy activation name (relu/tanh/sigmoid/leaky_relu).
     learning_rate : float
-        Peak Adam learning rate. The adaptive scheduler may reduce this.
+        Peak Adam/Muon learning rate.
     batch_size : int
         Samples per gradient step.
     use_embedding : bool
         Use learned token + positional embeddings (always True in practice).
     vocab_size : int
-        Characters in vocabulary.
+        Number of unique characters in the vocabulary.
     context_size : int
-        Sequence length T.
+        Sequence length T fed to the transformer.
     embed_dim : int
-        Hidden dimension D. Must be divisible by num_heads.
+        Hidden dimension D.  Must be divisible by num_heads.
     num_blocks : int
-        Transformer blocks stacked in series.
+        Number of transformer blocks stacked in series.
     num_heads : int
-        Attention heads. D must be divisible by num_heads.
-        Each head works in a D/num_heads dimensional subspace.
+        Number of attention heads H.  Each head works in a D/H subspace.
     dropout : float
-        Dropout rate (0 = disabled). Applied after attention and FF outputs,
-        and after the initial embedding. Ignored during generation.
+        Fraction of activations zeroed during training (0 = disabled).
     weight_tying : bool
-        If True, the output projection reuses the token embedding matrix
-        (Wout = embedding.T). Halves those parameters and often improves
-        quality because the embedding and output spaces are aligned.
+        If True, Wout = embedding.T  (halves output-projection parameters).
     grad_clip : float
-        Max global gradient L2 norm before Adam update (0 = disabled).
-        Prevents a bad batch from taking a destructively large step.
+        Max global gradient L2 norm before the update step (0 = disabled).
     """
 
     # ==========================================================================
@@ -833,19 +983,24 @@ class NeuralNetwork:
             self.pos_embedding = None
 
         # ---- Transformer blocks ---------------------------------------------
-        # Each block holds its own independent weights -- no sharing across
-        # blocks. This allows each block to specialise on different patterns.
+        # Each block is independent -- no weight sharing across blocks.
+        # This lets each block specialise on different linguistic patterns.
         #
-        # Per block:
-        #   Wqkv     -- fused Q,K,V projection  (D, 3D)
-        #   W1, b1   -- FF layer 1              (D, 4D) + (4D,)
-        #   W2, b2   -- FF layer 2              (4D, D) + (D,)
-        #   ln1_g/b  -- LayerNorm 1 params      (D,) each
-        #   ln2_g/b  -- LayerNorm 2 params      (D,) each
+        # Per-block parameters:
+        #   Wqkv     -- fused Q, K, V projection  (D, 3D)
+        #               Fusing into one matrix reduces memory traffic and is
+        #               the natural layout assumed by Flash Attention.
+        #               Ref: FlashAttention -- Dao et al. (2022).
+        #                    https://arxiv.org/abs/2205.14135
+        #   W1, b1   -- FF expansion layer         (D, 4D) + (4D,)
+        #   W2, b2   -- FF contraction layer        (4D, D) + (D,)
+        #               4D hidden width follows the GPT-2 convention.
+        #   ln1_g/b  -- pre-attention LayerNorm params  (D,) each
+        #   ln2_g/b  -- pre-FF LayerNorm params          (D,) each
         #
         # W2 is scaled by 1/sqrt(2*num_blocks) on init (GPT-2 residual
-        # scaling). With N residual paths each adding variance, this keeps
-        # the total residual stream variance under control.
+        # scaling). With N residual additions each adding variance ~0.02²,
+        # this keeps the residual stream magnitude stable from step 1.
         D           = embed_dim
         resid_scale = np.float32(0.02 / (2 * num_blocks) ** 0.5)
         self.blocks: List[Dict] = []

@@ -1,16 +1,27 @@
 """
 tool_definitions.py
 ===================
-Inference-time tool executors and the TOOL_REGISTRY that ties them together.
+Inference-time tool executors and the TOOL_REGISTRY.
 
-This file contains **only** the code needed at inference time:
-  - ToolDef dataclass
-  - One executor function per tool  (str -> str, never raises)
-  - TOOL_REGISTRY dict
+This module implements the inference side of Toolformer-style tool calling.
+At training time, the corpus is augmented with [TOOL:name|arg][RESULT:...]
+patterns (built by build_dataset.py).  At inference time, generate() in
+Neural_Network.py detects those patterns and calls the executors here.
 
-Training-data generation (templates, generators, fetch_tool_training) lives
-in build_dataset.py, which imports the executors from here to keep results
-consistent between training and inference.
+Ref: "Toolformer: Language Models Can Teach Themselves to Use Tools"
+      Schick et al. (2023). https://arxiv.org/abs/2302.04761
+
+What lives here vs build_dataset.py
+-------------------------------------
+  tool_definitions.py (this file):
+      - ToolDef dataclass
+      - One executor function per tool  (str -> str, never raises)
+      - TOOL_REGISTRY dict (used by both training AND inference)
+
+  build_dataset.py:
+      - Template banks and generators for each tool
+      - fetch_tool_training() that builds augmented corpora
+      - Imports executors from here so training/inference stay consistent
 
 Available tools
 ---------------
@@ -24,7 +35,7 @@ Adding a new tool
 -----------------
 1. Write an executor: ``str -> str``, never raises, returns ``"error:..."``
    on failure.
-2. Add it to TOOL_REGISTRY at the bottom.
+2. Add it to TOOL_REGISTRY at the bottom with a ToolDef.
 3. In build_dataset.py add a template bank + generator, then wire into
    fetch_tool_training().
 
@@ -35,13 +46,13 @@ Programmatic usage::
 
     model = MiniGPT.load("gpt_weights.json")
 
-    # Tools are on by default when the model was trained with tool data
+    # All tools on (default when model was trained with tool data)
     print(model.generate("The square root of 144 is"))
 
-    # Opt out of specific tools
+    # Disable specific tools
     print(model.generate("5 km equals", skip_tools={"search", "lookup"}))
 
-    # Opt out entirely
+    # Disable all tools
     print(model.generate("Democracy is", tool_registry=None))
 
     # Call an executor directly (no model needed)

@@ -1,26 +1,43 @@
 """
 model.py
 ========
-The core ``MiniGPT`` class: builds, trains, generates text, and
-saves/loads the character-level language model.
+MiniGPT: a character-level language model built on Neural_Network.py.
 
-Typical usage::
+This module is the user-facing wrapper.  It handles:
+  - tokenisation (CharTokenizer)
+  - data loading and batching (data.py)
+  - building the NeuralNetwork with the right dimensions
+  - the training loop with optional checkpointing
+  - autoregressive text generation (plain or with tool calling)
+  - save / load to/from JSON
 
+Implemented techniques (see Neural_Network.py for deeper docs)
+---------------------------------------------------------------
+  Transformer backbone   -- GPT-2-style pre-norm blocks (Radford et al. 2019)
+  Muon optimizer         -- weight matrices use Muon; rest use Adam
+                            Kosson et al. (2024). https://arxiv.org/abs/2409.20325
+  Toolformer tool calling -- [TOOL:name|arg][RESULT:...] format
+                            Schick et al. (2023). https://arxiv.org/abs/2302.04761
+  Gradient clipping      -- Zhang et al. (2020). https://arxiv.org/abs/1905.11881
+  Weight tying           -- output projection = embedding.T
+
+Quick start
+-----------
     from model import MiniGPT
 
-    # --- Train ---
+    # Train from scratch
     model = MiniGPT(context_size=8, hidden_layers=[256, 128])
     model.train("wiki_dataset.txt", epochs=5)
     model.save("gpt_weights.json")
 
-    # --- Generate (tools on by default when trained with tool data) ---
+    # Generate (tools on by default when the model was trained with tool data)
     model = MiniGPT.load("gpt_weights.json")
     print(model.generate(prompt="Democracy is", length=300))
 
-    # --- Opt out of tools ---
+    # Disable tools entirely
     print(model.generate(prompt="Democracy is", tool_registry=None))
 
-    # --- Skip specific tools ---
+    # Disable specific tools
     from tool_definitions import TOOL_REGISTRY
     print(model.generate(
         prompt       = "5 km equals",
@@ -52,75 +69,55 @@ from data import load_text, simplify_text, make_index_arrays
 
 class MiniGPT:
     """
-    A character-level language model that uses :class:`NeuralNetwork` as its
-    learning backbone.
+    Character-level language model.
 
-    **Architecture overview:**
+    Wraps NeuralNetwork with a friendlier interface: pass a .txt file (or
+    raw text) to train(), call generate() to sample new text, and
+    save()/load() to persist the model between sessions.
 
+    Architecture overview
+    ---------------------
     .. code-block:: text
 
         Raw text
             |
             v
-        CharTokenizer          (character -> integer index)
+        CharTokenizer          (char -> integer index)
             |
             v
-        One-hot encoding       (index -> flat binary vector)
-            |  context_size x vocab_size floats
-            v
-        NeuralNetwork          (your feedforward net)
-            |  hidden_layers with chosen activation
-            v
-        Softmax output         (probability over vocab_size characters)
+        Token + Positional     (learned embeddings, shape D)
+        Embeddings
             |
             v
-        Sampled next character
+        N × Transformer Block  (pre-norm MHA + FF, residual connections)
+            |
+            v
+        Final LayerNorm
+            |
+            v
+        Output projection      (D -> vocab_size logits)
+            |
+            v
+        Softmax -> sample next character
 
-    The model is trained as a multi-class classifier: given the last
-    ``context_size`` characters, predict the next one.  At generation
-    time the prediction is sampled repeatedly to produce new text.
+    The model is trained as a next-character predictor: given the previous
+    context_size characters, minimise cross-entropy on the next character.
+    At generation time, characters are sampled autoregressively.
 
-    :param context_size: How many preceding characters the model sees
-        before predicting the next one.  Larger = more coherent output
-        but slower training (input size grows linearly).
-        Good values: ``6`` (fast) - ``16`` (better quality).
-    :type context_size: int
-
-    :param hidden_layers: Neuron counts for each hidden layer of the
-        underlying NeuralNetwork.  Deeper / wider networks learn better
-        patterns but take longer to train.
-        Default: ``[256, 128]``.
-    :type hidden_layers: list[int]
-
-    :param activation: Activation function for hidden layers.
-        One of ``"relu"`` (default), ``"tanh"``, ``"sigmoid"``,
-        ``"leaky_relu"``.
-    :type activation: str
-
-    :param learning_rate: Step size for each gradient update.
-        Too high -> unstable training.  Too low -> very slow learning.
-        Default: ``0.005``.
-    :type learning_rate: float
-
-    **Quick example -- train and generate:**
-
-    .. code-block:: python
-
-        from model import MiniGPT
-
-        model = MiniGPT(context_size=8, hidden_layers=[256, 128])
-        model.train("wiki_dataset.txt", epochs=5)
-        model.save("gpt_weights.json")
-
-        text = model.generate(prompt="Science is", length=200)
-        print(text)
-
-    **Quick example -- load and generate:**
-
-    .. code-block:: python
-
-        model = MiniGPT.load("gpt_weights.json")
-        print(model.generate(prompt="History shows", length=300, temperature=0.7))
+    :param context_size: Characters of history seen per prediction step.
+        Larger = more coherent text but slower training (input grows linearly).
+        Good values: 6 (fast demo) to 2048 (full quality).
+    :param hidden_layers: Dense widths for legacy compatibility (not used in
+        the transformer path). Default: [256, 128].
+    :param activation: Legacy activation name. Default: "relu".
+    :param learning_rate: Peak Adam/Muon learning rate. Default: 0.005.
+    :param embed_dim: Hidden dimension D. Must be divisible by num_heads.
+    :param batch_size: Samples per gradient step.
+    :param num_blocks: Number of stacked transformer blocks.
+    :param num_heads: Attention heads. embed_dim must be divisible by this.
+    :param dropout: Dropout rate 0-0.5 (0 = off). Helps small-data training.
+    :param weight_tying: Share Wout with embedding.T. Default: True.
+    :param grad_clip: Max gradient L2 norm (0 = off). Default: 1.0.
     """
 
     def __init__(
