@@ -624,13 +624,17 @@ _TOOL_MAX_RESULT = 256    # characters; tune down if context window is tight
 TOOL_CHARS: frozenset = frozenset("[]:|")
 
 
-def ensure_tool_vocab(char2idx: Dict[str, int]) -> Dict[str, int]:
+def ensure_tool_vocab(char2idx: Dict[str, int], silent: bool = False) -> Dict[str, int]:
     """
     Guarantee all tool delimiter characters are in the vocabulary.
 
     Call this after building char2idx from your corpus, before constructing
     the NeuralNetwork.  Missing chars are appended so existing indices stay
     stable.
+
+    :param silent: Suppress the print when chars are added. Pass ``True``
+        during training -- model.py calls this automatically when tool
+        patterns are detected in the corpus.
 
     Example
     -------
@@ -645,8 +649,9 @@ def ensure_tool_vocab(char2idx: Dict[str, int]) -> Dict[str, int]:
         for ch in sorted(missing):
             char2idx[ch] = next_idx
             next_idx += 1
-        print(f"[tool vocab] Added {len(missing)} missing chars: "
-              f"{sorted(missing)}  (new size: {len(char2idx)})")
+        if not silent:
+            print(f"[tool vocab] Added {len(missing)} missing chars: "
+                  f"{sorted(missing)}  (new size: {len(char2idx)})")
     return char2idx
 
 
@@ -2080,71 +2085,83 @@ class NeuralNetwork:
             pass   # caller is responsible for running ensure_tool_vocab()
         self._tools[name] = handler
 
-    def generate_with_tools(
-        self,
-        prompt_ids:      List[int],
-        idx2char:        Dict[int, str],
-        char2idx:        Dict[str, int],
-        max_new:         int   = 200,
-        temperature:     float = 1.0,
-        top_k:           int   = 0,
-        max_tool_calls:  int   = 8,
-        kv_cache:        Optional[_KVCacheBase] = None,
-    ) -> Tuple[List[int], List[dict]]:
-        """
-        Autoregressive generation with interleaved tool execution.
+    # ==========================================================================
+    #  Autoregressive generation  (+ KV-cache helpers)
+    # ==========================================================================
 
-        Generates tokens one at a time.  Whenever the accumulated output
-        contains a complete [TOOL:name|arg] pattern, the registered handler
-        is called, a [RESULT:...] sequence is injected into the context, and
-        generation continues -- up to `max_tool_calls` times.
+    def generate(
+        self,
+        prompt_ids:     List[int],
+        max_new:        int   = 200,
+        temperature:    float = 1.0,
+        top_k:          int   = 0,
+        kv_cache:       Optional[_KVCacheBase] = None,
+        idx2char:       Optional[Dict[int, str]] = None,
+        char2idx:       Optional[Dict[str, int]] = None,
+        max_tool_calls: int   = 8,
+    ):
+        """
+        Autoregressive generation with optional KV-cache and tool execution.
+
+        When ``idx2char`` and ``char2idx`` are provided and tools have been
+        registered via ``register_tool()``, the output is scanned after each
+        token for complete ``[TOOL:name|arg]`` patterns.  Matching calls are
+        executed and ``[RESULT:...]`` is injected back into context before
+        generation continues.  Tool result tokens are injected into context
+        but do NOT count toward ``max_new``.
+
+        Without ``idx2char``/``char2idx`` (or with no registered tools) the
+        method behaves identically to the original plain generate -- no
+        scanning overhead at all.
 
         Parameters
         ----------
         prompt_ids     : integer token indices for the prompt.
-        idx2char       : index -> character mapping (for parsing tool calls).
-        char2idx       : character -> index mapping (for encoding results).
-        max_new        : maximum new tokens to generate (tool result tokens
-                         are injected into context but do NOT count toward
-                         this budget -- only model-generated tokens do).
-        temperature    : sampling temperature.
-        top_k          : top-k sampling (0 = disabled).
-        max_tool_calls : hard cap on number of tool calls to prevent loops.
-        kv_cache       : optional KV cache (same as generate()).
+        max_new        : how many new tokens to sample.
+        temperature    : softmax temperature (1.0 = unchanged, <1 = sharper).
+        top_k          : if > 0, restrict sampling to the top-k logits.
+        kv_cache       : TurboQuantKVCache / PolarQuantKVCache, or None.
+        idx2char       : index -> character mapping.  Required for tools.
+        char2idx       : character -> index mapping.  Required for tools.
+        max_tool_calls : hard cap on tool invocations to prevent loops.
 
         Returns
         -------
-        (token_ids, tool_log) where token_log is the full output token list
-        (model tokens + injected result tokens) and tool_log is a list of
-        dicts {name, query, result, position} for each call made.
+        Plain mode  (no idx2char): List[int] of generated token indices.
+        Tool mode   (idx2char set): Tuple[List[int], List[dict]] where the
+            first element is the full token list (model + injected) and the
+            second is a log of each tool call made.
         """
         if not hasattr(self, "_tools"):
             self._tools = {}
 
-        ctx        = self.context_size
-        ids        = list(prompt_ids[-ctx:])
-        out_ids    = []          # model-generated tokens only (counts toward max_new)
-        full_out   = []          # all tokens including injected results
+        tools_active = (
+            idx2char is not None
+            and char2idx is not None
+            and bool(self._tools)
+        )
+
+        ctx  = self.context_size
+        ids  = list(prompt_ids[-ctx:])
+        out  = []          # plain mode output
+        full_out   = []    # tool mode: model tokens + injected result tokens
         tool_log   = []
         calls_made = 0
+        decoded_tail = ""
+        _MAX_SCAN    = 512
 
         if kv_cache is not None:
             kv_cache.reset()
             self._kv_prefill(ids, kv_cache)
-
-        # Rolling decoded string -- used to detect complete [TOOL:...] patterns.
-        # We only keep the tail long enough to match the longest possible call.
-        _MAX_SCAN = 512
-        decoded_tail = ""
 
         for _ in range(max_new):
             # ---- Sample one token ----------------------------------------
             if kv_cache is not None:
                 logits = self._kv_decode_step(ids[-1], len(ids) - 1, kv_cache)
             else:
-                toks_np   = _np_cpu.array(ids, dtype=_np_cpu.int32).reshape(-1, 1)
+                toks      = _np_cpu.array(ids, dtype=_np_cpu.int32).reshape(-1, 1)
                 probs_all, _ = self._transformer_forward(
-                    np.array(toks_np), training=False
+                    np.array(toks), training=False
                 )
                 if _DEVICE == "gpu":
                     probs_all = np.asnumpy(probs_all)
@@ -2156,26 +2173,28 @@ class NeuralNetwork:
                 kth = _np_cpu.partition(logits, -top_k)[-top_k]
                 logits[logits < kth] = -1e9
             logits -= logits.max()
-            probs   = _np_cpu.exp(logits); probs /= probs.sum()
-            token   = int(_np_cpu.random.choice(len(probs), p=probs))
+            probs  = _np_cpu.exp(logits); probs /= probs.sum()
+            token  = int(_np_cpu.random.choice(len(probs), p=probs))
 
-            out_ids.append(token)
-            full_out.append(token)
+            out.append(token)
             ids.append(token)
             if len(ids) > ctx:
                 ids = ids[-ctx:]
 
-            # Extend decoded tail
+            if not tools_active:
+                continue
+
+            # ---- Tool path: scan for [TOOL:name|arg] ---------------------
+            full_out.append(token)
             decoded_tail += idx2char.get(token, "")
             if len(decoded_tail) > _MAX_SCAN:
                 decoded_tail = decoded_tail[-_MAX_SCAN:]
 
-            # ---- Check for complete tool call ----------------------------
             if calls_made < max_tool_calls and "[TOOL:" in decoded_tail:
                 m = _TOOL_OPEN_RE.search(decoded_tail)
                 if m:
-                    name  = m.group(1)
-                    query = m.group(2)
+                    name    = m.group(1)
+                    query   = m.group(2)
                     handler = self._tools.get(name)
                     if handler is not None:
                         try:
@@ -2192,96 +2211,19 @@ class NeuralNetwork:
                         })
                         calls_made += 1
 
-                        # Inject result tokens into context
                         result_ids = _encode_tool_result(result, char2idx)
                         for rid in result_ids:
                             full_out.append(rid)
                             ids.append(rid)
                             if len(ids) > ctx:
                                 ids = ids[-ctx:]
-
-                        # If using KV cache, prefill the injected tokens
                         if kv_cache is not None:
                             self._kv_prefill(result_ids, kv_cache)
 
-                        # Clear the matched call from the scan tail
                         decoded_tail = decoded_tail[m.end():]
 
-        return full_out, tool_log
-
-    # ==========================================================================
-    #  Autoregressive generation  (+ KV-cache helpers)
-    # ==========================================================================
-
-    def generate(
-        self,
-        prompt_ids:  List[int],
-        max_new:     int = 200,
-        temperature: float = 1.0,
-        top_k:       int = 0,
-        kv_cache:    Optional[_KVCacheBase] = None,
-    ) -> List[int]:
-        """
-        Autoregressive generation with optional KV-cache acceleration.
-
-        Without a cache every new token reruns the full context through all
-        blocks (O(T²) work per step).  With a cache each step is O(1) in
-        context length: we store K and V from past positions and only compute
-        Q for the new token, then look up K/V from the cache.
-
-        Parameters
-        ----------
-        prompt_ids  : list of integer token indices (the prompt).
-        max_new     : how many new tokens to sample.
-        temperature : softmax temperature (1.0 = unchanged, <1 = sharper).
-        top_k       : if > 0, restrict sampling to the top-k logits.
-        kv_cache    : a TurboQuantKVCache or PolarQuantKVCache instance, or
-                      None to use the plain full-context forward pass.
-
-        Returns
-        -------
-        List of generated token indices (not including the prompt).
-        """
-        ctx = self.context_size
-        ids = list(prompt_ids[-ctx:])          # seed context (trimmed to ctx)
-        out = []
-
-        if kv_cache is not None:
-            kv_cache.reset()
-            self._kv_prefill(ids, kv_cache)
-
-        for _ in range(max_new):
-            if kv_cache is not None:
-                # Incremental: only the last token needs a new Q projection.
-                logits = self._kv_decode_step(ids[-1], len(ids) - 1, kv_cache)
-            else:
-                # Fallback: full recompute every step.
-                toks      = _np_cpu.array(ids, dtype=_np_cpu.int32).reshape(-1, 1)
-                probs_all, _ = self._transformer_forward(
-                    np.array(toks), training=False
-                )
-                if _DEVICE == "gpu":
-                    probs_all = np.asnumpy(probs_all)
-                logits = probs_all[0, -1, :]     # (vocab,)  already softmax'd
-                # Undo softmax so temperature / top-k apply cleanly below.
-                logits = _np_cpu.log(logits + 1e-9)
-
-            # Temperature + top-k sampling
-            logits = _np_cpu.array(logits, dtype=_np_cpu.float32)
-            logits /= max(temperature, 1e-6)
-            if top_k > 0:
-                kth = _np_cpu.partition(logits, -top_k)[-top_k]
-                logits[logits < kth] = -1e9
-            logits -= logits.max()
-            probs   = _np_cpu.exp(logits)
-            probs  /= probs.sum()
-            token   = int(_np_cpu.random.choice(len(probs), p=probs))
-
-            out.append(token)
-            ids.append(token)
-            if len(ids) > ctx:
-                ids = ids[-ctx:]
-
+        if tools_active:
+            return full_out, tool_log
         return out
 
     def _kv_prefill(self, ids: List[int], kv_cache: _KVCacheBase) -> None:

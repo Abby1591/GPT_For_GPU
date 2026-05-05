@@ -269,6 +269,14 @@ class MiniGPT:
 
         print("\nTokenizing corpus...")
         tokenizer = CharTokenizer(text)
+
+        # Extend vocab with tool delimiter chars if the training data contains
+        # tool patterns. Done here once so inference never needs to add them.
+        if "[TOOL:" in text:
+            from Neural_Network import ensure_tool_vocab  # type: ignore
+            tokenizer.ch2idx = ensure_tool_vocab(tokenizer.ch2idx, silent=True)
+            tokenizer.idx2ch   = {v: k for k, v in tokenizer.ch2idx.items()}
+
         if self.nn is None:
             # Fresh training: build a new NeuralNetwork with the known vocab size
             self._build(tokenizer)
@@ -429,39 +437,31 @@ class MiniGPT:
         while len(ctx) < self.context_size:
             ctx = [0] + ctx
 
-        # ── Tool-enabled path ──────────────────────────────────────────────
         if tool_registry:
             from Neural_Network import ensure_tool_vocab  # type: ignore
-            tok.char2idx = ensure_tool_vocab(tok.char2idx)
-            tok.idx2ch   = {v: k for k, v in tok.char2idx.items()}
+            tok.ch2idx = ensure_tool_vocab(tok.ch2idx, silent=True)
+            tok.idx2ch   = {v: k for k, v in tok.ch2idx.items()}
             for name, tdef in tool_registry.items():
                 self.nn.register_tool(name, tdef.executor)
-            out_ids, tool_log = self.nn.generate_with_tools(
-                context        = ctx,
-                idx2char       = tok.idx2ch,
-                char2idx       = tok.char2idx,
-                max_new        = length,
-                temperature    = temperature,
-                max_tool_calls = max_tool_calls,
-            )
+
+        result = self.nn.generate(
+            prompt_ids     = ctx,
+            max_new        = length,
+            temperature    = temperature,
+            idx2char       = tok.idx2ch if tool_registry else None,
+            char2idx       = tok.ch2idx if tool_registry else None,
+            max_tool_calls = max_tool_calls,
+        )
+
+        if tool_registry:
+            out_ids, tool_log = result
             if verbose and tool_log:
                 for entry in tool_log:
-                    print(f"[tool] {entry['tool']}({entry['arg']!r}) → {entry['result']!r}")
+                    print(f"[tool] {entry['name']}({entry['query']!r}) → {entry['result']!r}")
             generated = "".join(tok.idx2ch.get(i, "") for i in out_ids)
-            return (prompt + generated) if prompt else generated
-
-        # ── Plain generation path ──────────────────────────────────────────
-        generated = list(prompt) if prompt else []
-        for _ in range(length):
-            _, _, probs = self.nn.predict(ctx)
-            if temperature != 1.0:
-                logits = np.log(np.array(probs) + 1e-9) / temperature
-                probs  = np.exp(logits - logits.max())
-                probs /= probs.sum()
-            next_idx = int(np.random.choice(len(probs), p=probs))
-            generated.append(tok.idx2ch[next_idx])
-            ctx = ctx[1:] + [next_idx]
-        return "".join(generated)
+        else:
+            generated = "".join(tok.idx2ch.get(i, "") for i in result)
+        return (prompt + generated) if prompt else generated
 
     # ------------------------------------------------------------------
     # Save / Load
