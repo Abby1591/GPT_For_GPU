@@ -58,6 +58,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import gzip
+import bz2
 from collections import Counter, deque
 from typing import Iterator, List, Optional
 
@@ -562,62 +564,95 @@ _HEADERS = {
 }
 
 
-def _get(url: str, timeout: int = 25) -> Optional[str]:
+def _get(url: str, timeout: int=25) -> Optional[str]:
     global _last_request, _request_count
 
     _request_count += 1
+
     if _request_count % _COOLDOWN_EVERY == 0:
-        print(f"  [cooldown] {_request_count} requests made, pausing 30s...")
+        print(f'  [cooldown] {_request_count} requests made, pausing 30s...')
         time.sleep(30)
 
     wait = _REQUEST_DELAY - (time.time() - _last_request)
+
     if wait > 0:
         time.sleep(wait)
+
     _last_request = time.time()
 
     for attempt in range(7):
         try:
+
             if _HAS_REQUESTS:
                 r = requests.get(url, headers=_HEADERS, timeout=timeout)
+
                 if r.status_code == 429:
-                    backoff = max(int(r.headers.get("Retry-After", 0)),
-                                  20 * (2 ** attempt))
-                    print(f"  [429] Rate limited, waiting {backoff}s...")
+                    backoff = max(
+                        int(r.headers.get('Retry-After', 0)),
+                        20 * 2 ** attempt
+                    )
+
+                    print(f'  [429] Rate limited, waiting {backoff}s...')
                     time.sleep(backoff)
                     _last_request = time.time()
                     continue
+
                 if r.status_code == 503:
                     time.sleep(30)
                     continue
+
                 r.raise_for_status()
                 return r.text
+
             else:
                 req = urllib.request.Request(url, headers=_HEADERS)
+
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.read().decode("utf-8", errors="ignore")
+
+                    data = resp.read()
+
+                    if resp.headers.get('Content-Encoding') == 'gzip':
+                        data = gzip.decompress(data)
+
+                    return data.decode('utf-8', errors='ignore')
+
+                    print(resp.headers.get('Content-Encoding'))
+
         except Exception as e:
-            if "429" in str(e) or "503" in str(e):
-                backoff = 20 * (2 ** attempt)
-                print(f"  [rate limit] waiting {backoff}s...")
+
+            if '429' in str(e) or '503' in str(e):
+                backoff = 20 * 2 ** attempt
+
+                print(f'  [rate limit] waiting {backoff}s...')
                 time.sleep(backoff)
+
                 _last_request = time.time()
                 continue
-            print(f"  [WARN] {url[:80]}: {e}")
+
+            print(f'  [WARN] {url[:80]}: {e}')
             return None
 
-    print(f"  [WARN] Gave up after 7 retries: {url[:80]}")
+    print(f'  [WARN] Gave up after 7 retries: {url[:80]}')
     return None
-
 
 def _get_json(url: str) -> Optional[dict]:
     text = _get(url)
+
     if text is None:
         return None
-    try:
-        return json.loads(text)
-    except Exception:
+
+    if text.lstrip().startswith('<'):
+        print("HTML returned instead of JSON")
+        print(text[:500])
         return None
 
+    try:
+        return json.loads(text)
+
+    except Exception as e:
+        print("JSON decode failed:", e)
+        print(text[:500])
+        return None
 
 # =============================================================================
 #  Text cleaning
@@ -911,71 +946,10 @@ def fetch_wikibooks(target_chars: int) -> List[str]:
     print(f"  Wikibooks done: {total:,} chars from {len(chunks)} books")
     return chunks
 
-
-def fetch_wiktionary(target_chars: int) -> List[str]:
-    print(f"\n[6/8] Wiktionary  (target {target_chars:,} chars)")
-    SEED_WORDS = [
-        "love", "justice", "freedom", "power", "nature", "science", "truth",
-        "language", "culture", "history", "philosophy", "economy", "society",
-        "identity", "community", "memory", "knowledge", "revolution", "labor",
-        "democracy", "empire", "resistance", "theory", "practice", "class",
-        "gender", "race", "body", "mind", "time", "space", "light", "water",
-        "fire", "earth", "machine", "art", "music", "poetry", "religion",
-    ]
-
-    chunks = []
-    total  = 0
-    seen   = set()
-    words  = list(SEED_WORDS)
-
-    data = _get_json(
-        "https://en.wiktionary.org/w/api.php"
-        "?action=query&list=random&rnnamespace=0&rnlimit=50&format=json"
-    )
-    if data:
-        try:
-            for entry in data["query"]["random"]:
-                words.append(entry["title"])
-        except Exception:
-            pass
-
-    random.shuffle(words)
-
-    for word in words:
-        if total >= target_chars:
-            break
-        if word in seen:
-            continue
-        seen.add(word)
-        url = (
-            "https://en.wiktionary.org/w/api.php"
-            f"?action=query&titles={urllib.parse.quote(word)}"
-            "&prop=extracts&explaintext=1&format=json"
-        )
-        data = _get_json(url)
-        if not data:
-            continue
-        try:
-            page = next(iter(data["query"]["pages"].values()))
-            if "extract" not in page:
-                continue
-            text = clean(page["extract"])
-            if len(text) < 100:
-                continue
-            chunks.append(f"{word}:\n{text}")
-            total += len(chunks[-1])
-            print(f"  OK  {word}  ({len(chunks[-1]):,} chars)")
-        except Exception:
-            continue
-
-    print(f"  Wiktionary done: {total:,} chars from {len(chunks)} entries")
-    return chunks
-
-
 def fetch_reddit(
     target_chars:     int,
-    comments_file:    str  = "RC_2016-01.jsonl",
-    submissions_file: str  = "RS_2016-01.jsonl",
+    comments_file:    str  = "Dumps/comments/RC_2016-01.jsonl",
+    submissions_file: str  = "Dumps/submissions/RS_2016-01.jsonl",
     reddit_output:    str  = "reddit_dataset.txt",
     no_submissions:   bool = False,
     resume:           bool = False,
@@ -1025,6 +999,121 @@ def fetch_reddit(
     print(f"  Reddit done: {len(chunks):,} chunks  ({chars:,} chars)")
     return chunks
 
+def fetch_wiktionary(
+    target_chars: int,
+    dump_file: str='dumps/enwiktionary-latest-pages-articles.xml.bz2',
+    checkpoint_file: str='Dataset/Dataset part backup/phase_6_wiktionary.txt'
+) -> List[str]:
+
+    print(f'\n[6/8] Wiktionary Dump  (target {target_chars:,} chars)')
+
+    if not os.path.exists(dump_file):
+        print(f'  Dump not found: {dump_file}')
+        return []
+
+    import gc
+
+    os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+
+    chunks = []
+    total = 0
+    entries = 0
+
+    inside_page = False
+    inside_text = False
+
+    title = ''
+    text_lines = []
+
+    with bz2.open(dump_file, 'rt', encoding='utf-8', errors='ignore') as f:
+
+        for line in f:
+
+            if '<page>' in line:
+                inside_page = True
+                inside_text = False
+                title = ''
+                text_lines = []
+                continue
+
+            if '</page>' in line:
+
+                if title and text_lines:
+
+                    text = ''.join(text_lines)
+
+                    if '#REDIRECT' not in text.upper():
+
+                        lower = text.lower()
+
+                        if (
+                            '==english==' in lower or
+                            '===noun===' in lower or
+                            '===verb===' in lower or
+                            '===adjective===' in lower
+                        ):
+
+                            text = text.replace('[[', '')
+                            text = text.replace(']]', '')
+                            text = text.replace('{{', '')
+                            text = text.replace('}}', '')
+
+                            text = re.sub('<[^>]+>', ' ', text)
+                            text = re.sub(r'\s+', ' ', text).strip()
+
+                            entry = f'{title}\n\n{text}\n\n'
+
+                            if len(entry) > 120:
+
+                                chunks.append(entry)
+
+                                total += len(entry)
+                                entries += 1
+
+                                if entries % 1000 == 0:
+                                    print(
+                                        f'  [{entries:,}] entries  '
+                                        f'({total:,}/{target_chars:,} chars)'
+                                    )
+
+                                if entries % 5000 == 0:
+                                    gc.collect()
+
+                                if total >= target_chars:
+                                    break
+
+                inside_page = False
+                inside_text = False
+                text_lines.clear()
+                continue
+
+            if not inside_page:
+                continue
+
+            if '<title>' in line and '</title>' in line:
+                title = re.sub(r'.*<title>(.*?)</title>.*', r'\1', line)
+                continue
+
+            if '<text' in line:
+                inside_text = True
+                line = line.split('>', 1)[-1]
+
+            if inside_text:
+
+                if '</text>' in line:
+                    line = line.split('</text>', 1)[0]
+                    inside_text = False
+
+                if len(text_lines) < 4000:
+                    text_lines.append(line)
+
+    with open(checkpoint_file, 'w', encoding='utf-8') as out:
+        out.write('\n\n'.join(chunks))
+
+    print(f'  Wiktionary dump done: {entries:,} entries  ({total:,} chars)')
+
+    return chunks
+
 
 # =============================================================================
 #  Phase 8: Tool training data
@@ -1045,7 +1134,7 @@ def fetch_reddit(
 # Executors are imported from tool_definitions so training and inference
 # always produce identical results for the same input.
 
-from tool_definitions import (  # noqa: E402
+from MiniGPT.tool_definitions import (  # noqa: E402
     _tool_exec_calc,
     _tool_exec_convert,
     _tool_exec_date,
@@ -1431,15 +1520,21 @@ def build_dataset(
         _save_checkpoint(c, "Dataset/Dataset part backup/phase_5_wikibooks.txt")
         print("  ✓ Wikibooks checkpoint saved")
 
-    if not chunks:
-        print("\nERROR: no text collected. Check internet connection.")
-        sys.exit(1)
-
     if not no_wiktionary:
-        c = fetch_wiktionary(int(target_chars * 0.05))
+        wiktionary_target = (
+            target_chars if phase == 6
+            else int(target_chars * 0.05)
+        )
+
+        c = fetch_wiktionary(
+            wiktionary_target,
+            dump_file='dumps/enwiktionary-latest-pages-articles.xml.bz2',
+            checkpoint_file='Dataset/Dataset part backup/phase_6_wiktionary.txt'
+        )
+
         chunks.extend(c)
-        _save_checkpoint(c, "Dataset/Dataset part backup/phase_6_wiktionary.txt")
-        print("  ✓ Wiktionary checkpoint saved")
+
+        print('  ✓ Wiktionary checkpoint saved')
 
     if not no_reddit:
         c = fetch_reddit(
@@ -1471,6 +1566,10 @@ def build_dataset(
             chunks.extend(c)
             _save_checkpoint(c, "Dataset/Dataset part backup/phase_8_tools.txt")
             print("  ✓ Tool training checkpoint saved")
+
+    if not chunks:
+        print("\nERROR: no text collected. Check internet connection.")
+        sys.exit(1)
 
     random.shuffle(chunks)
 

@@ -57,14 +57,14 @@ from typing import List, Optional
 import numpy as np
 
 try:
-    from Neural_Network import NeuralNetwork
+    from .Neural_Network import NeuralNetwork
 except ImportError:
     print("ERROR: Neural_Network.py not found.")
     print("Place Neural_Network.py in the same folder as model.py.")
     sys.exit(1)
 
-from tokenizer import CharTokenizer
-from data import load_text, simplify_text, make_index_arrays
+from .tokenizer import CharTokenizer
+from .data import load_text, simplify_text, make_index_arrays
 
 
 class MiniGPT:

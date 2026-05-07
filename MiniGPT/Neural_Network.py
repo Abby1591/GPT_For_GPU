@@ -29,7 +29,9 @@ Implemented techniques (with papers)
       Applied before attention AND feed-forward inside each block, plus a
       final norm before the output head.  Pre-norm trains more stably at
       depth than post-norm (GPT-1 style).
-      Ref: "Language Models are Unsupervised Multitask Learners" (GPT-2),
+      Ref: "Layer Normalization" -- Ba et al. (2016).
+           https://arxiv.org/abs/1607.06450
+           "Language Models are Unsupervised Multitask Learners" (GPT-2),
            Radford et al. (2019). https://openai.com/research/gpt-2
 
   Multi-Head Attention
@@ -49,11 +51,15 @@ Implemented techniques (with papers)
       Randomly zeros a fraction of activations during training.
       Applied after attention, after the FF block, and after the embedding.
       Prevents overfitting on small corpora.
+      Ref: "Dropout: A Simple Way to Prevent Neural Networks from Overfitting"
+           -- Srivastava et al. (2014). https://jmlr.org/papers/v15/srivastava14a.html
 
   Weight tying
       The output projection reuses the transposed token embedding matrix
       (Wout = embedding.T), halving those parameters.  Aligns the input
       and output representation spaces, which often improves perplexity.
+      Ref: "Using the Output Embedding to Improve Language Models"
+           -- Press & Wolf (2017). https://arxiv.org/abs/1608.05859
 
   Residual scaling
       W2 (FF output) is initialised with scale 1/sqrt(2*num_blocks).
@@ -66,6 +72,13 @@ Implemented techniques (with papers)
       Prevents a single bad batch from blowing up weights.
       Ref: "Why Gradient Clipping Accelerates Training" -- Zhang et al. (2020).
            https://arxiv.org/abs/1905.11881
+
+  Adam optimizer  (embeddings, biases, LayerNorm params)
+      Adaptive per-parameter learning rates using exponential moving averages
+      of gradient and squared gradient.  Used for all non-matrix parameters;
+      2-D weight matrices use Muon instead.
+      Ref: "Adam: A Method for Stochastic Optimization"
+           -- Kingma & Ba (2015). https://arxiv.org/abs/1412.6980
 
   Muon optimizer  (weight matrices only: Wqkv, W1, W2)
       Replaces Adam for 2-D weight matrices.  Uses Nesterov momentum +
@@ -94,24 +107,61 @@ Implemented techniques (with papers)
       PolarQuantKVCache  -- identifies per-channel outliers dynamically;
           keeps them in float16 while compressing inliers to int8.
           No rotation overhead; effective when outlier channels are sparse.
-          Ref: ResQ / QuaRot outlier-retention ideas.
+          Ref: "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs"
+               -- Ashkboos et al. (2024). https://arxiv.org/abs/2404.00456
+               "ResQ: Mixed-Precision Quantization of Large Language Models with
+               Low-Rank Residuals" -- Markov et al. (2024).
+               https://arxiv.org/abs/2407.11534
 
-Future work / papers worth adding
-------------------------------------
-  RoPE positional encoding  -- Su et al. (2021). https://arxiv.org/abs/2104.09864
-  ALiBi (no position vectors, bias-based) -- Press et al. (2022).
-       https://arxiv.org/abs/2108.12409
-  Grouped-Query Attention (GQA) -- Ainslie et al. (2023).
-       https://arxiv.org/abs/2305.13245  [saves KV memory at inference]
-  Differential Transformer  -- Microsoft (2024). https://arxiv.org/abs/2410.05258
-       [attention = softmax(Q1K^T) - softmax(Q2K^T); cancels attention noise]
-  Mixture of Depths (MoD) -- Raposo et al. (2024). https://arxiv.org/abs/2404.02258
-       [tokens dynamically skip layers; reduces FLOPs per forward pass]
-  MegaByte -- Yu et al. (2023). https://arxiv.org/abs/2305.07185
-       [local byte-level + global patch-level transformer; addresses sequence
-        length explosion in char models -- high priority for this codebase]
-  SpaceByte -- Slagle (2024). https://arxiv.org/abs/2404.14408
-       [inserts global blocks at whitespace boundaries; simple char-model fix]
+Implemented advanced techniques (replacing originals in the active model)
+--------------------------------------------------------------------------
+  RoPE positional encoding
+      Replaces learned absolute positional embeddings.  Rotates Q and K
+      vectors by position-dependent angles so attention scores encode
+      relative distance rather than absolute index.  Generalises to
+      sequences longer than seen during training.
+      Ref: "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+           -- Su et al. (2021). https://arxiv.org/abs/2104.09864
+
+  ALiBi (Attention with Linear Biases)
+      Alternative positional scheme.  Adds a fixed per-head linear penalty
+      m*|i-j| to each attention score (m is a head-specific slope).
+      No extra parameters; extrapolates naturally to longer sequences.
+      Ref: "Train Short, Test Long" -- Press et al. (2022).
+           https://arxiv.org/abs/2108.12409
+
+  Grouped-Query Attention (GQA)
+      Q keeps H heads but K and V use G < H heads shared across H//G
+      query heads.  Reduces KV-cache size by H/G at inference with
+      negligible quality loss.
+      Ref: "GQA: Training Generalised Multi-Query Transformer Models"
+           -- Ainslie et al. (2023). https://arxiv.org/abs/2305.13245
+
+  Differential Transformer
+      Each head computes A = softmax(Q1 K^T) - lambda * softmax(Q2 K^T).
+      The subtraction cancels attention noise and focuses on fewer tokens.
+      lambda is a learned per-block scalar initialised near 0.
+      Ref: "Differential Transformer" -- Ye et al. / Microsoft (2024).
+           https://arxiv.org/abs/2410.05258
+
+  Mixture of Depths (MoD)
+      A learned per-block token router sends only the top-k tokens through
+      attention + FF; the rest skip via the residual.  Reduces FLOPs by
+      roughly (1 - k/T) per block.
+      Ref: "Mixture of Depths" -- Raposo et al. (2024).
+           https://arxiv.org/abs/2404.02258
+
+Separate architecture classes (see below NeuralNetwork)
+---------------------------------------------------------
+  MegaByteTransformer
+      Local byte-level model processes B-byte patches; global patch-level
+      model processes patch summaries.  Avoids O(T^2) cost on raw bytes.
+      Ref: "MegaByte" -- Yu et al. (2023). https://arxiv.org/abs/2305.07185
+
+  SpaceByteTransformer
+      Standard byte transformer augmented with global blocks inserted at
+      whitespace boundaries.  Simple, effective for natural-language char LMs.
+      Ref: "SpaceByte" -- Slagle (2024). https://arxiv.org/abs/2404.14408
 
 GPU setup
 ---------
@@ -863,6 +913,902 @@ def make_tool_training_pairs(
 
 
 
+# ==============================================================================
+#  RoPE -- Rotary Positional Embedding
+#  Su et al. (2021). https://arxiv.org/abs/2104.09864
+# ==============================================================================
+
+def _rope_freqs(head_dim: int, max_seq: int, base: float = 10000.0):
+    """
+    Precompute the (cos, sin) rotation matrices for RoPE.
+
+    Each pair of dimensions (2i, 2i+1) in a d_h-dimensional head is
+    rotated by theta_i * position, where theta_i = base^(-2i/d_h).
+
+    Returns:
+        cos_cached : (max_seq, d_h)  -- cosine terms, broadcast-ready
+        sin_cached : (max_seq, d_h)  -- sine terms
+    """
+    # theta_i for i = 0, 1, ..., d_h/2 - 1
+    half    = head_dim // 2
+    thetas  = 1.0 / (base ** (np.arange(half, dtype=np.float32) * 2.0 / head_dim))
+    # positions x thetas -> (max_seq, half)
+    pos     = np.arange(max_seq, dtype=np.float32)
+    freqs   = pos[:, None] * thetas[None, :]          # (max_seq, half)
+    # Interleave: [cos(t0), cos(t0), cos(t1), cos(t1), ...]
+    cos_full = np.repeat(np.cos(freqs), 2, axis=-1)   # (max_seq, d_h)
+    sin_full = np.repeat(np.sin(freqs), 2, axis=-1)   # (max_seq, d_h)
+    return cos_full, sin_full
+
+
+def _rope_rotate_half(x):
+    """
+    For a (..., d_h) tensor, pair each dimension with its neighbour and
+    produce the perpendicular vector:  [-x1, x0, -x3, x2, ...].
+    This is the "rotate by 90 degrees in each 2D subspace" step.
+    """
+    # Split even / odd indices: even -> negated odd, odd -> even
+    x1 = x[..., 0::2]   # (..., half)
+    x2 = x[..., 1::2]   # (..., half)
+    # Interleave [-x2, x1] back to full dimension
+    out        = np.empty_like(x)
+    out[..., 0::2] = -x2
+    out[..., 1::2] =  x1
+    return out
+
+
+def _apply_rope(q, k, cos, sin):
+    """
+    Apply RoPE in-place to Q and K tensors.
+
+    q, k  : (B, H, T, d_h)
+    cos   : (T, d_h)   -- precomputed from _rope_freqs
+    sin   : (T, d_h)
+
+    Returns rotated (q_rot, k_rot) of the same shape.
+    RoPE formula:  x_rot = x * cos + rotate_half(x) * sin
+    """
+    # Broadcast cos/sin over batch and head dims: (1, 1, T, d_h)
+    c = cos[None, None, :, :]
+    s = sin[None, None, :, :]
+    q_rot = q * c + _rope_rotate_half(q) * s
+    k_rot = k * c + _rope_rotate_half(k) * s
+    return q_rot, k_rot
+
+
+# ==============================================================================
+#  ALiBi -- Attention with Linear Biases
+#  Press et al. (2022). https://arxiv.org/abs/2108.12409
+# ==============================================================================
+
+def _alibi_slopes(num_heads: int):
+    """
+    Compute the per-head ALiBi slope vector.
+
+    Slopes are geometric: m_h = 2^(-8h/H) for h = 1..H.
+    This is the formula from the ALiBi paper (Table 1).
+
+    Returns slopes : (H,)  float32
+    """
+    h_idx  = np.arange(1, num_heads + 1, dtype=np.float32)
+    slopes = (2.0 ** (-8.0 * h_idx / num_heads)).astype(np.float32)
+    return slopes
+
+
+def _alibi_bias(slopes, T: int):
+    """
+    Build the (H, T, T) ALiBi additive bias matrix.
+
+    bias[h, i, j] = -slope_h * |i - j|   for j <= i  (causal)
+                    -1e9                   for j >  i  (masked)
+
+    Adding this to raw attention logits replaces both the causal mask
+    and positional encoding in one step.
+    """
+    H      = len(slopes)
+    # Relative distance matrix: (T, T)  -- entry (i,j) = |i - j|
+    pos    = np.arange(T, dtype=np.float32)
+    dist   = np.abs(pos[:, None] - pos[None, :])          # (T, T)
+    # Apply slope per head: (H, 1, 1) * (1, T, T)
+    bias   = -slopes[:, None, None] * dist[None, :, :]    # (H, T, T)
+    # Mask future positions
+    future = (np.triu(np.ones((T, T), dtype=np.float32), k=1) * 1e9)
+    bias  -= future[None, :, :]                            # broadcast over H
+    return bias.astype(np.float32)
+
+
+# ==============================================================================
+#  GQA -- Grouped-Query Attention block forward
+#  Ainslie et al. (2023). https://arxiv.org/abs/2305.13245
+# ==============================================================================
+
+def _block_forward_gqa(self, x, blk, training: bool = False,
+                        cos=None, sin=None, alibi=None):
+    """
+    Transformer block using Grouped-Query Attention (GQA).
+
+    Q uses num_heads (H) heads; K and V use num_kv_heads (G) heads.
+    Each KV head is shared by H//G query heads ("groups").
+    When G == H this degenerates to standard MHA; G == 1 is MQA.
+
+    blk must contain:
+        Wq   : (D, D)              -- query projection (full heads)
+        Wkv  : (D, 2 * G * d_h)   -- fused KV projection (fewer heads)
+        W1/b1/W2/b2/ln1_g/ln1_b/ln2_g/ln2_b : same as standard block
+
+    Positional encoding can be RoPE (cos/sin provided) or ALiBi (alibi
+    matrix provided), or neither (absolute pos embedding, legacy).
+    """
+    B, T, D = x.shape
+    H       = self.num_heads
+    G       = self.num_kv_heads
+    d_h     = D // H
+    BT      = B * T
+    reps    = H // G          # how many Q heads share each KV head
+
+    # Pre-norm 1
+    ln1_out, ln1_cache = self._ln_forward(x, blk["ln1_g"], blk["ln1_b"])
+
+    # Q projection: (BT, D) @ (D, D) -> (B, H, T, d_h)
+    Q = (ln1_out.reshape(BT, D) @ blk["Wq"]).reshape(B, T, H, d_h)
+    Q = Q.transpose((0, 2, 1, 3))   # (B, H, T, d_h)
+
+    # KV projection: (BT, D) @ (D, 2*G*d_h) -> split K, V  (B, G, T, d_h)
+    KV  = (ln1_out.reshape(BT, D) @ blk["Wkv"]).reshape(B, T, 2, G, d_h)
+    K   = KV[:, :, 0].transpose((0, 2, 1, 3))   # (B, G, T, d_h)
+    V   = KV[:, :, 1].transpose((0, 2, 1, 3))
+    del KV
+
+    # Apply RoPE if provided
+    if cos is not None:
+        # RoPE on Q (H heads) and K (G heads) separately
+        Q, _ = _apply_rope(Q, Q, cos[:T], sin[:T])   # dummy K, only Q used
+        K, _ = _apply_rope(K, K, cos[:T], sin[:T])
+
+    # Expand K and V from G -> H heads by repeating each G-head reps times
+    # (B, G, T, d_h) -> (B, H, T, d_h)
+    K_exp = np.repeat(K, reps, axis=1)
+    V_exp = np.repeat(V, reps, axis=1)
+
+    # Scaled dot-product attention
+    scale  = 1.0 / (d_h ** 0.5)
+    scores = Q @ K_exp.transpose((0, 1, 3, 2)) * scale    # (B, H, T, T)
+
+    if alibi is not None:
+        scores += alibi[None, :, :T, :T]  # (1, H, T, T)
+    else:
+        scores += self._causal_mask(T)
+
+    scores -= scores.max(axis=-1, keepdims=True)
+    exp_s   = np.exp(scores)
+    A       = exp_s / exp_s.sum(axis=-1, keepdims=True)    # (B, H, T, T)
+    del scores, exp_s
+
+    attn_h   = A @ V_exp                                   # (B, H, T, d_h)
+    attn_out = attn_h.transpose((0, 2, 1, 3)).reshape(B, T, D)
+
+    attn_out, drop1_mask = self._apply_dropout(attn_out, training)
+    x_attn   = x + attn_out
+
+    # Pre-norm 2 + feed-forward (identical to standard block)
+    ln2_out, ln2_cache = self._ln_forward(x_attn, blk["ln2_g"], blk["ln2_b"])
+    h_ff   = np.maximum(0.0, ln2_out @ blk["W1"] + blk["b1"])
+    ff_out = h_ff @ blk["W2"] + blk["b2"]
+    ff_out, drop2_mask = self._apply_dropout(ff_out, training)
+    x_out  = x_attn + ff_out
+
+    cache = (
+        x, ln1_out, ln1_cache,
+        Q, K, V, K_exp, V_exp, A,
+        attn_out, drop1_mask,
+        x_attn, ln2_out, ln2_cache,
+        h_ff, ff_out, drop2_mask,
+        reps,
+    )
+    return x_out, cache
+
+
+def _block_backward_gqa(self, d_out, cache, blk):
+    """
+    Backprop through a GQA block.
+
+    K and V gradients are computed on the expanded (H-head) tensors and
+    then summed over groups of reps heads to get the G-head gradient for Wkv.
+    """
+    (
+        x, ln1_out, ln1_cache,
+        Q, K, V, K_exp, V_exp, A,
+        attn_out, drop1_mask,
+        x_attn, ln2_out, ln2_cache,
+        h_ff, ff_out, drop2_mask,
+        reps,
+    ) = cache
+
+    B, T, D = x.shape
+    H       = self.num_heads
+    G       = self.num_kv_heads
+    d_h     = D // H
+    BT      = B * T
+
+    # FF backward
+    d_ff_out = d_out * drop2_mask if drop2_mask is not None else d_out
+    dW2      = h_ff.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)
+    db2      = d_ff_out.sum(axis=(0, 1))
+    d_h_grad = d_ff_out @ blk["W2"].T
+    d_h_grad *= (h_ff > 0)
+    dW1      = ln2_out.reshape(BT, -1).T @ d_h_grad.reshape(BT, -1)
+    db1      = d_h_grad.sum(axis=(0, 1))
+    d_ln2_out = d_h_grad @ blk["W1"].T
+
+    d_x_attn_ff, d_ln2_g, d_ln2_b = self._ln_backward(d_ln2_out, ln2_cache)
+    d_x_attn = d_out + d_x_attn_ff
+
+    # Attention backward
+    d_attn_out = d_x_attn * drop1_mask if drop1_mask is not None else d_x_attn
+    d_attn_h   = d_attn_out.reshape(B, T, H, d_h).transpose((0, 2, 1, 3))
+
+    dA     = d_attn_h @ V_exp.transpose((0, 1, 3, 2))
+    dV_exp = A.transpose((0, 1, 3, 2)) @ d_attn_h
+
+    dS = A * (dA - (dA * A).sum(axis=-1, keepdims=True))
+    dS *= 1.0 / (d_h ** 0.5)
+
+    dQ     = dS @ K_exp
+    dK_exp = dS.transpose((0, 1, 3, 2)) @ Q
+
+    # Reduce expanded K/V grads from H heads -> G heads by summing groups
+    # (B, H, T, d_h) -> (B, G, T, d_h)
+    dK_g = dK_exp.reshape(B, G, reps, T, d_h).sum(axis=2)
+    dV_g = dV_exp.reshape(B, G, reps, T, d_h).sum(axis=2)
+
+    # Grad for Wq: (BT, D) <- dQ (B, H, T, d_h) -> (BT, D)
+    dQ_r  = dQ.transpose((0, 2, 1, 3)).reshape(BT, D)
+    dWq   = ln1_out.reshape(BT, D).T @ dQ_r
+    d_ln1_from_q = (dQ_r @ blk["Wq"].T)
+
+    # Grad for Wkv: (D, 2*G*d_h)
+    dK_r   = dK_g.transpose((0, 2, 1, 3)).reshape(BT, G * d_h)
+    dV_r   = dV_g.transpose((0, 2, 1, 3)).reshape(BT, G * d_h)
+    dKV_r  = np.concatenate([dK_r, dV_r], axis=1)          # (BT, 2*G*d_h)
+    dWkv   = ln1_out.reshape(BT, D).T @ dKV_r
+    d_ln1_from_kv = (dKV_r @ blk["Wkv"].T)
+
+    d_ln1_out = (d_ln1_from_q + d_ln1_from_kv).reshape(B, T, D)
+    d_x_from_attn, d_ln1_g, d_ln1_b = self._ln_backward(d_ln1_out, ln1_cache)
+    d_x = d_x_attn + d_x_from_attn
+
+    grads = {
+        "Wq":    dWq,
+        "Wkv":   dWkv,
+        "W1":    dW1,  "b1": db1,
+        "W2":    dW2,  "b2": db2,
+        "ln1_g": d_ln1_g, "ln1_b": d_ln1_b,
+        "ln2_g": d_ln2_g, "ln2_b": d_ln2_b,
+    }
+    return d_x, grads
+
+
+# ==============================================================================
+#  Differential Transformer block
+#  Ye et al. / Microsoft (2024). https://arxiv.org/abs/2410.05258
+# ==============================================================================
+
+def _block_forward_diff(self, x, blk, training: bool = False,
+                         cos=None, sin=None, alibi=None):
+    """
+    Differential Transformer block.
+
+    Each head computes two independent softmax attentions and subtracts them:
+        A = softmax(Q1 K^T / sqrt(d_h)) - lambda * softmax(Q2 K^T / sqrt(d_h))
+
+    This cancels common "noise" patterns that both attentions learn, leaving
+    only the signal unique to Q1.  lambda is a per-block learned scalar
+    initialised near 0 (so at the start the block behaves close to standard).
+
+    blk must contain all standard keys plus:
+        Wqkv2  : (D, 3D)   -- second set of Q2, K2, V2 projections
+        lambda_ : scalar   -- learned subtraction weight (Adam-updated)
+    """
+    B, T, D = x.shape
+    H       = self.num_heads
+    d_h     = D // H
+    BT      = B * T
+    scale   = 1.0 / (d_h ** 0.5)
+
+    ln1_out, ln1_cache = self._ln_forward(x, blk["ln1_g"], blk["ln1_b"])
+
+    # First QKV set
+    QKV1 = (ln1_out.reshape(BT, D) @ blk["Wqkv"]).reshape(B, T, 3, H, d_h)
+    Q1 = QKV1[:, :, 0].transpose((0, 2, 1, 3))
+    K1 = QKV1[:, :, 1].transpose((0, 2, 1, 3))
+    V1 = QKV1[:, :, 2].transpose((0, 2, 1, 3))
+    del QKV1
+
+    # Second QKV set
+    QKV2 = (ln1_out.reshape(BT, D) @ blk["Wqkv2"]).reshape(B, T, 3, H, d_h)
+    Q2 = QKV2[:, :, 0].transpose((0, 2, 1, 3))
+    K2 = QKV2[:, :, 1].transpose((0, 2, 1, 3))
+    V2 = QKV2[:, :, 2].transpose((0, 2, 1, 3))
+    del QKV2
+
+    # Apply RoPE if provided
+    if cos is not None:
+        Q1, K1 = _apply_rope(Q1, K1, cos[:T], sin[:T])
+        Q2, K2 = _apply_rope(Q2, K2, cos[:T], sin[:T])
+
+    def _softmax_attn(Q, K):
+        s = Q @ K.transpose((0, 1, 3, 2)) * scale   # (B, H, T, T)
+        if alibi is not None:
+            s += alibi[None, :, :T, :T]
+        else:
+            s += self._causal_mask(T)
+        s -= s.max(axis=-1, keepdims=True)
+        e  = np.exp(s)
+        return e / e.sum(axis=-1, keepdims=True), s
+
+    A1, s1 = _softmax_attn(Q1, K1)   # (B, H, T, T)
+    A2, s2 = _softmax_attn(Q2, K2)
+
+    lam    = float(blk["lambda_"])
+    A_diff = A1 - lam * A2            # differential attention
+
+    # Use V1 for the signal head (V2 is the "noise" head)
+    attn_h   = A_diff @ V1                                  # (B, H, T, d_h)
+    attn_out = attn_h.transpose((0, 2, 1, 3)).reshape(B, T, D)
+
+    attn_out, drop1_mask = self._apply_dropout(attn_out, training)
+    x_attn   = x + attn_out
+
+    ln2_out, ln2_cache = self._ln_forward(x_attn, blk["ln2_g"], blk["ln2_b"])
+    h_ff   = np.maximum(0.0, ln2_out @ blk["W1"] + blk["b1"])
+    ff_out = h_ff @ blk["W2"] + blk["b2"]
+    ff_out, drop2_mask = self._apply_dropout(ff_out, training)
+    x_out  = x_attn + ff_out
+
+    cache = (
+        x, ln1_out, ln1_cache,
+        Q1, K1, V1, Q2, K2, V2,
+        A1, A2, A_diff, lam,
+        attn_out, drop1_mask,
+        x_attn, ln2_out, ln2_cache,
+        h_ff, ff_out, drop2_mask,
+    )
+    return x_out, cache
+
+
+def _block_backward_diff(self, d_out, cache, blk):
+    """Backprop through one Differential Transformer block."""
+    (
+        x, ln1_out, ln1_cache,
+        Q1, K1, V1, Q2, K2, V2,
+        A1, A2, A_diff, lam,
+        attn_out, drop1_mask,
+        x_attn, ln2_out, ln2_cache,
+        h_ff, ff_out, drop2_mask,
+    ) = cache
+
+    B, T, D = x.shape
+    H       = self.num_heads
+    d_h     = D // H
+    BT      = B * T
+    scale   = 1.0 / (d_h ** 0.5)
+
+    # FF backward
+    d_ff_out = d_out * drop2_mask if drop2_mask is not None else d_out
+    dW2  = h_ff.reshape(BT, -1).T @ d_ff_out.reshape(BT, -1)
+    db2  = d_ff_out.sum(axis=(0, 1))
+    d_hg = d_ff_out @ blk["W2"].T
+    d_hg *= (h_ff > 0)
+    dW1  = ln2_out.reshape(BT, -1).T @ d_hg.reshape(BT, -1)
+    db1  = d_hg.sum(axis=(0, 1))
+    d_ln2_out = d_hg @ blk["W1"].T
+
+    d_x_attn_ff, d_ln2_g, d_ln2_b = self._ln_backward(d_ln2_out, ln2_cache)
+    d_x_attn = d_out + d_x_attn_ff
+
+    d_attn_out = d_x_attn * drop1_mask if drop1_mask is not None else d_x_attn
+    d_attn_h   = d_attn_out.reshape(B, T, H, d_h).transpose((0, 2, 1, 3))
+    # (B, H, T, d_h)
+
+    # Gradient through A_diff @ V1 = attn_h
+    dA_diff = d_attn_h @ V1.transpose((0, 1, 3, 2))   # (B, H, T, T)
+    dV1     = A_diff.transpose((0, 1, 3, 2)) @ d_attn_h
+
+    # A_diff = A1 - lam * A2  =>  dA1 = dA_diff,  dA2 = -lam * dA_diff
+    dA1 =  dA_diff
+    dA2 = -lam * dA_diff
+    # Gradient of lambda: d_lam = -sum(A2 * dA_diff)
+    d_lam = float(-np.sum(A2 * dA_diff))
+
+    def _softmax_vjp(A, dA, Q, K):
+        dS = A * (dA - (dA * A).sum(axis=-1, keepdims=True))
+        dS *= scale
+        dQ = dS @ K
+        dK = dS.transpose((0, 1, 3, 2)) @ Q
+        return dQ, dK
+
+    dQ1, dK1 = _softmax_vjp(A1, dA1, Q1, K1)
+    dQ2, dK2 = _softmax_vjp(A2, dA2, Q2, K2)
+
+    # Wqkv1 backward
+    dQ1r = dQ1.transpose((0,2,1,3)).reshape(BT,D)
+    dK1r = dK1.transpose((0,2,1,3)).reshape(BT,D)
+    dV1r = dV1.transpose((0,2,1,3)).reshape(BT,D)
+    dQKV1_r = np.concatenate([dQ1r, dK1r, dV1r], axis=1)
+    dWqkv  = ln1_out.reshape(BT,D).T @ dQKV1_r
+    d_ln1_1 = (dQKV1_r @ blk["Wqkv"].T)
+
+    # Wqkv2 backward (V2 not used in forward attn output, but still project)
+    dV2     = np.zeros_like(V2)   # V2 unused in output; grad is zero
+    dQ2r = dQ2.transpose((0,2,1,3)).reshape(BT,D)
+    dK2r = dK2.transpose((0,2,1,3)).reshape(BT,D)
+    dV2r = dV2.transpose((0,2,1,3)).reshape(BT,D)
+    dQKV2_r = np.concatenate([dQ2r, dK2r, dV2r], axis=1)
+    dWqkv2 = ln1_out.reshape(BT,D).T @ dQKV2_r
+    d_ln1_2 = (dQKV2_r @ blk["Wqkv2"].T)
+
+    d_ln1_out = (d_ln1_1 + d_ln1_2).reshape(B, T, D)
+    d_x_from_attn, d_ln1_g, d_ln1_b = self._ln_backward(d_ln1_out, ln1_cache)
+    d_x = d_x_attn + d_x_from_attn
+
+    grads = {
+        "Wqkv":   dWqkv,
+        "Wqkv2":  dWqkv2,
+        "lambda_": np.array(d_lam, dtype=np.float32),
+        "W1":  dW1, "b1": db1,
+        "W2":  dW2, "b2": db2,
+        "ln1_g": d_ln1_g, "ln1_b": d_ln1_b,
+        "ln2_g": d_ln2_g, "ln2_b": d_ln2_b,
+    }
+    return d_x, grads
+
+
+# ==============================================================================
+#  Mixture of Depths (MoD) token router
+#  Raposo et al. (2024). https://arxiv.org/abs/2404.02258
+# ==============================================================================
+
+def _mod_route(x, router_w, capacity: float = 0.5):
+    """
+    MoD token router for one block.
+
+    Computes a scalar routing score for each (batch, position) token via
+    a linear projection router_w : (D,) -> scalar, then selects the top
+    ceil(capacity * T) tokens by score to pass through the block.
+
+    Returns:
+        selected_mask : (B, T)  bool -- which tokens go through the block
+        scores        : (B, T)  float -- raw router logits (needed for backward)
+        top_k         : int     -- number of tokens selected
+    """
+    B, T, D = x.shape
+    top_k   = max(1, int(np.ceil(capacity * T)))
+    # Router score: (B, T, D) @ (D,) -> (B, T)
+    scores  = x.reshape(B * T, D) @ router_w               # (B*T,)
+    scores  = scores.reshape(B, T)
+    # Select top-k indices per batch item
+    # argsort descending: take the last top_k of ascending sort
+    order   = np.argsort(scores, axis=-1)                   # (B, T) ascending
+    selected_idx = order[:, -top_k:]                        # (B, top_k)
+    mask    = np.zeros((B, T), dtype=bool)
+    for b in range(B):
+        mask[b, selected_idx[b]] = True
+    return mask, scores, top_k
+
+
+# ==============================================================================
+#  MegaByte Transformer
+#  Yu et al. (2023). https://arxiv.org/abs/2305.07185
+# ==============================================================================
+
+class MegaByteTransformer:
+    """
+    Two-level transformer for byte-level language modelling.
+
+    Architecture
+    ------------
+    Input byte sequence is divided into fixed-size patches of length P.
+
+    LOCAL model  (small transformer, D_local dimensions):
+        Processes each patch independently.  Each patch is a (P, D_local)
+        sequence.  The last-position hidden state of each patch becomes the
+        patch embedding fed to the global model.
+
+    GLOBAL model  (larger transformer, D_global dimensions):
+        Sees the sequence of patch embeddings  (num_patches, D_global).
+        Its output at each patch position is broadcast back and prepended
+        to the local model's input for that patch (cross-patch context).
+
+    Forward pass per patch p:
+        1. Global model reads patch embeddings[0..p-1] -> global_ctx[p]  (D_global,)
+        2. Patch bytes are embedded -> (P, D_local)
+        3. Prepend global_ctx[p] projected to D_local -> (P+1, D_local)
+        4. Local model processes the (P+1, T) sequence
+        5. Output logits at positions 1..P predict each byte in the patch
+        6. Last hidden state (position P) -> next patch embedding
+
+    Parameters
+    ----------
+    vocab_size    : number of byte values (256 for raw bytes)
+    patch_size    : P -- bytes per patch (4 or 8 is typical)
+    D_local       : embedding dimension for the local model
+    D_global      : embedding dimension for the global model
+    num_local_blk : number of local transformer blocks
+    num_global_blk: number of global transformer blocks
+    num_heads     : attention heads (shared between local and global)
+    dropout       : dropout rate
+    max_patches   : maximum number of patches in a sequence
+
+    Ref: "MegaByte: Predicting Million-byte Sequences with Multiscale
+         Transformers" -- Yu et al. (2023). https://arxiv.org/abs/2305.07185
+    """
+
+    def __init__(
+        self,
+        vocab_size:     int   = 256,
+        patch_size:     int   = 4,
+        D_local:        int   = 64,
+        D_global:       int   = 128,
+        num_local_blk:  int   = 2,
+        num_global_blk: int   = 4,
+        num_heads:      int   = 4,
+        dropout:        float = 0.0,
+        max_patches:    int   = 512,
+    ):
+        assert D_local  % num_heads == 0
+        assert D_global % num_heads == 0
+
+        self.vocab_size     = vocab_size
+        self.patch_size     = patch_size
+        self.D_local        = D_local
+        self.D_global       = D_global
+        self.num_local_blk  = num_local_blk
+        self.num_global_blk = num_global_blk
+        self.num_heads      = num_heads
+        self.dropout        = dropout
+        self.max_patches    = max_patches
+
+        rs  = np.float32(0.02)
+        # ---- Byte embedding (shared between local input and output) ----------
+        self.byte_emb  = np.random.randn(vocab_size, D_local ).astype(np.float32) * rs
+        self.pos_local = np.random.randn(patch_size + 1, D_local).astype(np.float32) * rs
+
+        # ---- Global model embeddings ----------------------------------------
+        self.pos_global = np.random.randn(max_patches, D_global).astype(np.float32) * rs
+        # Projection: last local hidden -> global embedding space
+        self.W_patch_to_global = np.random.randn(D_local, D_global).astype(np.float32) * rs
+        # Projection: global context -> local input space
+        self.W_global_to_local = np.random.randn(D_global, D_local).astype(np.float32) * rs
+
+        # ---- Local transformer blocks ----------------------------------------
+        resid_l = np.float32(0.02 / (2 * num_local_blk) ** 0.5)
+        self.local_blocks = [
+            self._make_block(D_local, resid_l) for _ in range(num_local_blk)
+        ]
+        self.ln_local_f_g = np.ones(D_local,  dtype=np.float32)
+        self.ln_local_f_b = np.zeros(D_local, dtype=np.float32)
+
+        # ---- Global transformer blocks ---------------------------------------
+        resid_g = np.float32(0.02 / (2 * num_global_blk) ** 0.5)
+        self.global_blocks = [
+            self._make_block(D_global, resid_g) for _ in range(num_global_blk)
+        ]
+        self.ln_global_f_g = np.ones(D_global,  dtype=np.float32)
+        self.ln_global_f_b = np.zeros(D_global, dtype=np.float32)
+
+        # ---- Output head (local D_local -> vocab) ----------------------------
+        self.W_out = np.random.randn(D_local, vocab_size).astype(np.float32) * rs
+        self.b_out = np.zeros(vocab_size, dtype=np.float32)
+
+    @staticmethod
+    def _make_block(D: int, resid_scale: float) -> dict:
+        return {
+            "Wqkv":  np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02),
+            "W1":    np.random.randn(D, D * 4).astype(np.float32) * np.float32(0.02),
+            "b1":    np.zeros(D * 4, dtype=np.float32),
+            "W2":    np.random.randn(D * 4, D).astype(np.float32) * resid_scale,
+            "b2":    np.zeros(D, dtype=np.float32),
+            "ln1_g": np.ones(D,  dtype=np.float32),
+            "ln1_b": np.zeros(D, dtype=np.float32),
+            "ln2_g": np.ones(D,  dtype=np.float32),
+            "ln2_b": np.zeros(D, dtype=np.float32),
+        }
+
+    # ------------------------------------------------------------------
+    #  Shared helpers (LN, MHA) -- duplicated from NeuralNetwork so
+    #  MegaByteTransformer is self-contained.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ln(x, g, b, eps=1e-5):
+        mean  = x.mean(axis=-1, keepdims=True)
+        rstd  = 1.0 / np.sqrt(x.var(axis=-1, keepdims=True) + eps)
+        return g * (x - mean) * rstd + b
+
+    def _block_fwd(self, x, blk, causal: bool = True):
+        """Minimal forward-only block (used for generation / inference)."""
+        B, T, D = x.shape
+        H, d_h  = self.num_heads, D // self.num_heads
+        # LN1 + QKV
+        ln1 = self._ln(x, blk["ln1_g"], blk["ln1_b"])
+        QKV = (ln1.reshape(B*T, D) @ blk["Wqkv"]).reshape(B, T, 3, H, d_h)
+        Q   = QKV[:,:,0].transpose((0,2,1,3))
+        K   = QKV[:,:,1].transpose((0,2,1,3))
+        V   = QKV[:,:,2].transpose((0,2,1,3))
+        # Attention
+        sc  = Q @ K.transpose((0,1,3,2)) / (d_h ** 0.5)
+        if causal:
+            sc += (np.triu(np.ones((T,T)),k=1) * -1e9).astype(np.float32)
+        sc -= sc.max(axis=-1, keepdims=True)
+        A   = np.exp(sc); A /= A.sum(axis=-1, keepdims=True)
+        out = (A @ V).transpose((0,2,1,3)).reshape(B, T, D)
+        x   = x + out
+        # LN2 + FF
+        ln2 = self._ln(x, blk["ln2_g"], blk["ln2_b"])
+        x   = x + np.maximum(0.0, ln2 @ blk["W1"] + blk["b1"]) @ blk["W2"] + blk["b2"]
+        return x
+
+    def forward(self, byte_seq: "_np_cpu.ndarray") -> "_np_cpu.ndarray":
+        """
+        Inference-only forward pass.
+
+        byte_seq : (T,) int array of byte indices.
+        Returns  : (T, vocab_size) next-byte probabilities.
+
+        Sequences shorter than patch_size are zero-padded to a full patch.
+        """
+        P  = self.patch_size
+        T  = len(byte_seq)
+        # Pad to multiple of P
+        pad = (-T) % P
+        if pad:
+            byte_seq = _np_cpu.concatenate([byte_seq, _np_cpu.zeros(pad, dtype=_np_cpu.int32)])
+        N_patches = len(byte_seq) // P
+
+        # ---- Build patch embeddings from byte embeddings --------------------
+        patches_emb = []
+        for p in range(N_patches):
+            chunk    = byte_seq[p*P:(p+1)*P]
+            emb      = np.array(self.byte_emb[chunk])              # (P, D_local)
+            # Summarise patch as mean of byte embeddings -> D_local
+            summary  = emb.mean(axis=0)                            # (D_local,)
+            patches_emb.append(summary)
+        patch_emb_arr = np.stack(patches_emb, axis=0)[None]        # (1, N, D_local)
+        # Project to global space
+        global_in = (patch_emb_arr.reshape(N_patches, self.D_local)
+                     @ self.W_patch_to_global)                     # (N, D_global)
+        global_in = global_in[None] + self.pos_global[:N_patches]  # (1, N, D_global)
+
+        # ---- Global model ---------------------------------------------------
+        x_g = global_in
+        for blk in self.global_blocks:
+            x_g = self._block_fwd(x_g, blk, causal=True)
+        # LN
+        x_g = self._ln(x_g, self.ln_global_f_g, self.ln_global_f_b)  # (1, N, D_global)
+
+        # ---- Local model (patch by patch) -----------------------------------
+        all_logits = []
+        for p in range(N_patches):
+            # Global context for this patch: (D_global,) -> (D_local,)
+            g_ctx = (x_g[0, p] @ self.W_global_to_local)              # (D_local,)
+            chunk = byte_seq[p*P:(p+1)*P]
+            # Embed bytes
+            loc   = np.array(self.byte_emb[chunk]) + self.pos_local[1:P+1]  # (P, D_local)
+            # Prepend global context token
+            g_tok = (g_ctx + self.pos_local[0])[None]                  # (1, D_local)
+            x_l   = np.concatenate([g_tok, loc], axis=0)[None]         # (1, P+1, D_local)
+            for blk in self.local_blocks:
+                x_l = self._block_fwd(x_l, blk, causal=True)
+            x_l = self._ln(x_l, self.ln_local_f_g, self.ln_local_f_b)
+            # Output logits for positions 1..P (byte predictions)
+            logits_p = x_l[0, 1:] @ self.W_out + self.b_out           # (P, vocab)
+            all_logits.append(logits_p)
+
+        logits = np.concatenate(all_logits, axis=0)[:T]               # (T, vocab)
+        logits -= logits.max(axis=-1, keepdims=True)
+        probs   = np.exp(logits); probs /= probs.sum(axis=-1, keepdims=True)
+        if _DEVICE == "gpu":
+            return np.asnumpy(probs)
+        return probs
+
+
+# ==============================================================================
+#  SpaceByte Transformer
+#  Slagle (2024). https://arxiv.org/abs/2404.14408
+# ==============================================================================
+
+class SpaceByteTransformer:
+    """
+    Byte-level transformer augmented with global blocks at whitespace boundaries.
+
+    Architecture
+    ------------
+    Standard local byte-level transformer blocks process every byte.
+    After every N_local local blocks, a global block is applied ONLY at
+    whitespace boundary positions (space / newline); non-boundary positions
+    copy their hidden states unchanged.
+
+    The global block still operates on the full (B, T, D) tensor but
+    the attention mask restricts each global block to attend only among
+    boundary positions.  Non-boundary positions receive no update.
+
+    Why this works
+    --------------
+    In natural language, whitespace boundaries cleanly separate words and
+    sentences -- the natural units of meaning.  Applying stronger (global)
+    attention at these positions lets the model capture long-range semantic
+    relationships without the full O(T²) cost of attending everywhere.
+
+    Parameters
+    ----------
+    vocab_size       : character/byte vocabulary size
+    embed_dim        : hidden dimension D
+    num_local_blocks : standard transformer blocks
+    num_global_blocks: global blocks inserted at whitespace boundaries
+    local_per_global : insert one global block every this many local blocks
+    num_heads        : attention heads
+    context_size     : maximum sequence length
+    dropout          : dropout rate
+    space_chars      : set of character indices considered whitespace
+                       (default: space=32, newline=10, tab=9)
+
+    Ref: "SpaceByte: Towards Deleting Tokenization from Large Language
+         Modeling" -- Slagle (2024). https://arxiv.org/abs/2404.14408
+    """
+
+    def __init__(
+        self,
+        vocab_size:        int        = 256,
+        embed_dim:         int        = 128,
+        num_local_blocks:  int        = 4,
+        num_global_blocks: int        = 2,
+        local_per_global:  int        = 2,
+        num_heads:         int        = 4,
+        context_size:      int        = 256,
+        dropout:           float      = 0.0,
+        space_chars:       set        = None,
+    ):
+        assert embed_dim % num_heads == 0
+        self.vocab_size        = vocab_size
+        self.D                 = embed_dim
+        self.num_local_blocks  = num_local_blocks
+        self.num_global_blocks = num_global_blocks
+        self.local_per_global  = local_per_global
+        self.num_heads         = num_heads
+        self.context_size      = context_size
+        self.dropout           = dropout
+        self.space_chars       = space_chars or {9, 10, 32}  # tab, LF, space
+
+        rs = np.float32(0.02)
+        D  = embed_dim
+
+        self.embedding     = np.random.randn(vocab_size, D).astype(np.float32) * rs
+        self.pos_embedding = np.random.randn(context_size, D).astype(np.float32) * rs
+
+        resid_l = np.float32(0.02 / (2 * num_local_blocks) ** 0.5)
+        self.local_blocks  = [self._make_block(D, resid_l) for _ in range(num_local_blocks)]
+
+        resid_g = np.float32(0.02 / max(1, 2 * num_global_blocks) ** 0.5)
+        self.global_blocks = [self._make_block(D, resid_g) for _ in range(num_global_blocks)]
+
+        self.ln_f_g = np.ones(D,  dtype=np.float32)
+        self.ln_f_b = np.zeros(D, dtype=np.float32)
+
+        self.W_out = np.random.randn(D, vocab_size).astype(np.float32) * rs
+        self.b_out = np.zeros(vocab_size, dtype=np.float32)
+
+    @staticmethod
+    def _make_block(D: int, resid_scale: float) -> dict:
+        return {
+            "Wqkv":  np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02),
+            "W1":    np.random.randn(D, D * 4).astype(np.float32) * np.float32(0.02),
+            "b1":    np.zeros(D * 4, dtype=np.float32),
+            "W2":    np.random.randn(D * 4, D).astype(np.float32) * resid_scale,
+            "b2":    np.zeros(D, dtype=np.float32),
+            "ln1_g": np.ones(D,  dtype=np.float32),
+            "ln1_b": np.zeros(D, dtype=np.float32),
+            "ln2_g": np.ones(D,  dtype=np.float32),
+            "ln2_b": np.zeros(D, dtype=np.float32),
+        }
+
+    @staticmethod
+    def _ln(x, g, b, eps=1e-5):
+        mean = x.mean(axis=-1, keepdims=True)
+        rstd = 1.0 / np.sqrt(x.var(axis=-1, keepdims=True) + eps)
+        return g * (x - mean) * rstd + b
+
+    def _block_fwd(self, x, blk, mask=None):
+        """Standard causal block forward (no dropout at inference)."""
+        B, T, D = x.shape
+        H, d_h  = self.num_heads, D // self.num_heads
+        ln1 = self._ln(x, blk["ln1_g"], blk["ln1_b"])
+        QKV = (ln1.reshape(B*T, D) @ blk["Wqkv"]).reshape(B, T, 3, H, d_h)
+        Q   = QKV[:,:,0].transpose((0,2,1,3))
+        K   = QKV[:,:,1].transpose((0,2,1,3))
+        V   = QKV[:,:,2].transpose((0,2,1,3))
+        sc  = Q @ K.transpose((0,1,3,2)) / (d_h ** 0.5)
+        if mask is not None:
+            sc += mask
+        else:
+            sc += (np.triu(np.ones((T,T)),k=1) * -1e9).astype(np.float32)
+        sc -= sc.max(axis=-1, keepdims=True)
+        A   = np.exp(sc); A /= A.sum(axis=-1, keepdims=True)
+        out = (A @ V).transpose((0,2,1,3)).reshape(B, T, D)
+        x   = x + out
+        ln2 = self._ln(x, blk["ln2_g"], blk["ln2_b"])
+        x   = x + np.maximum(0.0, ln2 @ blk["W1"] + blk["b1"]) @ blk["W2"] + blk["b2"]
+        return x
+
+    def _global_block_fwd(self, x, blk, boundary_mask: "_np_cpu.ndarray"):
+        """
+        Apply a global block restricted to whitespace boundary positions.
+
+        boundary_mask : (T,) bool -- True at whitespace positions.
+
+        Non-boundary positions skip the block entirely (copy x unchanged).
+        Boundary positions attend only to other boundary positions (plus
+        a causal mask within that subset).
+        """
+        B, T, D = x.shape
+        idx = _np_cpu.where(boundary_mask)[0]     # positions of boundaries (CPU)
+        if len(idx) == 0:
+            return x   # no boundaries in this window -- skip entirely
+
+        idx_np = np.array(idx)
+        # Extract boundary token hidden states: (B, n_b, D)
+        x_b = x[:, idx_np, :]
+
+        # Build causal mask for the boundary subsequence
+        n_b = len(idx)
+        causal_b = (np.triu(np.ones((n_b, n_b)), k=1) * -1e9).astype(np.float32)
+
+        # Run the global block on boundary tokens only
+        x_b_out = self._block_fwd(x_b, blk, mask=causal_b)
+
+        # Write updated boundary hidden states back into x
+        x_out = x.copy()
+        x_out[:, idx_np, :] = x_b_out
+        return x_out
+
+    def forward(
+        self,
+        token_ids: "_np_cpu.ndarray",
+    ) -> "_np_cpu.ndarray":
+        """
+        Inference-only forward pass.
+
+        token_ids : (T,) int array of character/byte indices.
+        Returns   : (T, vocab_size) next-token probabilities.
+        """
+        T  = len(token_ids)
+        x  = np.array(
+            self.embedding[token_ids] + self.pos_embedding[:T]
+        )[None]       # (1, T, D)
+
+        # Build whitespace boundary mask (CPU-side for indexing)
+        boundary_mask = _np_cpu.array(
+            [int(t) in self.space_chars for t in token_ids]
+        )
+
+        g_idx = 0     # which global block to use next
+        for l_idx, local_blk in enumerate(self.local_blocks):
+            x = self._block_fwd(x, local_blk)
+            # Insert global block every local_per_global local blocks
+            if ((l_idx + 1) % self.local_per_global == 0
+                    and g_idx < len(self.global_blocks)):
+                x = self._global_block_fwd(x, self.global_blocks[g_idx],
+                                            boundary_mask)
+                g_idx += 1
+
+        x      = self._ln(x, self.ln_f_g, self.ln_f_b)
+        logits = x[0] @ self.W_out + self.b_out           # (T, vocab)
+        logits -= logits.max(axis=-1, keepdims=True)
+        probs   = np.exp(logits); probs /= probs.sum(axis=-1, keepdims=True)
+        if _DEVICE == "gpu":
+            return np.asnumpy(probs)
+        return probs
+
+
 class NeuralNetwork:
     """
     Character-level GPT-2-inspired transformer.
@@ -910,6 +1856,21 @@ class NeuralNetwork:
         If True, Wout = embedding.T  (halves output-projection parameters).
     grad_clip : float
         Max global gradient L2 norm before the update step (0 = disabled).
+    pos_encoding : str
+        Positional encoding scheme: "learned" (default, absolute embeddings),
+        "rope" (RoPE, replaces pos_embedding), or "alibi" (no pos params).
+    num_kv_heads : int
+        Number of key/value heads for GQA.  Must divide num_heads.
+        Default 0 means use standard MHA (num_kv_heads == num_heads).
+    use_diff_attn : bool
+        If True, use Differential Transformer blocks (two QKV projections
+        per block; learned lambda cancels attention noise).
+    use_mod : bool
+        If True, wrap each block with a Mixture-of-Depths token router.
+        Only the top mod_capacity fraction of tokens pass through each block.
+    mod_capacity : float
+        Fraction of tokens routed through each block when use_mod=True.
+        E.g. 0.5 means half the tokens skip each block.  Default 0.5.
     """
 
     # ==========================================================================
@@ -933,6 +1894,11 @@ class NeuralNetwork:
         dropout:       float = 0.0,
         weight_tying:  bool  = True,
         grad_clip:     float = 1.0,
+        pos_encoding:  str   = "rope",
+        num_kv_heads:  int   = 0,
+        use_diff_attn: bool  = True,
+        use_mod:       bool  = True,
+        mod_capacity:  float = 0.5,
     ) -> None:
         if activation not in _ACTIVATIONS:
             raise ValueError(
@@ -944,6 +1910,15 @@ class NeuralNetwork:
         if embed_dim % num_heads != 0:
             raise ValueError(
                 f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
+            )
+
+        if pos_encoding not in ("learned", "rope", "alibi"):
+            raise ValueError(f"pos_encoding must be 'learned', 'rope', or 'alibi'.")
+        if num_kv_heads == 0:
+            num_kv_heads = num_heads
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})."
             )
 
         # Store all hyperparameters -- also written to save files.
@@ -962,6 +1937,11 @@ class NeuralNetwork:
         self.dropout       = dropout
         self.weight_tying  = weight_tying
         self.grad_clip     = grad_clip
+        self.pos_encoding  = pos_encoding
+        self.num_kv_heads  = num_kv_heads
+        self.use_diff_attn = use_diff_attn
+        self.use_mod       = use_mod
+        self.mod_capacity  = mod_capacity
         self.device        = _DEVICE
         self._act_fn, self._act_d = _ACTIVATIONS[activation]
 
@@ -972,50 +1952,69 @@ class NeuralNetwork:
         self._scale_head = 1.0 / (self._head_dim ** 0.5)
 
         # ---- Token + positional embeddings ----------------------------------
-        # Token embedding:      (vocab_size, D)  -- one row per character.
-        # Positional embedding: (context_size, D) -- one row per position.
-        # Both are learned and updated by Adam just like any weight matrix.
+        # "learned": standard GPT-2 absolute pos embedding (learned).
+        # "rope":    no pos_embedding; RoPE freqs precomputed from head_dim.
+        # "alibi":   no pos params at all; bias injected into attention scores.
         if self.use_embedding:
-            self.embedding     = np.random.randn(vocab_size, embed_dim).astype(np.float32) * 0.01
-            self.pos_embedding = np.random.randn(context_size, embed_dim).astype(np.float32) * 0.01
+            self.embedding = np.random.randn(vocab_size, embed_dim).astype(np.float32) * 0.01
+            if pos_encoding == "learned":
+                self.pos_embedding = np.random.randn(context_size, embed_dim).astype(np.float32) * 0.01
+            else:
+                self.pos_embedding = None
         else:
             self.embedding     = None
             self.pos_embedding = None
 
+        # RoPE: precompute (cos, sin) cache up to context_size positions.
+        if pos_encoding == "rope":
+            self._rope_cos, self._rope_sin = _rope_freqs(self._head_dim, context_size)
+        else:
+            self._rope_cos = self._rope_sin = None
+
+        # ALiBi: precompute per-head slopes and the full bias matrix.
+        if pos_encoding == "alibi":
+            self._alibi_slopes = _alibi_slopes(num_heads)
+            self._alibi_bias   = _alibi_bias(self._alibi_slopes, context_size)
+        else:
+            self._alibi_slopes = None
+            self._alibi_bias   = None
+
         # ---- Transformer blocks ---------------------------------------------
-        # Each block is independent -- no weight sharing across blocks.
-        # This lets each block specialise on different linguistic patterns.
-        #
-        # Per-block parameters:
-        #   Wqkv     -- fused Q, K, V projection  (D, 3D)
-        #               Fusing into one matrix reduces memory traffic and is
-        #               the natural layout assumed by Flash Attention.
-        #               Ref: FlashAttention -- Dao et al. (2022).
-        #                    https://arxiv.org/abs/2205.14135
-        #   W1, b1   -- FF expansion layer         (D, 4D) + (4D,)
-        #   W2, b2   -- FF contraction layer        (4D, D) + (D,)
-        #               4D hidden width follows the GPT-2 convention.
-        #   ln1_g/b  -- pre-attention LayerNorm params  (D,) each
-        #   ln2_g/b  -- pre-FF LayerNorm params          (D,) each
-        #
-        # W2 is scaled by 1/sqrt(2*num_blocks) on init (GPT-2 residual
-        # scaling). With N residual additions each adding variance ~0.02²,
-        # this keeps the residual stream magnitude stable from step 1.
         D           = embed_dim
+        G           = num_kv_heads
         resid_scale = np.float32(0.02 / (2 * num_blocks) ** 0.5)
         self.blocks: List[Dict] = []
         for _ in range(num_blocks):
-            self.blocks.append({
-                "Wqkv":  np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02),
-                "W1":    np.random.randn(D, D * 4).astype(np.float32) * np.float32(0.02),
-                "b1":    np.zeros(D * 4, dtype=np.float32),
-                "W2":    np.random.randn(D * 4, D).astype(np.float32) * resid_scale,
-                "b2":    np.zeros(D, dtype=np.float32),
-                "ln1_g": np.ones(D, dtype=np.float32),
-                "ln1_b": np.zeros(D, dtype=np.float32),
-                "ln2_g": np.ones(D, dtype=np.float32),
-                "ln2_b": np.zeros(D, dtype=np.float32),
-            })
+            blk: Dict = {}
+
+            if use_diff_attn:
+                # Differential Transformer: two independent QKV projections.
+                blk["Wqkv"]   = np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02)
+                blk["Wqkv2"]  = np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02)
+                # lambda_ initialised near 0 so the block starts ~standard.
+                blk["lambda_"] = np.float32(0.01)
+            elif G < num_heads:
+                # GQA: separate Q and fused KV projections.
+                blk["Wq"]  = np.random.randn(D, D).astype(np.float32) * np.float32(0.02)
+                blk["Wkv"] = np.random.randn(D, 2 * G * self._head_dim).astype(np.float32) * np.float32(0.02)
+            else:
+                # Standard MHA: fused QKV.
+                blk["Wqkv"] = np.random.randn(D, D * 3).astype(np.float32) * np.float32(0.02)
+
+            blk["W1"]    = np.random.randn(D, D * 4).astype(np.float32) * np.float32(0.02)
+            blk["b1"]    = np.zeros(D * 4, dtype=np.float32)
+            blk["W2"]    = np.random.randn(D * 4, D).astype(np.float32) * resid_scale
+            blk["b2"]    = np.zeros(D, dtype=np.float32)
+            blk["ln1_g"] = np.ones(D, dtype=np.float32)
+            blk["ln1_b"] = np.zeros(D, dtype=np.float32)
+            blk["ln2_g"] = np.ones(D, dtype=np.float32)
+            blk["ln2_b"] = np.zeros(D, dtype=np.float32)
+
+            # MoD router: one (D,) weight vector per block.
+            if use_mod:
+                blk["router_w"] = np.random.randn(D).astype(np.float32) * np.float32(0.02)
+
+            self.blocks.append(blk)
 
         # ---- Final LayerNorm (GPT-2 style) ----------------------------------
         # Applied once after all transformer blocks, before output projection.
@@ -1066,7 +2065,8 @@ class NeuralNetwork:
         self._adam_blocks = []
         for blk in self.blocks:
             self._adam_blocks.append(
-                {k: {"m": z(v), "v": z(v)} for k, v in blk.items()}
+                {k: {"m": z(v), "v": z(v)} for k, v in blk.items()
+                 if isinstance(v, np.ndarray)}
             )
 
         # Final LayerNorm buffers
@@ -1080,21 +2080,23 @@ class NeuralNetwork:
 
         # Embedding buffers
         if self.use_embedding:
-            self._me  = z(self.embedding);      self._ve  = z(self.embedding)
-            self._mpe = z(self.pos_embedding);  self._vpe = z(self.pos_embedding)
+            self._me  = z(self.embedding);   self._ve  = z(self.embedding)
+            if self.pos_embedding is not None:
+                self._mpe = z(self.pos_embedding); self._vpe = z(self.pos_embedding)
+            else:
+                self._mpe = self._vpe = None
 
         self._adam_t    = 0     # global step counter -- used for bias correction
         self._adam_init = True
 
-        # ---- Muon momentum buffers (Wqkv, W1, W2 always use Muon) ----------
-        # One momentum buffer per matrix per block; no v buffer needed.
+        # ---- Muon momentum buffers (Wqkv, Wq, Wkv, Wqkv2, W1, W2 use Muon) -
+        # One momentum buffer per 2-D weight matrix per block; no v buffer needed.
+        _muon_keys = {"Wqkv", "Wqkv2", "Wq", "Wkv", "W1", "W2"}
         self._muon_bufs = []
         for blk in self.blocks:
-            self._muon_bufs.append({
-                "Wqkv": np.zeros_like(blk["Wqkv"]),
-                "W1":   np.zeros_like(blk["W1"]),
-                "W2":   np.zeros_like(blk["W2"]),
-            })
+            self._muon_bufs.append(
+                {k: np.zeros_like(blk[k]) for k in blk if k in _muon_keys}
+            )
 
     # ==========================================================================
     #  LayerNorm  (forward + backward kept together)
@@ -1116,6 +2118,9 @@ class NeuralNetwork:
         Post-norm (GPT-1 style) normalises the residual stream AFTER adding
         back. Pre-norm (GPT-2 style) normalises BEFORE, leaving the residual
         connection clean. Pre-norm trains more stably at larger depth.
+
+        Ref: "Layer Normalization" -- Ba et al. (2016).
+             https://arxiv.org/abs/1607.06450
 
         Cache stores what backward needs:
             x_norm -- normalised input (needed for d_gamma, d_x)
@@ -1178,6 +2183,10 @@ class NeuralNetwork:
         Without scaling, the average activation magnitude at inference is
         (1-rate) times what it was during training. Inverted dropout fixes
         this by scaling during training, so inference needs no adjustment.
+
+        Ref: "Dropout: A Simple Way to Prevent Neural Networks from Overfitting"
+             -- Srivastava et al. (2014).
+             https://jmlr.org/papers/v15/srivastava14a.html
         """
         if not training or self.dropout == 0.0:
             return x, None
@@ -1416,45 +2425,93 @@ class NeuralNetwork:
         """
         Complete forward pass from token indices to softmax probabilities.
 
+        Dispatches to the appropriate block forward based on architecture:
+          - use_diff_attn=True  -> _block_forward_diff  (Differential Transformer)
+          - num_kv_heads < num_heads -> _block_forward_gqa  (GQA)
+          - otherwise           -> _block_forward  (standard MHA)
+
+        Positional encoding:
+          - "learned" -> add pos_embedding table to token embeddings (original)
+          - "rope"    -> pass (cos, sin) into each block; no pos_embedding add
+          - "alibi"   -> pass alibi bias matrix into each block; no pos_embedding
+
+        MoD wrapping:
+          - use_mod=True -> each block's output is selectively applied:
+            only top mod_capacity fraction of tokens are updated per block;
+            the rest keep their residual stream unchanged.
+
         token_idx_batch : int array  (T, B)
         training        : bool  -- enables dropout when True
 
         Returns probs (B, T, vocab) and a cache tuple needed by the backward.
         """
         toks = token_idx_batch.T                                   # (B, T)
+        T    = toks.shape[1]
 
-        # Token embedding lookup + positional embedding (broadcast over B)
-        x = self.embedding[toks] + self.pos_embedding              # (B, T, D)
+        # Token embedding lookup
+        x = self.embedding[toks]                                   # (B, T, D)
 
-        # Embedding dropout: randomly zero full embedding vectors.
+        # Positional encoding
+        if self.pos_encoding == "learned":
+            x = x + self.pos_embedding[:T]
+        # rope / alibi: positional info injected inside each block
+
         x, emb_drop_mask = self._apply_dropout(x, training)
 
-        # Hoist causal mask: T never changes mid-run, so compute once and
-        # pass it into every block rather than recomputing per block.
-        mask = self._causal_mask(toks.shape[1])   # (T, T)
+        # Precompute positional encoding inputs for blocks
+        cos    = self._rope_cos[:T]  if self._rope_cos  is not None else None
+        sin    = self._rope_sin[:T]  if self._rope_sin  is not None else None
+        alibi  = self._alibi_bias[:, :T, :T] if self._alibi_bias is not None else None
 
-        # Transformer blocks
-        block_caches = []
+        # Choose block forward function
+        if self.use_diff_attn:
+            blk_fwd = lambda blk, _x, tr: _block_forward_diff(self, _x, blk, tr, cos, sin, alibi)
+            blk_bwd = lambda d, cache, blk: _block_backward_diff(self, d, cache, blk)
+        elif self.num_kv_heads < self.num_heads:
+            blk_fwd = lambda blk, _x, tr: _block_forward_gqa(self, _x, blk, tr, cos, sin, alibi)
+            blk_bwd = lambda d, cache, blk: _block_backward_gqa(self, d, cache, blk)
+        else:
+            # Standard MHA -- pass mask incorporating ALiBi or causal only
+            std_mask = alibi if alibi is not None else self._causal_mask(T)
+            blk_fwd  = lambda blk, _x, tr: self._block_forward(_x, blk, tr, std_mask)
+            blk_bwd  = lambda d, cache, blk: self._block_backward(d, cache, blk)
+
+        # Transformer blocks (with optional MoD routing)
+        block_caches  = []
+        mod_data_list = []   # stores (mask, scores) per block if MoD active
+
         for blk in self.blocks:
-            x, cache = self._block_forward(x, blk, training=training, mask=mask)
-            block_caches.append(cache)
+            if self.use_mod:
+                # MoD: compute router scores; only top-k tokens enter the block
+                route_mask, route_scores, _ = _mod_route(
+                    x, blk["router_w"], self.mod_capacity
+                )
+                # Run block on ALL tokens (we need full-shape output for cache)
+                x_new, cache = blk_fwd(blk, x, training)
+                # Only update selected token positions; others keep x unchanged
+                mask_broad = route_mask[:, :, None]                # (B, T, 1)
+                x = np.where(mask_broad, x_new, x)
+                block_caches.append(cache)
+                mod_data_list.append((route_mask, route_scores))
+            else:
+                x, cache = blk_fwd(blk, x, training)
+                block_caches.append(cache)
 
         # Final LayerNorm: normalise before output projection
         x, ln_f_cache = self._ln_forward(x, self.ln_f_g, self.ln_f_b)
 
         # Output projection at ALL T positions simultaneously.
-        # Weight tying: use embedding.T instead of a separate Wout matrix.
         if self.weight_tying:
-            logits = x @ self.embedding.T + self.bout              # (B, T, vocab)
+            logits = x @ self.embedding.T + self.bout
         else:
-            logits = x @ self.Wout + self.bout                     # (B, T, vocab)
+            logits = x @ self.Wout + self.bout
 
-        # Numerically stable softmax (subtract max before exp)
         logits -= logits.max(axis=2, keepdims=True)
         e      = np.exp(logits)
-        probs  = e / e.sum(axis=2, keepdims=True)                  # (B, T, vocab)
+        probs  = e / e.sum(axis=2, keepdims=True)
 
-        return probs, (toks, x, block_caches, ln_f_cache, emb_drop_mask)
+        return probs, (toks, x, block_caches, ln_f_cache, emb_drop_mask,
+                       blk_bwd, mod_data_list)
 
     def forward(self, inputs):
         """
@@ -1602,13 +2659,16 @@ class NeuralNetwork:
         prev_loss        = float("inf")
         lr_change_msg    = ""
 
-        # ---- Pre-allocate gradient buffers ----------------------------------
+        # Pre-allocate gradient buffers ----------------------------------
         # Allocated once, zeroed in-place each epoch (buf[...] = 0.0).
         # Avoids thousands of GPU memory allocations and CUDA syncs.
+        # lambda_ (scalar) accumulated as a plain Python float separately.
         blk_grad_acc = [
-            {k: np.zeros_like(v) for k, v in blk.items()}
+            {k: np.zeros_like(v) for k, v in blk.items() if isinstance(v, np.ndarray)}
             for blk in self.blocks
         ]
+        # scalar accumulator for lambda_ (Differential Transformer)
+        lam_grad_acc = [0.0] * self.num_blocks
 
         # Final LN gradient buffers
         d_ln_f_g_acc = np.zeros_like(self.ln_f_g)
@@ -1620,7 +2680,9 @@ class NeuralNetwork:
             dWout_acc = np.zeros_like(self.Wout)
         dbout_acc = np.zeros_like(self.bout)
         de_acc    = np.zeros_like(self.embedding)     if self.use_embedding else None
-        dpe_acc   = np.zeros_like(self.pos_embedding) if self.use_embedding else None
+        dpe_acc   = (np.zeros_like(self.pos_embedding)
+                     if self.use_embedding and self.pos_embedding is not None
+                     else None)
 
         # ---- Hoisted constants (never change inside the loop) ---------------
         T          = ctx_size
@@ -1650,6 +2712,8 @@ class NeuralNetwork:
             for acc in blk_grad_acc:
                 for a in acc.values():
                     a[...] = 0.0
+            for i in range(self.num_blocks):
+                lam_grad_acc[i] = 0.0
             d_ln_f_g_acc[...] = 0.0
             d_ln_f_b_acc[...] = 0.0
             if not self.weight_tying:
@@ -1657,7 +2721,8 @@ class NeuralNetwork:
             dbout_acc[...] = 0.0
             if self.use_embedding:
                 de_acc[...]  = 0.0
-                dpe_acc[...] = 0.0
+                if dpe_acc is not None:
+                    dpe_acc[...] = 0.0
 
             # ================================================================
             #  Mini-batch loop
@@ -1669,7 +2734,8 @@ class NeuralNetwork:
                 Yb  = Y_shuf[:, start:end]    # (T, B)
 
                 # Forward pass (training=True enables dropout)
-                probs, (toks, x_out, block_caches, ln_f_cache, emb_drop_mask) = (
+                probs, (toks, x_out, block_caches, ln_f_cache, emb_drop_mask,
+                        blk_bwd, mod_data_list) = (
                     self._transformer_forward(Xb, training=True)
                 )
 
@@ -1718,11 +2784,24 @@ class NeuralNetwork:
                 for i, (cache, blk) in enumerate(
                     zip(reversed(block_caches), reversed(self.blocks))
                 ):
-                    d_x, grads = self._block_backward(d_x, cache, blk)
+                    rev_i = self.num_blocks - 1 - i
+
+                    # MoD: zero out gradient for tokens that were not routed
+                    if self.use_mod:
+                        route_mask, _ = mod_data_list[rev_i]
+                        mask_broad    = route_mask[:, :, None]  # (B, T, 1)
+                        d_x_routed    = d_x * mask_broad        # zero non-selected
+                    else:
+                        d_x_routed = d_x
+
+                    d_x, grads = blk_bwd(d_x_routed, cache, blk)
                     del cache    # free VRAM as we go
-                    acc = blk_grad_acc[self.num_blocks - 1 - i]
+                    acc = blk_grad_acc[rev_i]
                     for k in grads:
-                        acc[k] += grads[k]
+                        if k == "lambda_":
+                            lam_grad_acc[rev_i] += float(grads[k])
+                        else:
+                            acc[k] += grads[k]
                 del block_caches
 
                 # ---- Embedding gradients ------------------------------------
@@ -1730,9 +2809,9 @@ class NeuralNetwork:
                     d_x = d_x * emb_drop_mask
 
                 if self.use_embedding:
-                    # Positional embedding: same position across all samples,
-                    # so sum d_x over the batch dimension.
-                    dpe_acc += d_x.sum(axis=0)                       # (T, D)
+                    # Positional embedding: only if using learned pos encoding
+                    if dpe_acc is not None:
+                        dpe_acc += d_x.sum(axis=0)                   # (T, D)
 
                     # Token embedding: scatter-add because multiple tokens in
                     # the same batch may map to the same vocab row.
@@ -1770,7 +2849,9 @@ class NeuralNetwork:
                 if not self.weight_tying:
                     all_grads.append(dWout_acc.reshape(-1))
                 if self.use_embedding:
-                    all_grads += [de_acc.reshape(-1), dpe_acc.reshape(-1)]
+                    all_grads.append(de_acc.reshape(-1))
+                    if dpe_acc is not None:
+                        all_grads.append(dpe_acc.reshape(-1))
 
                 # One concatenation + one dot product = one GPU sync instead of N.
                 all_flat   = np.concatenate(all_grads)
@@ -1788,8 +2869,9 @@ class NeuralNetwork:
                     if not self.weight_tying:
                         dWout_acc *= scale
                     if self.use_embedding:
-                        de_acc  *= scale
-                        dpe_acc *= scale
+                        de_acc *= scale
+                        if dpe_acc is not None:
+                            dpe_acc *= scale
 
             # ================================================================
             #  Adam parameter updates
@@ -1806,16 +2888,23 @@ class NeuralNetwork:
             lr_eff = epoch_lr * (bc2 ** 0.5) / bc1
 
             # Update all block parameters:
-            #   Wqkv, W1, W2  --> Muon  (Nesterov + Newton-Schulz ortho)
-            #   everything else -> Adam  (biases, LN params)
-            for blk, acc, adam_buf, mbuf in zip(
+            #   2-D weight matrices (Wqkv, Wq, Wkv, Wqkv2, W1, W2) -> Muon
+            #   scalar/1-D params (lambda_, router_w, biases, LN) -> Adam
+            _muon_keys = {"Wqkv", "Wqkv2", "Wq", "Wkv", "W1", "W2"}
+            for blk_i, (blk, acc, adam_buf, mbuf) in enumerate(zip(
                 self.blocks, blk_grad_acc, self._adam_blocks, self._muon_bufs
-            ):
+            )):
                 for k in blk:
-                    if k in ("Wqkv", "W1", "W2"):
+                    if k not in acc:
+                        continue
+                    if k in _muon_keys:
                         _muon_step(blk[k], acc[k], mbuf[k], epoch_lr)
                     else:
                         _adam_step(blk[k], acc[k], adam_buf[k]["m"], adam_buf[k]["v"], lr_eff)
+                if "lambda_" in blk:
+                    blk["lambda_"] = np.float32(
+                        float(blk["lambda_"]) - lr_eff * lam_grad_acc[blk_i]
+                    )
 
             # Update final LN
             _adam_step(self.ln_f_g, d_ln_f_g_acc, self._m_ln_f_g, self._v_ln_f_g, lr_eff)
@@ -1828,8 +2917,9 @@ class NeuralNetwork:
 
             # Update embeddings
             if self.use_embedding:
-                _adam_step(self.embedding,     de_acc,  self._me,  self._ve,  lr_eff)
-                _adam_step(self.pos_embedding, dpe_acc, self._mpe, self._vpe, lr_eff)
+                _adam_step(self.embedding, de_acc, self._me, self._ve, lr_eff)
+                if self.pos_embedding is not None and self._mpe is not None:
+                    _adam_step(self.pos_embedding, dpe_acc, self._mpe, self._vpe, lr_eff)
 
             # ================================================================
             #  Adaptive LR scheduler
@@ -1912,8 +3002,15 @@ class NeuralNetwork:
                   blk["ln2_g"].size + blk["ln2_b"].size)
         ln_f_p = self.ln_f_g.size + self.ln_f_b.size
         out_p  = (0 if self.weight_tying else self.Wout.size) + self.bout.size
-        emb_p  = (self.embedding.size + self.pos_embedding.size
-                  if self.use_embedding else 0)
+        emb_p = 0
+
+        if self.use_embedding and self.embedding is not None:
+            emb_p += self.embedding.size
+
+        # Only count learned positional embeddings if they exist
+        if getattr(self, "pos_encoding", None) == "learned":
+            if self.pos_embedding is not None:
+                emb_p += self.pos_embedding.size
         total  = (attn_p + ff_p + ln_p) * self.num_blocks + ln_f_p + out_p + emb_p
 
         width  = 56
@@ -1928,8 +3025,14 @@ class NeuralNetwork:
         print(f"|  {'Optimizer':<18} | {'Muon (W) + Adam (rest)':<{width-24}}|")
         print(f"|  {'Batch size':<18} | {self.batch_size:<{width-24}}|")
         if self.use_embedding:
-            edim = f"{self.vocab_size} chars x {D}d  context={self.context_size}"
-            print(f"|  {'Embedding':<18} | {edim:<{width-24}}|")
+            pos_type = getattr(self, "pos_encoding", "unknown")
+
+            edim = (
+                f"{self.vocab_size} chars x {D}d  "
+                f"context={self.context_size}  pos={pos_type}"
+            )
+
+            print(f"|  {'Embedding':<18} | {edim:<{width - 24}}|")
         blk_str  = f"{self.num_blocks} blocks  heads={self.num_heads}  d_head={d_h}"
         attn_str = f"causal MHA {D}x{D*3} ({attn_p} params/block)"
         ff_str   = f"{D}->{D*4}->{D} ({ff_p} params/block)"

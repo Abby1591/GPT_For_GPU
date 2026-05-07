@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from tokenizer import CharTokenizer
+from .tokenizer import CharTokenizer
 
 # A single training sample: (flat one-hot feature vector, target class index)
 Sample = Tuple[List[float], int]
