@@ -16,20 +16,20 @@ Sources
   8. Reddit             -- conversational, informal register (local .jsonl dumps)
   9. Tool training      -- Toolformer-style [TOOL:name|arg][RESULT:...] examples
 
-Source split (default 2.2M chars):
-    28% Gutenberg         -- long-form prose, vocabulary breadth
-    23% Wikipedia (LGBTQ+ + Left guaranteed, then Diverse + Academic)
-    14% Simple Wikipedia
-     9% Wikiquote
-     9% Wikibooks
-     5% Wiktionary
-     5% Reddit
-     7% Tool training     -- teaches model WHEN and HOW to call tools
+Source split (default 200M chars  ~200 MB):
+    18% Gutenberg         -- long-form prose, vocabulary breadth
+    28% Wikipedia (LGBTQ+ + Left guaranteed, then Diverse + Academic)
+    10% Simple Wikipedia
+     5% Wikiquote
+     7% Wikibooks         -- programming + science textbooks
+    12% Wiktionary        -- clean word definitions, near-full dictionary
+    12% Reddit            -- conversational, informal, programming Q&A
+     8% Tool training     -- teaches model WHEN and HOW to call tools
 
 Usage
 -----
     python build_dataset.py
-    python build_dataset.py --target_chars 5000000 --output big_dataset.txt
+    python build_dataset.py --target_chars 500000000 --output big_dataset.txt
     python build_dataset.py --no_gutenberg
     python build_dataset.py --no_wikipedia
     python build_dataset.py --no_reddit
@@ -350,22 +350,34 @@ WIKIQUOTE_PAGES = [
 #  Reddit phase constants and helpers
 # =============================================================================
 
-_REDDIT_MIN_SCORE_COMMENT    = 4
-_REDDIT_MIN_SCORE_SUBMISSION = 3
-_REDDIT_MIN_LEN  = 80
-_REDDIT_MAX_LEN  = 1500
+_REDDIT_MIN_SCORE_COMMENT    = 2
+_REDDIT_MIN_SCORE_SUBMISSION = 2
+_REDDIT_MIN_LEN  = 60
+_REDDIT_MAX_LEN  = 3000
 _REDDIT_DEDUP_CACHE_SIZE = 200_000
 
 _REDDIT_GOOD_SUBS: set[str] = {
-    "programming", "compsci", "softwareengineering",
-    "MachineLearning", "learnmachinelearning",
-    "datascience", "algorithms",
-    "linux", "opensource",
-    "math", "askmath", "statistics",
-    "AskHistorians", "explainlikeimfive",
-    "TrueReddit", "DepthHub",
-    "AskScience", "Philosophy", "Economics",
-    "books", "writing", "science",
+    # Programming / CS / ML
+    "programming", "compsci", "softwareengineering", "learnprogramming",
+    "Python", "javascript", "cpp", "rust", "golang", "java", "haskell",
+    "MachineLearning", "learnmachinelearning", "deeplearning", "artificial",
+    "datascience", "algorithms", "computerscience", "coding", "webdev",
+    "gamedev", "devops", "sysadmin", "linux", "opensource", "commandline",
+    # Math / Science
+    "math", "askmath", "statistics", "physics", "chemistry", "biology",
+    "AskScience", "science", "neuroscience", "genetics",
+    # Conversation / Q&A
+    "AskReddit", "explainlikeimfive", "NoStupidQuestions", "answers",
+    "AskHistorians", "TrueReddit", "DepthHub", "changemyview",
+    "philosophy", "Philosophy", "Ethics",
+    # Left / politics / social justice
+    "socialism", "communism", "anarchism", "Marxism", "labour",
+    "politics", "PoliticalDiscussion", "progressive", "SocialJustice",
+    "feminism", "GenderCritical", "lgbt", "ainbow", "trans", "nonbinary",
+    "BlackLives", "antiracism", "labor",
+    # Culture / knowledge
+    "history", "Economics", "books", "writing", "literature", "worldnews",
+    "todayilearned", "Showerthoughts", "technology", "Futurology",
 }
 
 _BOT_PHRASES = re.compile(
@@ -428,7 +440,7 @@ def _stream_reddit_comments(path: str, target: int) -> Iterator[str]:
                 continue
             if score < _REDDIT_MIN_SCORE_COMMENT:
                 continue
-            if sub not in _REDDIT_GOOD_SUBS and score < 12:
+            if sub not in _REDDIT_GOOD_SUBS and score < 6:
                 continue
             text = _reddit_clean(body)
             if _reddit_is_quality(text):
@@ -453,7 +465,7 @@ def _stream_reddit_submissions(path: str, target: int) -> Iterator[str]:
                 continue
             if score < _REDDIT_MIN_SCORE_SUBMISSION:
                 continue
-            if sub not in _REDDIT_GOOD_SUBS and score < 8:
+            if sub not in _REDDIT_GOOD_SUBS and score < 4:
                 continue
             text = _reddit_clean(f"{title}\n{body}" if title else body)
             if _reddit_is_quality(text):
@@ -1001,9 +1013,14 @@ def fetch_reddit(
 
 def fetch_wiktionary(
     target_chars: int,
-    dump_file: str='dumps/enwiktionary-latest-pages-articles.xml.bz2',
-    checkpoint_file: str='Dataset/Dataset part backup/phase_6_wiktionary.txt'
-) -> List[str]:
+    dump_file: str = 'dumps/enwiktionary-latest-pages-articles.xml.bz2',
+) -> list[str]:
+
+    import os
+    import re
+    import bz2
+    import gc
+    import html
 
     print(f'\n[6/8] Wiktionary Dump  (target {target_chars:,} chars)')
 
@@ -1011,109 +1028,343 @@ def fetch_wiktionary(
         print(f'  Dump not found: {dump_file}')
         return []
 
-    import gc
+    os.makedirs('Dataset/Dataset part backup', exist_ok=True)
 
-    os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+    _WIKT_KEEP_SECTIONS = {
+        'noun', 'verb', 'adjective', 'adverb', 'pronoun', 'preposition',
+        'conjunction', 'interjection', 'determiner', 'article',
+        'etymology', 'pronunciation',
+    }
+
+    _WIKT_SKIP_SECTIONS = {
+        'references', 'further reading', 'anagrams', 'translations',
+        'related terms', 'derived terms', 'descendants', 'see also',
+        'synonyms', 'antonyms', 'hypernyms', 'hyponyms', 'meronyms',
+        'holonyms', 'coordinate terms', 'alternative forms',
+        'declension', 'conjugation', 'inflection', 'usage notes',
+        'quotations', 'external links',
+    }
+
+    _POS_SECTIONS = {
+        'noun', 'verb', 'adjective', 'adverb', 'pronoun', 'preposition',
+        'conjunction', 'interjection', 'determiner', 'article',
+    }
+
+    def clean_line(line: str) -> str:
+        stripped = line.strip()
+
+        line = html.unescape(line)
+
+        line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE | re.DOTALL)
+        line = re.sub(r'https?://\S+', ' ', line)
+        line = re.sub(r'\[[^\]]*http[^\]]*\]', ' ', line)
+        line = re.sub(r'<!--.*?-->', ' ', line, flags=re.DOTALL)
+        line = re.sub(r'\(\s*\)', '', line)
+        line = line.replace('{{', ' ').replace('}}', ' ')
+
+        if not stripped:
+            return ''
+        if re.match(r'^\*?\s*IPA', stripped) or '{{IPA' in stripped:
+            return ''
+        if re.match(r'^\*?\s*(audio|File|Image|thumb)', stripped, re.IGNORECASE):
+            return ''
+        if re.match(r'^\*?\s*(rhymes|hyph|homophones?)', stripped, re.IGNORECASE):
+            return ''
+        if stripped.startswith('[[Category') or stripped.startswith('C|'):
+            return ''
+        if re.match(r'^[a-z_-]{2,10}\|', stripped) and stripped.count('|') >= 2:
+            return ''
+
+        prev = None
+        iters = 0
+        while prev != line and iters < 10:
+            prev = line
+            line = re.sub(r'\{\{[^{}]*\}\}', '', line)
+            iters += 1
+
+        line = re.sub(r"'{2,}", '', line)
+        line = re.sub(r'\[\[(File|Image):[^\]]*\]\]', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\[\[[^\]|]*\|([^\]]+)\]\]', r'\1', line)
+        line = re.sub(r'\[\[([^\]]+)\]\]', r'\1', line)
+        line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE)
+        line = re.sub(r'<[^>]+>', ' ', line)
+        line = re.sub(r'\|', ' ', line)
+        line = re.sub(r'\s+', ' ', line).strip()
+
+        junk_markers = (
+            'quote-book', 'quote-web', 'quote-journal', 'quote-text',
+            'cite-book', 'cite-web', 'isbn', 'retrieved from',
+            'page ', 'chapter ',
+        )
+        if any(j in line.lower() for j in junk_markers):
+            return ''
+        if len(line) < 4:
+            return ''
+        if re.match(r'^[^a-zA-Z]*$', line):
+            return ''
+
+        return line
+
+    def section_header(line: str):
+        m = re.match(r'^(={2,5})\s*(.+?)\s*\1$', line.strip())
+        return m.group(2) if m else None
+
+    def parse_entry(title: str, raw: str) -> str:
+
+        lines = raw.replace('\r\n', '\n').splitlines()
+
+        # Find English section
+        eng_start = None
+        eng_end = len(lines)
+
+        for i, ln in enumerate(lines):
+
+            s = ln.strip()
+
+            # Find ==English==
+            if re.match(r'^==\s*English\s*==$', s, re.IGNORECASE):
+                eng_start = i
+                continue
+
+            # Find next language section
+            if eng_start is not None:
+
+                if (
+                        re.match(r'^==[^=].*==$', s)
+                        and
+                        not re.match(r'^==\s*English\s*==$', s, re.IGNORECASE)
+                ):
+                    eng_end = i
+                    break
+
+        scope = lines[eng_start:eng_end] if eng_start is not None else lines
+
+        # Extract syllabification
+        syllable_title = title
+
+        for ln in scope:
+            m = re.search(r'\{\{hyph(?:enation)?\s*\|[^}]*\}\}', ln, re.IGNORECASE)
+            if m:
+                inner = m.group(0)
+                parts = re.sub(r'^\{\{[^|]+\|', '', inner).rstrip('}').split('|')
+                if parts and re.match(r'^[a-z]{2,3}$', parts[0].strip()):
+                    parts = parts[1:]
+                syllables = [p.strip() for p in parts if p.strip()]
+                if syllables:
+                    syllable_title = '\u00b7'.join(syllables)
+                    break
+
+        # Parse POS sections
+        sections = []
+        current_pos = None
+        in_skip = False
+        current_defs = []
+        current_examples = []
+        current_defn = None
+
+        def flush_defn():
+            nonlocal current_defn, current_examples
+            if current_defn:
+                current_defs.append((current_defn, current_examples[:]))
+            current_defn = None
+            current_examples = []
+
+        def flush_pos():
+            nonlocal current_pos, current_defs
+            if current_pos and current_defs:
+                sections.append((current_pos, current_defs[:]))
+            current_pos = None
+            current_defs = []
+
+        for ln in scope:
+
+            header = section_header(ln)
+
+            if header is not None:
+                hl = re.sub(r'\s+', ' ', header.lower()).strip()
+                hl_clean = re.sub(r'\s*\d+$', '', hl)  # strip "noun 2" -> "noun"
+
+                flush_defn()
+
+                if hl in _WIKT_SKIP_SECTIONS or hl_clean in _WIKT_SKIP_SECTIONS:
+                    flush_pos()
+                    in_skip = True
+                    continue
+
+                if hl.startswith('etymology') or hl.startswith('pronunciation'):
+                    flush_defn()
+                    flush_pos()
+                    in_skip = False
+                    current_pos = None
+                    continue
+
+                if hl_clean in _POS_SECTIONS:
+                    flush_defn()
+                    flush_pos()
+                    current_pos = hl_clean
+                    in_skip = False
+                    continue
+
+                # Unknown section — skip it
+                flush_defn()
+                flush_pos()
+                in_skip = True
+                continue
+
+            if in_skip or current_pos is None:
+                continue
+
+            if ln.startswith('# ') and not ln.startswith('## '):
+                flush_defn()
+                clean = clean_line(ln[2:])
+                if clean:
+                    current_defn = clean
+
+            elif ln.startswith('#: ') or ln.startswith('#* '):
+                raw_example = ln[3:].strip().lower()
+                if (
+                    '{{quote-' in raw_example or
+                    '{{rq:' in raw_example or
+                    '{{rquote' in raw_example or
+                    '{{cite' in raw_example
+                ):
+                    continue
+                clean = clean_line(ln[3:])
+                if (
+                    clean and
+                    len(clean) > 8 and
+                    '{{' not in clean and
+                    '}}' not in clean and
+                    not clean.startswith('quote-')
+                ):
+                    current_examples.append(clean)
+
+        flush_defn()
+        flush_pos()
+
+        total_defs = sum(len(d) for _, d in sections)
+        if total_defs > 20:
+            return ''
+        if not sections:
+            return ''
+
+        # Render
+        blocks = [syllable_title]
+
+        for pos_label, defs in sections:
+            blocks.append('')
+            blocks.append(pos_label)
+            blocks.append('')
+            for idx, (defn, examples) in enumerate(defs, 1):
+                if examples:
+                    defn_line = defn.rstrip('.:') + ':'
+                else:
+                    defn_line = defn
+                blocks.append(f'{idx}. {defn_line}')
+                for ex in examples:
+                    ex_clean = ex.strip('"\'')
+                    blocks.append(f'"{ex_clean}"')
+
+        return '\n'.join(blocks)
 
     chunks = []
     total = 0
     entries = 0
+    skipped = 0
 
     inside_page = False
     inside_text = False
-
     title = ''
     text_lines = []
 
     with bz2.open(dump_file, 'rt', encoding='utf-8', errors='ignore') as f:
 
-        for line in f:
+        for raw_line in f:
 
-            if '<page>' in line:
+            if '<page>' in raw_line:
                 inside_page = True
                 inside_text = False
                 title = ''
                 text_lines = []
                 continue
 
-            if '</page>' in line:
+            if '</page>' in raw_line:
 
                 if title and text_lines:
+                    raw_text = ''.join(text_lines).replace('\r\n', '\n')
 
-                    text = ''.join(text_lines)
+                    if '#REDIRECT' not in raw_text.upper() and len(raw_text) < 200_000:
 
-                    if '#REDIRECT' not in text.upper():
+                        has_english = re.search(r'==\s*English\s*==', raw_text) is not None
+                        has_pos = re.search(
+                            r'===?\s*(Noun|Verb|Adjective|Adverb|Pronoun|Preposition|Conjunction|Interjection|Determiner|Article)\s*===?',
+                            raw_text,
+                            re.IGNORECASE
+                        ) is not None
 
-                        lower = text.lower()
-
-                        if (
-                            '==english==' in lower or
-                            '===noun===' in lower or
-                            '===verb===' in lower or
-                            '===adjective===' in lower
-                        ):
-
-                            text = text.replace('[[', '')
-                            text = text.replace(']]', '')
-                            text = text.replace('{{', '')
-                            text = text.replace('}}', '')
-
-                            text = re.sub('<[^>]+>', ' ', text)
-                            text = re.sub(r'\s+', ' ', text).strip()
-
-                            entry = f'{title}\n\n{text}\n\n'
-
-                            if len(entry) > 120:
-
+                        if has_english and has_pos:
+                            entry = parse_entry(title, raw_text)
+                            if entry and len(entry) > 80:
                                 chunks.append(entry)
-
                                 total += len(entry)
                                 entries += 1
 
-                                if entries % 1000 == 0:
-                                    print(
-                                        f'  [{entries:,}] entries  '
-                                        f'({total:,}/{target_chars:,} chars)'
-                                    )
-
                                 if entries % 5000 == 0:
+                                    print(
+                                        f'  [{entries:,} entries | '
+                                        f'{skipped:,} skipped]  '
+                                        f'{total:,}/{target_chars:,} chars'
+                                    )
                                     gc.collect()
 
                                 if total >= target_chars:
                                     break
+                        else:
+                            skipped += 1
 
                 inside_page = False
                 inside_text = False
-                text_lines.clear()
+                text_lines = []
                 continue
 
             if not inside_page:
                 continue
 
-            if '<title>' in line and '</title>' in line:
-                title = re.sub(r'.*<title>(.*?)</title>.*', r'\1', line)
+            if '<title>' in raw_line and '</title>' in raw_line:
+
+                title = re.sub(
+                    r'.*<title>(.*?)</title>.*',
+                    r'\1',
+                    raw_line
+                ).strip()
+
+                # Skip non-English / foreign-script titles
+                if not re.match(r"^[A-Za-z0-9 _'\-]+$", title):
+                    title = ''
+
+                if ':' in title and not title[0].isupper():
+                    title = ''
+
                 continue
 
-            if '<text' in line:
+            if '<text' in raw_line:
                 inside_text = True
-                line = line.split('>', 1)[-1]
+                raw_line = raw_line.split('>', 1)[-1]
 
             if inside_text:
-
-                if '</text>' in line:
-                    line = line.split('</text>', 1)[0]
+                if '</text>' in raw_line:
+                    raw_line = raw_line.split('</text>', 1)[0]
                     inside_text = False
+                if len(text_lines) < 6000:
+                    text_lines.append(raw_line)
 
-                if len(text_lines) < 4000:
-                    text_lines.append(line)
-
-    with open(checkpoint_file, 'w', encoding='utf-8') as out:
-        out.write('\n\n'.join(chunks))
-
-    print(f'  Wiktionary dump done: {entries:,} entries  ({total:,} chars)')
+    print(
+        f'  Wiktionary done: {entries:,} entries  '
+        f'({total:,} chars)  '
+        f'({skipped:,} non-English skipped)'
+    )
 
     return chunks
-
 
 # =============================================================================
 #  Phase 8: Tool training data
@@ -1438,8 +1689,8 @@ def _save_checkpoint(chunks: List[str], filename: str) -> None:
 # =============================================================================
 
 def build_dataset(
-    target_chars:          int,
-    output_file:           str,
+    target_chars:          int  = 200_000_000,
+    output_file:           str  = "diverse_dataset.txt",
     no_gutenberg:          bool = False,
     no_wikipedia:          bool = False,
     no_simple_wiki:        bool = False,
@@ -1482,63 +1733,47 @@ def build_dataset(
         no_tools       = (phase != 8)
     print("=" * 65)
 
-    print("\nWaiting 10s before starting (clears any Wikipedia rate limit)...")
-    for i in range(10, 0, -2):
-        print(f"  {i}s...", end="\r", flush=True)
-        time.sleep(2)
-    print("  Starting.         ")
-
     chunks = []
 
     if not no_gutenberg:
-        c = fetch_gutenberg(int(target_chars * 0.28))
+        c = fetch_gutenberg(int(target_chars * 0.18))
         chunks.extend(c)
         _save_checkpoint(c, "Dataset/Dataset part backup/phase_1_gutenberg.txt")
         print("  ✓ Gutenberg checkpoint saved")
 
     if not no_wikipedia:
-        c = fetch_wikipedia(int(target_chars * 0.23))
+        c = fetch_wikipedia(int(target_chars * 0.28))
         chunks.extend(c)
         _save_checkpoint(c, "Dataset/Dataset part backup/phase_2_wikipedia.txt")
         print("  ✓ Wikipedia checkpoint saved")
 
     if not no_simple_wiki:
-        c = fetch_simple_wikipedia(int(target_chars * 0.14))
+        c = fetch_simple_wikipedia(int(target_chars * 0.10))
         chunks.extend(c)
         _save_checkpoint(c, "Dataset/Dataset part backup/phase_3_simple_wikipedia.txt")
         print("  ✓ Simple Wikipedia checkpoint saved")
 
     if not no_wikiquote:
-        c = fetch_wikiquote(int(target_chars * 0.09))
+        c = fetch_wikiquote(int(target_chars * 0.05))
         chunks.extend(c)
         _save_checkpoint(c, "Dataset/Dataset part backup/phase_4_wikiquote.txt")
         print("  ✓ Wikiquote checkpoint saved")
 
     if not no_wikibooks:
-        c = fetch_wikibooks(int(target_chars * 0.09))
+        c = fetch_wikibooks(int(target_chars * 0.07))
         chunks.extend(c)
         _save_checkpoint(c, "Dataset/Dataset part backup/phase_5_wikibooks.txt")
         print("  ✓ Wikibooks checkpoint saved")
 
     if not no_wiktionary:
-        wiktionary_target = (
-            target_chars if phase == 6
-            else int(target_chars * 0.05)
-        )
-
-        c = fetch_wiktionary(
-            wiktionary_target,
-            dump_file='dumps/enwiktionary-latest-pages-articles.xml.bz2',
-            checkpoint_file='Dataset/Dataset part backup/phase_6_wiktionary.txt'
-        )
-
+        c = fetch_wiktionary(int(target_chars * 0.12))
         chunks.extend(c)
-
-        print('  ✓ Wiktionary checkpoint saved')
+        _save_checkpoint(c, "Dataset/Dataset part backup/phase_6_wiktionary.txt")
+        print("  ✓ Wiktionary checkpoint saved")
 
     if not no_reddit:
         c = fetch_reddit(
-            target_chars     = int(target_chars * 0.05),
+            target_chars     = int(target_chars * 0.12),
             comments_file    = reddit_comments,
             submissions_file = reddit_submissions,
             reddit_output    = reddit_output,
@@ -1553,7 +1788,7 @@ def build_dataset(
 
     if not no_tools:
         c = fetch_tool_training(
-            target_chars = int(target_chars * 0.07),
+            target_chars = int(target_chars * 0.08),
             live_search  = tools_live_search,
             weights      = {
                 "calc":    tools_calc_weight,
@@ -1625,8 +1860,8 @@ if __name__ == "__main__":
         description="Build a diverse local dataset for miniGPT.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("--target_chars",  type=int, default=2_200_000,
-                        help="Target character count (default: 2,200,000)")
+    parser.add_argument("--target_chars",  type=int, default=200_000_000,
+                        help="Target character count (default: 200,000,000 ≈ 200 MB)")
     parser.add_argument("--output",        type=str, default="diverse_dataset.txt",
                         help="Output filename (default: diverse_dataset.txt)")
     parser.add_argument("--seed",          type=int, default=42,
