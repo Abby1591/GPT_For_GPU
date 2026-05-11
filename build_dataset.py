@@ -1102,6 +1102,9 @@ def fetch_wiktionary(
     }
 
     def normalize_diacritics(text: str) -> str:
+        if not text:
+            return text
+
         def fix_word(w):
             if w in _WORD_MAP:
                 return _WORD_MAP[w]
@@ -1113,18 +1116,64 @@ def fetch_wiktionary(
                     continue
                 if c in _KNOWN_CHARS:
                     continue
-                # Unknown non-ASCII — drop token
                 return None
-            # All chars are known — recover diacritics
             return ''.join(_DIACRITIC_MAP.get(c, c) for c in w)
 
         tokens = text.split()
+        if not tokens:
+            return text
         result = []
         for tok in tokens:
             fixed = fix_word(tok)
             if fixed is not None:
                 result.append(fixed)
-        return ' '.join(result)
+        recovered = ' '.join(result)
+        return recovered if recovered else text  # fallback to original if everything got dropped
+
+    def replace_template(match):
+        inner = match.group(1).strip()
+        parts = [p.strip() for p in inner.split('|')]
+        if not parts:
+            return ' '
+        name = parts[0].lower()
+
+        if name == 'w':
+            if len(parts) >= 2:
+                return ' ' + parts[-1] + ' '  # add spaces
+
+        if name == 'taxlink':
+            if len(parts) >= 2:
+                return ' ' + parts[1] + ' '
+
+        if name in ('vern', 'vernacular'):
+            if len(parts) >= 2:
+                return ' ' + parts[1] + ' '
+
+        if name == 'given name':
+            return ' given name '
+
+        if name == 'surname':
+            return ' surname '
+
+        if name in ('gloss', 'lb', 'label', 'qualifier', 'q', 'qual', 'context'):
+            return ' ' + ' '.join(parts[1:]) + ' '
+
+        useful = []
+        for p in parts[1:]:
+            if '=' in p:
+                continue
+            if re.match(r'^[a-z]{1,3}$', p):
+                continue
+            if re.match(r'^Q\d+$', p):
+                continue
+            if len(p) < 2:
+                continue
+            useful.append(p)
+
+        if useful:
+            return ' ' + ' '.join(useful[:2]) + ' '
+
+        return ' '
 
     def clean_line(line: str) -> str:
 
@@ -1165,51 +1214,6 @@ def fetch_wiktionary(
         # ---------------------------------------------------------- #
         # Smart template handling
         # ---------------------------------------------------------- #
-
-        def replace_template(match):
-            inner = match.group(1).strip()
-            parts = [p.strip() for p in inner.split('|')]
-            if not parts:
-                return ' '
-            name = parts[0].lower()
-
-            if name == 'w':
-                if len(parts) >= 2:
-                    return parts[-1]
-
-            if name == 'taxlink':
-                if len(parts) >= 2:
-                    return parts[1]
-
-            if name in ('vern', 'vernacular'):
-                if len(parts) >= 2:
-                    return parts[1]
-
-            if name == 'given name':
-                return 'given name'
-
-            if name == 'surname':
-                return 'surname'
-
-            if name in ('gloss', 'lb', 'label', 'qualifier', 'q', 'qual', 'context'):
-                return ' '.join(parts[1:])
-
-            useful = []
-            for p in parts[1:]:
-                if '=' in p:
-                    continue
-                if re.match(r'^[a-z]{1,3}$', p):
-                    continue
-                if re.match(r'^Q\d+$', p):
-                    continue
-                if len(p) < 2:
-                    continue
-                useful.append(p)
-
-            if useful:
-                return ' '.join(useful[:2])
-
-            return ' '
 
         prev = None
         loops = 0
@@ -1279,6 +1283,8 @@ def fetch_wiktionary(
         line = re.sub(r'\(\s*\)', ' ', line)
         line = re.sub(r'<[^>]+>', ' ', line)
         line = re.sub(r'\|', ' ', line)
+        line = re.sub(r'\bcontrast\s+([A-Za-z])', r'contrast: \1', line)
+        line = re.sub(r'\bsee\s+([A-Z])', r'see: \1', line)
 
         # Strip leading lowercase label phrases before a capital word
         line = re.sub(r'^(?:[a-z][^A-Z.!?]{0,40}?\s){1,3}(?=[A-Z])', '', line)
@@ -1287,7 +1293,7 @@ def fetch_wiktionary(
         line = re.sub(r':\s*(?:from|to|into|onto|upon)\s*$', '', line)
 
         # Remove duplicate consecutive words
-        line = re.sub(r'\b(\w+)\s+\1\b', r'\1', line, flags=re.IGNORECASE)
+        line = re.sub(r"([\w']+(?:\s+[\w']+){0,2})\s+\1", r'\1', line, flags=re.IGNORECASE)
 
         # Strip known leading label fragments
         line = re.sub(
@@ -1305,6 +1311,8 @@ def fetch_wiktionary(
 
         # Strip date fragments like "ca. 1480" "from 1570s"
         line = re.sub(r'\b(ca\.|from|since|defdate)[\s\d,\.]+s?\b', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\b\d+(?:st|nd|rd|th)\s+c\.?(?:\s+\d+)?\b', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'_\s*', ' ', line)
 
         # Strip senseid label fragments at start of definition
         # e.g. "unconstrained, socially social Unconstrained"
@@ -1341,10 +1349,12 @@ def fetch_wiktionary(
         # ---------------------------------------------------------- #
 
         # Cleanup dangling punctuation
-        line = re.sub(r'\s+([,.;:])', r'\1', line)
+        line = re.sub(r' +([,.;:])', r'\1', line)
+        line = re.sub(r'\s+(about|of|for|with|by|to|from)\s*[.!?]$', '.', line)
         line = re.sub(r'([,.;:]){2,}', r'\1', line)
         line = re.sub(r'\(\s*[,.;:]?\s*\)', ' ', line)
-        line = re.sub(r'\s+', ' ', line).strip()
+        line = re.sub(r'([a-z])([A-Z])', r'\1 \2', line)
+        line = re.sub(r' +', ' ', line).strip()
 
         # Remove leading/trailing punctuation junk
         line = line.strip(' ,;:-')
@@ -1398,7 +1408,8 @@ def fetch_wiktionary(
         scope = lines[eng_start:eng_end] if eng_start is not None else lines
 
         # Extract syllabification
-        syllable_title = normalize_diacritics(title)
+        syllable_title = normalize_diacritics(title) or title
+        found_syllabification = False
 
         if not syllable_title:
             print(f"  WARNING: empty title, raw was: {repr(title)}")
@@ -1412,7 +1423,10 @@ def fetch_wiktionary(
                     parts = parts[1:]
                 syllables = [p.strip() for p in parts if p.strip()]
                 if syllables:
-                    syllable_title = normalize_diacritics('\u00b7'.join(syllables))
+                    candidate = normalize_diacritics('\u00b7'.join(syllables))
+                    # Sanity check: syllabified form should be close in length to title
+                    if candidate and len(candidate) <= len(title) * 2 + 3:
+                        syllable_title = candidate
                     break
 
         # Parse POS sections
@@ -1475,9 +1489,73 @@ def fetch_wiktionary(
                 continue
 
             if ln.startswith('# ') and not ln.startswith('## '):
+
+                raw_def = ln[2:].lower()
+
+                # -------------------------------------------------- #
+                # Skip slang / low-quality Wiktionary senses
+                # -------------------------------------------------- #
+
+                _BAD_LABELS = (
+                    'slang',
+                    'internet',
+                    'meme',
+                    'vulgar',
+                    'offensive',
+                    'racial slur',
+                    'ethnic slur',
+                    'childish',
+                    'baby talk',
+                    'nonstandard',
+                    'eye dialect',
+                    'leet',
+                    'txt',
+                    'texting',
+                )
+
+                # Optional stricter historical filtering
+                _HISTORICAL_LABELS = (
+                    'obsolete',
+                    'archaic',
+                    'dated',
+                )
+
+                if any(label in raw_def for label in _BAD_LABELS):
+                    continue
+
+                # Optional:
+                # uncomment if you want cleaner modern English only
+
+                # if any(label in raw_def for label in _HISTORICAL_LABELS):
+                #     continue
+
                 flush_defn()
+
                 clean = clean_line(ln[2:])
-                if clean and len(clean) <= 400:
+
+                if clean:
+                    clean = re.sub(
+                        r'^(?:slang|archaic|obsolete|dated|rare|now rare|'
+                        r'transitive|intransitive|'
+                        r'countable|uncountable|'
+                        r'figurative|literal|'
+                        r'formal|informal|'
+                        r'computing|mathematics|physics|biology|chemistry|'
+                        r'linguistics|semantics|theology|law|legal|'
+                        r'nautical|military|sports?|meiosis|'
+                        r'UK|US|Australia|Ireland|Canada|'
+                        r'sometimes|usually|especially|'
+                        r'in the plural|plural|singular|'
+                        r'oath\s+\w+|'
+                        r'outside certain phrases|'
+                        r'sometimes\s+\w+\s+\w+|'
+                        r'sometimes\s+\w+)\s+'
+                        r'|\w+\s+outside certain phrases'
+                        r'|outside certain phrases',
+                        '', clean, flags=re.IGNORECASE
+                    )
+
+                if clean and len(clean) <= 400 and len(clean.split()) >= 3:
                     current_defn = clean
 
             elif ln.startswith('#: ') or ln.startswith('#* '):
@@ -1509,6 +1587,11 @@ def fetch_wiktionary(
                             clean.lower() == clean and
                             not clean.endswith('.')
                     ):
+                        continue
+
+                    if len(clean.split()) <= 2:
+                        continue
+                    if re.fullmatch(r'[A-Z][a-zA-Z]+\s+[A-Z][a-zA-Z]+', clean):
                         continue
 
                     current_examples.append(clean)
