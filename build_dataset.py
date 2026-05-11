@@ -1014,6 +1014,7 @@ def fetch_reddit(
 def fetch_wiktionary(
     target_chars: int,
     dump_file: str = 'dumps/enwiktionary-latest-pages-articles.xml.bz2',
+    ascii_only: bool = False,
 ) -> list[str]:
 
     import os
@@ -1021,6 +1022,7 @@ def fetch_wiktionary(
     import bz2
     import gc
     import html
+    import unicodedata
 
     print(f'\n[6/8] Wiktionary Dump  (target {target_chars:,} chars)')
 
@@ -1029,12 +1031,6 @@ def fetch_wiktionary(
         return []
 
     os.makedirs('Dataset/Dataset part backup', exist_ok=True)
-
-    _WIKT_KEEP_SECTIONS = {
-        'noun', 'verb', 'adjective', 'adverb', 'pronoun', 'preposition',
-        'conjunction', 'interjection', 'determiner', 'article',
-        'etymology', 'pronunciation',
-    }
 
     _WIKT_SKIP_SECTIONS = {
         'references', 'further reading', 'anagrams', 'translations',
@@ -1050,60 +1046,329 @@ def fetch_wiktionary(
         'conjunction', 'interjection', 'determiner', 'article',
     }
 
+    _DIACRITIC_MAP = {
+        'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a','æ':'ae',
+        'ç':'c',
+        'è':'e','é':'e','ê':'e','ë':'e',
+        'ì':'i','í':'i','î':'i','ï':'i',
+        'ñ':'n',
+        'ò':'o','ó':'o','ô':'o','õ':'o','ö':'o','ø':'o',
+        'ù':'u','ú':'u','û':'u','ü':'u',
+        'ý':'y','ÿ':'y',
+        'À':'A','Á':'A','Â':'A','Ã':'A','Ä':'A','Å':'A','Æ':'AE',
+        'Ç':'C',
+        'È':'E','É':'E','Ê':'E','Ë':'E',
+        'Ì':'I','Í':'I','Î':'I','Ï':'I',
+        'Ñ':'N',
+        'Ò':'O','Ó':'O','Ô':'O','Õ':'O','Ö':'O','Ø':'O',
+        'Ù':'U','Ú':'U','Û':'U','Ü':'U',
+        'Ý':'Y',
+        'ß':'ss',
+        'œ':'oe','Œ':'OE',
+        'š':'s','Š':'S',
+        'ž':'z','Ž':'Z',
+        'č':'c','Č':'C',
+        'ř':'r','Ř':'R',
+    }
+
+    _MATH_GREEK_CHARS = {
+        'α','β','γ','δ','ε','ζ','η','θ','ι','κ','λ','μ',
+        'ν','ξ','ο','π','ρ','σ','τ','υ','φ','χ','ψ','ω',
+        'Α','Β','Γ','Δ','Ε','Ζ','Η','Θ','Ι','Κ','Λ','Μ',
+        'Ν','Ξ','Ο','Π','Ρ','Σ','Τ','Υ','Φ','Χ','Ψ','Ω',
+        '∀','∂','∃','∅','∇','∈','∉','∋','∏','∑','√','∞',
+        '∧','∨','∩','∪','∫','∴','∼','≅','≈','≠','≡','≤',
+        '≥','⊂','⊃','⊆','⊇','⊕','⊗','⊥','⋅','±','×','÷',
+        '°','²','³','¹','½','¼','¾',
+    }
+
+    # All chars we consider recoverable or keepable
+    _KNOWN_CHARS = set(_DIACRITIC_MAP.keys()) | _MATH_GREEK_CHARS
+
+    _WORD_MAP = {
+        'café':'cafe','naïve':'naive','résumé':'resume',
+        'Pokémon':'Pokemon','piñata':'pinata','père':'pere',
+        'fiancée':'fiance','fiancé':'fiance','née':'nee',
+        'rôle':'role','über':'uber','façade':'facade',
+        'protégé':'protege','cliché':'cliche','déjà':'deja',
+        'naïveté':'naivete','émigré':'emigre','attaché':'attache',
+        'exposé':'expose','communiqué':'communique','détente':'detente',
+        'soufflé':'souffle','rosé':'rose','touché':'touche',
+        'blasé':'blase','purée':'puree','entrée':'entree',
+        'sauté':'saute','maté':'mate','pâté':'pate',
+        'crêpe':'crepe','chalet':'chalet','rôtisserie':'rotisserie',
+        'hôtel':'hotel','naïf':'naif','Zürich':'Zurich',
+        'München':'Munich','Köln':'Cologne',
+    }
+
+    def normalize_diacritics(text: str) -> str:
+        def fix_word(w):
+            if w in _WORD_MAP:
+                return _WORD_MAP[w]
+            if w.lower() in _WORD_MAP:
+                replacement = _WORD_MAP[w.lower()]
+                return replacement.capitalize() if w[0].isupper() else replacement
+            for c in w:
+                if c.isascii():
+                    continue
+                if c in _KNOWN_CHARS:
+                    continue
+                # Unknown non-ASCII — drop token
+                return None
+            # All chars are known — recover diacritics
+            return ''.join(_DIACRITIC_MAP.get(c, c) for c in w)
+
+        tokens = text.split()
+        result = []
+        for tok in tokens:
+            fixed = fix_word(tok)
+            if fixed is not None:
+                result.append(fixed)
+        return ' '.join(result)
+
     def clean_line(line: str) -> str:
-        stripped = line.strip()
 
         line = html.unescape(line)
-
-        line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE | re.DOTALL)
-        line = re.sub(r'https?://\S+', ' ', line)
-        line = re.sub(r'\[[^\]]*http[^\]]*\]', ' ', line)
-        line = re.sub(r'<!--.*?-->', ' ', line, flags=re.DOTALL)
-        line = re.sub(r'\(\s*\)', '', line)
-        line = line.replace('{{', ' ').replace('}}', ' ')
+        stripped = line.strip()
 
         if not stripped:
             return ''
-        if re.match(r'^\*?\s*IPA', stripped) or '{{IPA' in stripped:
+
+        # ---------------------------------------------------------- #
+        # Remove references / comments / urls
+        # ---------------------------------------------------------- #
+
+        line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE | re.DOTALL)
+        line = re.sub(r'<!--.*?-->', ' ', line, flags=re.DOTALL)
+        line = re.sub(r'https?://\S+', ' ', line)
+        line = re.sub(r'\[[^\]]*http[^\]]*\]', ' ', line)
+
+        # ---------------------------------------------------------- #
+        # Skip obvious junk lines
+        # ---------------------------------------------------------- #
+
+        if re.match(r'^\*?\s*IPA', stripped):
+            return ''
+        if '{{IPA' in stripped:
             return ''
         if re.match(r'^\*?\s*(audio|File|Image|thumb)', stripped, re.IGNORECASE):
             return ''
         if re.match(r'^\*?\s*(rhymes|hyph|homophones?)', stripped, re.IGNORECASE):
             return ''
-        if stripped.startswith('[[Category') or stripped.startswith('C|'):
+        if stripped.startswith('[[Category'):
             return ''
-        if re.match(r'^[a-z_-]{2,10}\|', stripped) and stripped.count('|') >= 2:
+        if stripped.startswith('C|'):
             return ''
+        if 'non-gloss' in stripped.lower():
+            return ''
+
+        # ---------------------------------------------------------- #
+        # Smart template handling
+        # ---------------------------------------------------------- #
+
+        def replace_template(match):
+            inner = match.group(1).strip()
+            parts = [p.strip() for p in inner.split('|')]
+            if not parts:
+                return ' '
+            name = parts[0].lower()
+
+            if name == 'w':
+                if len(parts) >= 2:
+                    return parts[-1]
+
+            if name == 'taxlink':
+                if len(parts) >= 2:
+                    return parts[1]
+
+            if name in ('vern', 'vernacular'):
+                if len(parts) >= 2:
+                    return parts[1]
+
+            if name == 'given name':
+                return 'given name'
+
+            if name == 'surname':
+                return 'surname'
+
+            if name in ('gloss', 'lb', 'label', 'qualifier', 'q', 'qual', 'context'):
+                return ' '.join(parts[1:])
+
+            useful = []
+            for p in parts[1:]:
+                if '=' in p:
+                    continue
+                if re.match(r'^[a-z]{1,3}$', p):
+                    continue
+                if re.match(r'^Q\d+$', p):
+                    continue
+                if len(p) < 2:
+                    continue
+                useful.append(p)
+
+            if useful:
+                return ' '.join(useful[:2])
+
+            return ' '
 
         prev = None
-        iters = 0
-        while prev != line and iters < 10:
+        loops = 0
+        while prev != line and loops < 20:
             prev = line
-            line = re.sub(r'\{\{[^{}]*\}\}', '', line)
-            iters += 1
+            line = re.sub(
+                r'\{\{([^{}]*)\}\}',
+                replace_template,
+                line
+            )
+            loops += 1
+
+        # ---------------------------------------------------------- #
+        # Remove wiki formatting
+        # ---------------------------------------------------------- #
 
         line = re.sub(r"'{2,}", '', line)
-        line = re.sub(r'\[\[(File|Image):[^\]]*\]\]', '', line, flags=re.IGNORECASE)
-        line = re.sub(r'\[\[[^\]|]*\|([^\]]+)\]\]', r'\1', line)
-        line = re.sub(r'\[\[([^\]]+)\]\]', r'\1', line)
-        line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE)
+        line = re.sub(r'\[\[(File|Image):[^\]]*\]\]', ' ', line, flags=re.IGNORECASE)
+
+        # [[Article|Display]]
+        line = re.sub(
+            r'\[\[[^\]|]+\|([^\]]+)\]\]',
+            r'\1',
+            line
+        )
+
+        # [[Namespace:Article]]
+        line = re.sub(
+            r'\[\[[A-Za-z]+:([^\]]+)\]\]',
+            r'\1',
+            line
+        )
+
+        # [[Article]]
+        line = re.sub(
+            r'\[\[([^\]]+)\]\]',
+            r'\1',
+            line
+        )
+
+        # ---------------------------------------------------------- #
+        # Remove leftover Wiktionary metadata
+        # ---------------------------------------------------------- #
+
+        line = re.sub(r'(?<!\w)(senseid|sid|lb|gloss)(?!\w)\s*', ' ', line, flags=re.IGNORECASE)
+        line = re.sub(
+            r'\b(?:ux|uxi|uxa|lb|syn|ant|cot|hyper|hyponyms)\s+[a-z]{2,3}\b',
+            ' ', line, flags=re.IGNORECASE
+        )
+
+        # Remove standalone language codes
+        line = re.sub(
+            r'(?<![A-Za-z])(?:en|fr|de|es|la|it|pt)(?![A-Za-z])',
+            ' ',
+            line
+        )
+
+        line = re.sub(
+            r'\b(?:rfdef|rfquote|qualifier|qual|context|topics|w|l|m|mention)\b',
+            ' ',
+            line,
+            flags=re.IGNORECASE
+        )
+
+        line = re.sub(r'\bQ\d+\b', ' ', line)
+        line = re.sub(r'\b[a-zA-Z_]+\s*=\s*\S+', ' ', line)
+        line = re.sub(r'\(\s*\)', ' ', line)
         line = re.sub(r'<[^>]+>', ' ', line)
         line = re.sub(r'\|', ' ', line)
-        line = re.sub(r'\s+', ' ', line).strip()
+
+        # Strip leading lowercase label phrases before a capital word
+        line = re.sub(r'^(?:[a-z][^A-Z.!?]{0,40}?\s){1,3}(?=[A-Z])', '', line)
+
+        # Remove ":from" ":to" style obj fragments
+        line = re.sub(r':\s*(?:from|to|into|onto|upon)\s*$', '', line)
+
+        # Remove duplicate consecutive words
+        line = re.sub(r'\b(\w+)\s+\1\b', r'\1', line, flags=re.IGNORECASE)
+
+        # Strip known leading label fragments
+        line = re.sub(
+            r'^(by extension|figurative|computing|dated|obsolete|archaic|informal|'
+            r'transitive|intransitive|preceded by|with or possessive frequently '
+            r'figurative especially disparaging)\s+',
+            '', line
+        )
+
+        # Strip any remaining leading lowercase label phrases before a capital word
+        line = re.sub(r'^(?:[a-z][^A-Z.!?]{0,40}?\s){1,3}(?=[A-Z])', '', line)
+
+        # Strip anchor links like "libre#Adjective" or "cathead#Verb"
+        line = re.sub(r'\b\w+#\w+\b', '', line)
+
+        # Strip date fragments like "ca. 1480" "from 1570s"
+        line = re.sub(r'\b(ca\.|from|since|defdate)[\s\d,\.]+s?\b', '', line, flags=re.IGNORECASE)
+
+        # Strip senseid label fragments at start of definition
+        # e.g. "unconstrained, socially social Unconstrained"
+        # These appear as "short phrase + single word + Capital word"
+        line = re.sub(r'^[a-z][^.!?]{0,60}?\s+[a-z]+\s+(?=[A-Z])', '', line)
+
+        # Fix &emsp; explicitly before unescape catches it
+        line = line.replace('&emsp;', ' ').replace('&nbsp;', ' ')
+
+        # ---------------------------------------------------------- #
+        # Per-token normalization and unknown char filtering
+        # ---------------------------------------------------------- #
+
+        line = normalize_diacritics(line)
+
+        # ascii_only: additionally drop math/Greek tokens
+        if ascii_only:
+            tokens = line.split()
+            line = ' '.join(t for t in tokens if not re.search(r'[^\x00-\x7F]', t))
+
+        # ---------------------------------------------------------- #
+        # Remove known junk fragments
+        # ---------------------------------------------------------- #
 
         junk_markers = (
             'quote-book', 'quote-web', 'quote-journal', 'quote-text',
             'cite-book', 'cite-web', 'isbn', 'retrieved from',
-            'page ', 'chapter ',
         )
         if any(j in line.lower() for j in junk_markers):
             return ''
+
+        # ---------------------------------------------------------- #
+        # Cleanup spacing + final sanity
+        # ---------------------------------------------------------- #
+
+        # Cleanup dangling punctuation
+        line = re.sub(r'\s+([,.;:])', r'\1', line)
+        line = re.sub(r'([,.;:]){2,}', r'\1', line)
+        line = re.sub(r'\(\s*[,.;:]?\s*\)', ' ', line)
+        line = re.sub(r'\s+', ' ', line).strip()
+
+        # Remove leading/trailing punctuation junk
+        line = line.strip(' ,;:-')
+
         if len(line) < 4:
             return ''
         if re.match(r'^[^a-zA-Z]*$', line):
             return ''
 
         return line
+
+    def is_clean_entry(text: str) -> bool:
+        if re.search(r'\b(lb|ux|syn|ant|cot|senseid|sid)\b', text):
+            return False
+        if '{{' in text or '}}' in text:
+            return False
+        if text.count('|') > 2:
+            return False
+        if not ascii_only:
+            letters = len(re.findall(r'[a-zA-Z]', text))
+            non_ascii = len(re.findall(r'[^\x00-\x7F]', text))
+            if letters > 0 and non_ascii / (letters + 1) > 0.6:
+                return False
+        return True
 
     def section_header(line: str):
         m = re.match(r'^(={2,5})\s*(.+?)\s*\1$', line.strip())
@@ -1118,21 +1383,14 @@ def fetch_wiktionary(
         eng_end = len(lines)
 
         for i, ln in enumerate(lines):
-
             s = ln.strip()
-
-            # Find ==English==
             if re.match(r'^==\s*English\s*==$', s, re.IGNORECASE):
                 eng_start = i
                 continue
-
-            # Find next language section
             if eng_start is not None:
-
                 if (
-                        re.match(r'^==[^=].*==$', s)
-                        and
-                        not re.match(r'^==\s*English\s*==$', s, re.IGNORECASE)
+                    re.match(r'^==[^=].*==$', s)
+                    and not re.match(r'^==\s*English\s*==$', s, re.IGNORECASE)
                 ):
                     eng_end = i
                     break
@@ -1140,7 +1398,10 @@ def fetch_wiktionary(
         scope = lines[eng_start:eng_end] if eng_start is not None else lines
 
         # Extract syllabification
-        syllable_title = title
+        syllable_title = normalize_diacritics(title)
+
+        if not syllable_title:
+            print(f"  WARNING: empty title, raw was: {repr(title)}")
 
         for ln in scope:
             m = re.search(r'\{\{hyph(?:enation)?\s*\|[^}]*\}\}', ln, re.IGNORECASE)
@@ -1151,7 +1412,7 @@ def fetch_wiktionary(
                     parts = parts[1:]
                 syllables = [p.strip() for p in parts if p.strip()]
                 if syllables:
-                    syllable_title = '\u00b7'.join(syllables)
+                    syllable_title = normalize_diacritics('\u00b7'.join(syllables))
                     break
 
         # Parse POS sections
@@ -1182,7 +1443,7 @@ def fetch_wiktionary(
 
             if header is not None:
                 hl = re.sub(r'\s+', ' ', header.lower()).strip()
-                hl_clean = re.sub(r'\s*\d+$', '', hl)  # strip "noun 2" -> "noun"
+                hl_clean = re.sub(r'\s*\d+$', '', hl)
 
                 flush_defn()
 
@@ -1205,7 +1466,6 @@ def fetch_wiktionary(
                     in_skip = False
                     continue
 
-                # Unknown section — skip it
                 flush_defn()
                 flush_pos()
                 in_skip = True
@@ -1217,7 +1477,7 @@ def fetch_wiktionary(
             if ln.startswith('# ') and not ln.startswith('## '):
                 flush_defn()
                 clean = clean_line(ln[2:])
-                if clean:
+                if clean and len(clean) <= 400:
                     current_defn = clean
 
             elif ln.startswith('#: ') or ln.startswith('#* '):
@@ -1230,17 +1490,54 @@ def fetch_wiktionary(
                 ):
                     continue
                 clean = clean_line(ln[3:])
-                if (
-                    clean and
-                    len(clean) > 8 and
-                    '{{' not in clean and
-                    '}}' not in clean and
-                    not clean.startswith('quote-')
-                ):
+                if not clean or len(clean) <= 8:
+                    continue
+                if '{{' in clean or '}}' in clean:
+                    continue
+                if clean.startswith('quote-'):
+                    continue
+                if re.match(r'^\d{4},', clean):
+                    continue
+                if re.search(r'\b(p\.|pp\.|vol\.|ibid|op\.cit)\b', clean, re.IGNORECASE):
+                    continue
+                if len(clean) <= 400:
+                    # Reject weak synonym-only fragments
+                    word_count = len(clean.split())
+
+                    if (
+                            word_count <= 4 and
+                            clean.lower() == clean and
+                            not clean.endswith('.')
+                    ):
+                        continue
+
                     current_examples.append(clean)
 
         flush_defn()
         flush_pos()
+
+        # Merge duplicate POS sections
+        merged = {}
+        for pos, defs in sections:
+            merged.setdefault(pos, []).extend(defs)
+        sections = list(merged.items())
+
+        # Cascade filter: drop non-ASCII lines, empty POS, empty entry
+        def line_is_ascii_clean(text: str) -> bool:
+            return not bool(re.search(r'[^\x00-\x7F]', text))
+
+        if ascii_only:
+            clean_sections = []
+            for pos_label, defs in sections:
+                clean_defs = []
+                for defn, examples in defs:
+                    if not line_is_ascii_clean(defn):
+                        continue
+                    clean_examples = [e for e in examples if line_is_ascii_clean(e)]
+                    clean_defs.append((defn, clean_examples))
+                if clean_defs:
+                    clean_sections.append((pos_label, clean_defs))
+            sections = clean_sections
 
         total_defs = sum(len(d) for _, d in sections)
         if total_defs > 20:
@@ -1256,16 +1553,25 @@ def fetch_wiktionary(
             blocks.append(pos_label)
             blocks.append('')
             for idx, (defn, examples) in enumerate(defs, 1):
-                if examples:
-                    defn_line = defn.rstrip('.:') + ':'
-                else:
-                    defn_line = defn
+                defn_line = defn.rstrip('.:') + ':' if examples else defn
                 blocks.append(f'{idx}. {defn_line}')
                 for ex in examples:
-                    ex_clean = ex.strip('"\'')
-                    blocks.append(f'"{ex_clean}"')
+                    clean_ex = ex.strip(chr(34) + chr(39))
+
+                    # Skip garbage examples
+                    if (
+                            '#' in clean_ex or
+                            len(clean_ex.split()) <= 1
+                    ):
+                        continue
+
+                    blocks.append(f'"{clean_ex}"')
 
         return '\n'.join(blocks)
+
+    # ------------------------------------------------------------------ #
+    # Main loop
+    # ------------------------------------------------------------------ #
 
     chunks = []
     total = 0
@@ -1297,14 +1603,19 @@ def fetch_wiktionary(
 
                         has_english = re.search(r'==\s*English\s*==', raw_text) is not None
                         has_pos = re.search(
-                            r'===?\s*(Noun|Verb|Adjective|Adverb|Pronoun|Preposition|Conjunction|Interjection|Determiner|Article)\s*===?',
+                            r'===?\s*(Noun|Verb|Adjective|Adverb|Pronoun|Preposition'
+                            r'|Conjunction|Interjection|Determiner|Article)\s*===?',
                             raw_text,
                             re.IGNORECASE
                         ) is not None
 
+                        if title.startswith('Reconstruction:'):
+                            skipped += 1
+                            continue
+
                         if has_english and has_pos:
                             entry = parse_entry(title, raw_text)
-                            if entry and len(entry) > 80:
+                            if entry and len(entry) > 80 and is_clean_entry(entry):
                                 chunks.append(entry)
                                 total += len(entry)
                                 entries += 1
@@ -1331,20 +1642,15 @@ def fetch_wiktionary(
                 continue
 
             if '<title>' in raw_line and '</title>' in raw_line:
-
-                title = re.sub(
-                    r'.*<title>(.*?)</title>.*',
-                    r'\1',
-                    raw_line
-                ).strip()
-
-                # Skip non-English / foreign-script titles
-                if not re.match(r"^[A-Za-z0-9 _'\-]+$", title):
+                title = re.sub(r'.*<title>(.*?)</title>.*', r'\1', raw_line).strip()
+                title = normalize_diacritics(title)
+                if ascii_only:
+                    if not re.match(r"^[A-Za-z0-9 _'\-]+$", title):
+                        title = ''
+                elif not re.match(r"^[\w\s'\-\.]+$", title, re.UNICODE):
                     title = ''
-
-                if ':' in title and not title[0].isupper():
+                if title and ':' in title and not title[0].isupper():
                     title = ''
-
                 continue
 
             if '<text' in raw_line:
