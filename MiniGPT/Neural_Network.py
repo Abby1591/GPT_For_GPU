@@ -817,38 +817,6 @@ _TOOL_MAX_RESULT = 256    # characters; tune down if context window is tight
 # Pass your char2idx through ensure_tool_vocab() before building the model.
 TOOL_CHARS: frozenset = frozenset("[]:|")
 
-
-def ensure_tool_vocab(char2idx: Dict[str, int], silent: bool = False) -> Dict[str, int]:
-    """
-    Guarantee all tool delimiter characters are in the vocabulary.
-
-    Call this after building char2idx from your corpus, before constructing
-    the NeuralNetwork.  Missing chars are appended so existing indices stay
-    stable.
-
-    :param silent: Suppress the print when chars are added. Pass ``True``
-        during training -- model.py calls this automatically when tool
-        patterns are detected in the corpus.
-
-    Example
-    -------
-        chars    = sorted(set(corpus_text))
-        char2idx = {c: i for i, c in enumerate(chars)}
-        char2idx = ensure_tool_vocab(char2idx)   # adds [ ] : | if absent
-        nn = NeuralNetwork(vocab_size=len(char2idx), ...)
-    """
-    missing = TOOL_CHARS - set(char2idx)
-    if missing:
-        next_idx = max(char2idx.values()) + 1
-        for ch in sorted(missing):
-            char2idx[ch] = next_idx
-            next_idx += 1
-        if not silent:
-            print(f"[tool vocab] Added {len(missing)} missing chars: "
-                  f"{sorted(missing)}  (new size: {len(char2idx)})")
-    return char2idx
-
-
 def _encode_tool_result(result: str, char2idx: Dict[str, int]) -> List[int]:
     """
     Encode a [RESULT:...] string to token indices, substituting '?' for

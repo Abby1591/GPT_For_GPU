@@ -61,7 +61,7 @@ import urllib.request
 import gzip
 import bz2
 from collections import Counter, deque
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Dict
 
 try:
     import requests
@@ -2009,7 +2009,38 @@ def fetch_tool_training(
     :param weights: ``{tool_name: fraction}`` override.  Defaults to
         ``TOOL_WEIGHTS`` from ``tool_definitions``.  Must sum to ~1.0.
     """
-    from Neural_Network import ensure_tool_vocab  # type: ignore
+
+    TOOL_CHARS: frozenset = frozenset("[]:|")
+
+    def ensure_tool_vocab(char2idx: Dict[str, int], silent: bool = False) -> Dict[str, int]:
+        """
+        Guarantee all tool delimiter characters are in the vocabulary.
+
+        Call this after building char2idx from your corpus, before constructing
+        the NeuralNetwork.  Missing chars are appended so existing indices stay
+        stable.
+
+        :param silent: Suppress the print when chars are added. Pass ``True``
+            during training -- model.py calls this automatically when tool
+            patterns are detected in the corpus.
+
+        Example
+        -------
+            chars    = sorted(set(corpus_text))
+            char2idx = {c: i for i, c in enumerate(chars)}
+            char2idx = ensure_tool_vocab(char2idx)   # adds [ ] : | if absent
+            nn = NeuralNetwork(vocab_size=len(char2idx), ...)
+        """
+        missing = TOOL_CHARS - set(char2idx)
+        if missing:
+            next_idx = max(char2idx.values()) + 1
+            for ch in sorted(missing):
+                char2idx[ch] = next_idx
+                next_idx += 1
+            if not silent:
+                print(f"[tool vocab] Added {len(missing)} missing chars: "
+                      f"{sorted(missing)}  (new size: {len(char2idx)})")
+        return char2idx
 
     print(f"\n[8/8] Tool training  (target {target_chars:,} chars, "
           f"live_search={'yes' if live_search else 'no'})")
