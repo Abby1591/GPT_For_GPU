@@ -1023,6 +1023,7 @@ def fetch_wiktionary(
     import gc
     import html
     from typing import Optional
+    import mwparserfromhell
 
     print(f'\n[6/8] Wiktionary Dump  (target {target_chars:,} chars)')
 
@@ -1047,7 +1048,9 @@ def fetch_wiktionary(
 
     POS_SECTIONS = {
         'noun', 'verb', 'adjective', 'adverb', 'pronoun', 'preposition',
-        'conjunction', 'interjection', 'determiner', 'article',
+        'conjunction', 'interjection', 'determiner', 'article','phrase',
+        'proper noun','abbreviation','initialism','numeral','symbol',
+        'prefix','suffix','idiom','proverb','particle',
     }
 
     BAD_SENSE_LABELS = (
@@ -1077,6 +1080,24 @@ def fetch_wiktionary(
         'quote-book', 'quote-web', 'quote-journal', 'quote-text',
         'cite-book', 'cite-web', 'isbn', 'retrieved from',
     )
+
+    # Templates whose first unnamed param is the display text
+    DISPLAY_TEMPLATES = {
+        'w', 'l', 'm', 'mention', 'taxlink', 'vern', 'vernacular',
+        'link', 'pedlink',
+    }
+
+    # Templates to strip entirely (no useful text)
+    DROP_TEMPLATES = {
+        'ipa', 'audio', 'rhymes', 'homophones', 'hyphenation', 'hyph',
+        'sense', 'senseid', 'sid', 'rfdef', 'rfquote', 'rfc', 'rfd',
+        'attention', 'wikipedia', 'wikispecies', 'commons',
+        'quote-book', 'quote-web', 'quote-journal', 'quote-text',
+        'cite-book', 'cite-web', 'rq', 'seeCites',
+    }
+
+    # Label/context templates — emit their label args as plain text
+    LABEL_TEMPLATES = {'lb', 'label', 'context', 'qualifier', 'q', 'qual', 'gloss'}
 
     DIACRITIC_MAP = {
         'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a','æ':'ae',
@@ -1161,58 +1182,116 @@ def fetch_wiktionary(
         return ' '.join(result) if result else text
 
     # ------------------------------------------------------------------ #
-    # Line cleaning
+    # mwparserfromhell-based wikitext cleaner
+    # ------------------------------------------------------------------ #
+
+    def resolve_template(tpl) -> str:
+        """Convert a single mwparserfromhell Template to plain text."""
+        name = tpl.name.strip().lower()
+
+        # Drop entirely
+        if name in DROP_TEMPLATES or name.startswith('quote-') or name.startswith('cite-'):
+            return ''
+
+        # Display: use last unnamed param as display text
+        if name in DISPLAY_TEMPLATES:
+            params = [p for p in tpl.params if not p.showkey]
+            if len(params) >= 2:
+                return str(params[-1].value).strip()
+            if len(params) == 1:
+                return str(params[0].value).strip()
+            return ''
+
+        # given name / surname
+        if name in ('given name', 'surname'):
+            return name
+
+        # Label templates — emit non-language label args
+        if name in LABEL_TEMPLATES:
+            labels = []
+            for p in tpl.params:
+                if p.showkey:
+                    continue
+                v = str(p.value).strip()
+                if re.match(r'^[a-z]{2,3}$', v):  # skip lang codes
+                    continue
+                if re.match(r'^Q\d+$', v):  # skip Wikidata IDs
+                    continue
+                if len(v) >= 2:
+                    labels.append(v)
+            return ' '.join(labels)
+
+        # Taxlink: first unnamed param is species name
+        if name == 'taxlink':
+            params = [p for p in tpl.params if not p.showkey]
+            if params:
+                return str(params[0].value).strip()
+            return ''
+
+        # Non-gloss definition — drop
+        if 'non-gloss' in name:
+            return ''
+
+        # Default: collect unnamed params that look like real words
+        useful = []
+        for p in tpl.params:
+            if p.showkey:
+                continue
+            v = str(p.value).strip()
+            if re.match(r'^[a-z]{1,3}$', v):
+                continue
+            if re.match(r'^Q\d+$', v):
+                continue
+            if len(v) >= 2:
+                useful.append(v)
+        return ' '.join(useful[:2])
+
+    def wikitext_to_plain(raw: str) -> str:
+        """Full wikitext → clean plain text using mwparserfromhell."""
+        try:
+            wikicode = mwparserfromhell.parse(raw)
+        except Exception:
+            return raw  # fallback
+
+        # Replace each template with its resolved text
+        for tpl in wikicode.filter_templates(recursive=True):
+            try:
+                replacement = resolve_template(tpl)
+                wikicode.replace(tpl, replacement)
+            except Exception:
+                try:
+                    wikicode.replace(tpl, '')
+                except Exception:
+                    pass
+
+        # Strip wikilinks: keep display text
+        for link in wikicode.filter_wikilinks():
+            try:
+                text = str(link.text) if link.text else str(link.title)
+                # Drop file/image links
+                title_str = str(link.title).strip()
+                if re.match(r'^(File|Image|Category):', title_str, re.IGNORECASE):
+                    wikicode.replace(link, '')
+                else:
+                    wikicode.replace(link, text.strip())
+            except Exception:
+                pass
+
+        text = wikicode.strip_code()
+        text = html.unescape(text)
+        return text
+
+    # ------------------------------------------------------------------ #
+    # Line-level post-cleaning (after mwparserfromhell)
     # ------------------------------------------------------------------ #
 
     def clean_line(line: str) -> str:
-
-        def expand_templates(text: str) -> str:
-            def expand_template(match: re.Match) -> str:
-                inner = match.group(1).strip()
-                parts = [p.strip() for p in inner.split('|')]
-                if not parts:
-                    return ' '
-                name = parts[0].lower()
-                if name == 'w' and len(parts) >= 2:
-                    return ' ' + parts[-1] + ' '
-                if name == 'taxlink' and len(parts) >= 2:
-                    return ' ' + parts[1] + ' '
-                if name in ('vern', 'vernacular') and len(parts) >= 2:
-                    return ' ' + parts[1] + ' '
-                if name == 'given name':
-                    return ' given name '
-                if name == 'surname':
-                    return ' surname '
-                if name in ('gloss', 'lb', 'label', 'qualifier', 'q', 'qual', 'context'):
-                    return ' ' + ' '.join(parts[1:]) + ' '
-                useful = [
-                    p for p in parts[1:]
-                    if '=' not in p
-                    and not re.match(r'^[a-z]{1,3}$', p)
-                    and not re.match(r'^Q\d+$', p)
-                    and len(p) >= 2
-                ]
-                return (' ' + ' '.join(useful[:2]) + ' ') if useful else ' '
-
-            for _ in range(20):
-                expanded = re.sub(r'\{\{([^{}]*)\}\}', expand_template, text)
-                if expanded == text:
-                    break
-                text = expanded
-            return text
-
         line = html.unescape(line)
         stripped = line.strip()
         if not stripped:
             return ''
 
-        # Remove references, comments, bare URLs
-        line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE | re.DOTALL)
-        line = re.sub(r'<!--.*?-->', ' ', line, flags=re.DOTALL)
-        line = re.sub(r'https?://\S+', ' ', line)
-        line = re.sub(r'\[[^\]]*http[^\]]*\]', ' ', line)
-
-        # Skip lines that are phonetic / media metadata
+        # Skip phonetic/media lines before parsing
         if re.match(r'^\*?\s*IPA', stripped) or '{{IPA' in stripped:
             return ''
         if re.match(r'^\*?\s*(audio|File|Image|thumb)', stripped, re.IGNORECASE):
@@ -1224,44 +1303,35 @@ def fetch_wiktionary(
         if 'non-gloss' in stripped.lower():
             return ''
 
-        # Expand templates
-        line = expand_templates(line)
+        # Use mwparserfromhell for template/link resolution
+        line = wikitext_to_plain(line)
 
-        # Remove wiki formatting
+        # Remove residual refs, comments, URLs
+        line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE | re.DOTALL)
+        line = re.sub(r'<!--.*?-->', ' ', line, flags=re.DOTALL)
+        line = re.sub(r'https?://\S+', ' ', line)
+        line = re.sub(r'\[[^\]]*http[^\]]*\]', ' ', line)
+
+        # Remove residual wiki markup
         line = re.sub(r"'{2,}", '', line)
-        line = re.sub(r'\[\[(File|Image):[^\]]*\]\]', ' ', line, flags=re.IGNORECASE)
-        line = re.sub(r'\[\[[^\]|]+\|([^\]]+)\]\]', r'\1', line)   # [[Article|Display]]
-        line = re.sub(r'\[\[[A-Za-z]+:([^\]]+)\]\]', r'\1', line)  # [[Namespace:Article]]
-        line = re.sub(r'\[\[([^\]]+)\]\]', r'\1', line)             # [[Article]]
+        line = re.sub(r'<[^>]+>', ' ', line)
+        line = re.sub(r'\|', ' ', line)
 
-        # Strip leftover Wiktionary metadata tokens
-        line = re.sub(r'(?<!\w)(senseid|sid|lb|gloss)(?!\w)\s*', ' ', line, flags=re.IGNORECASE)
-        line = re.sub(r'\b(?:ux|uxi|uxa|lb|syn|ant|cot|hyper|hyponyms)\s+[a-z]{2,3}\b', ' ', line, flags=re.IGNORECASE)
-        line = re.sub(r'(?<![A-Za-z])(?:en|fr|de|es|la|it|pt)(?![A-Za-z])', ' ', line)
-        line = re.sub(r'\b(?:rfdef|rfquote|qualifier|qual|context|topics|w|l|m|mention)\b', ' ', line, flags=re.IGNORECASE)
+        # Leftover stray template artifacts
+        line = re.sub(r'\{\{[^}]*\}\}', ' ', line)
+        line = re.sub(r'\[\[[^\]]*\]\]', ' ', line)
+
         line = re.sub(r'\bQ\d+\b', ' ', line)
         line = re.sub(r'\b[a-zA-Z_]+\s*=\s*\S+', ' ', line)
         line = re.sub(r'\(\s*\)', ' ', line)
-        line = re.sub(r'<[^>]+>', ' ', line)
-        line = re.sub(r'\|', ' ', line)
         line = re.sub(r'\bcontrast\s+([A-Za-z])', r'contrast: \1', line)
         line = re.sub(r'\bsee\s+([A-Z])', r'see: \1', line)
-
-        line = re.sub(r'^(?:[a-z][^A-Z.!?]{0,40}?\s){1,3}(?=[A-Z])', '', line)
         line = re.sub(r':\s*(?:from|to|into|onto|upon)\s*$', '', line)
         line = re.sub(r"([\w']+(?:\s+[\w']+){0,2})\s+\1", r'\1', line, flags=re.IGNORECASE)
-        line = re.sub(
-            r'^(by extension|figurative|computing|dated|obsolete|archaic|informal|'
-            r'transitive|intransitive|preceded by|with or possessive frequently '
-            r'figurative especially disparaging)\s+',
-            '', line,
-        )
-        line = re.sub(r'^(?:[a-z][^A-Z.!?]{0,40}?\s){1,3}(?=[A-Z])', '', line)
         line = re.sub(r'\b\w+#\w+\b', '', line)
         line = re.sub(r'\b(ca\.|from|since|defdate)[\s\d,\.]+s?\b', '', line, flags=re.IGNORECASE)
         line = re.sub(r'\b\d+(?:st|nd|rd|th)\s+c\.?(?:\s+\d+)?\b', '', line, flags=re.IGNORECASE)
         line = re.sub(r'_\s*', ' ', line)
-        line = re.sub(r'^[a-z][^.!?]{0,60}?\s+[a-z]+\s+(?=[A-Z])', '', line)
         line = line.replace('&emsp;', ' ').replace('&nbsp;', ' ')
 
         line = normalize_diacritics(line)
@@ -1290,15 +1360,16 @@ def fetch_wiktionary(
     # ------------------------------------------------------------------ #
 
     def entry_looks_clean(text: str) -> bool:
-        if re.search(r'\b(lb|ux|syn|ant|cot|senseid|sid)\b', text):
-            return False
+        # Any surviving template braces = incomplete parsing
         if '{{' in text or '}}' in text:
             return False
+        # Stray pipes suggest unparsed template remnants
         if text.count('|') > 2:
             return False
         if not ascii_only:
-            letters = len(re.findall(r'[a-zA-Z]', text))
-            non_ascii = len(re.findall(r'[^\x00-\x7F]', text))
+            stripped = text.replace('\u00b7', '')  # ignore syllable dots
+            letters = len(re.findall(r'[a-zA-Z]', stripped))
+            non_ascii = len(re.findall(r'[^\x00-\x7F]', stripped))
             if letters > 0 and non_ascii / (letters + 1) > 0.6:
                 return False
         return True
@@ -1409,7 +1480,7 @@ def fetch_wiktionary(
                     flush_definition()
                     clean = clean_line(ln[2:])
                     if clean:
-                        clean = LEADING_SENSE_LABELS.sub('', clean)
+                        clean = LEADING_SENSE_LABELS.sub('', clean).strip()
                     if clean and 3 <= len(clean.split()) and len(clean) <= 400:
                         current_defn = clean
                     continue
@@ -1462,7 +1533,7 @@ def fetch_wiktionary(
         sections = parse_pos_sections(scope)
 
         total_defs = sum(len(defs) for _, defs in sections)
-        if not sections or total_defs > 20:
+        if not sections or total_defs == 0:
             return ''
 
         blocks = [display_title]
@@ -1539,7 +1610,7 @@ def fetch_wiktionary(
                             entries_skipped += 1
                         elif is_english and has_pos:
                             entry = render_entry(title, raw_text)
-                            if entry and len(entry) > 80:
+                            if entry and len(entry) > 20:
                                 chunks.append(entry)
                                 total_chars += len(entry)
                                 entries_kept += 1
