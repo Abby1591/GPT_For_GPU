@@ -63,6 +63,7 @@ import bz2
 import gc
 import html
 import mwparserfromhell
+import hashlib
 
 from collections import Counter, deque
 from typing import Iterator, List, Optional, Dict
@@ -348,221 +349,6 @@ WIKIQUOTE_PAGES = [
     "Justice", "Freedom", "Knowledge", "Love", "Art", "Revolution",
     "Democracy", "Equality",
 ]
-
-
-# =============================================================================
-#  Reddit phase constants and helpers
-# =============================================================================
-
-_REDDIT_MIN_SCORE_COMMENT    = 2
-_REDDIT_MIN_SCORE_SUBMISSION = 2
-_REDDIT_MIN_LEN  = 60
-_REDDIT_MAX_LEN  = 3000
-_REDDIT_DEDUP_CACHE_SIZE = 200_000
-
-_REDDIT_GOOD_SUBS: set[str] = {
-    # Programming / CS / ML
-    "programming", "compsci", "softwareengineering", "learnprogramming",
-    "Python", "javascript", "cpp", "rust", "golang", "java", "haskell",
-    "MachineLearning", "learnmachinelearning", "deeplearning", "artificial",
-    "datascience", "algorithms", "computerscience", "coding", "webdev",
-    "gamedev", "devops", "sysadmin", "linux", "opensource", "commandline",
-    # Math / Science
-    "math", "askmath", "statistics", "physics", "chemistry", "biology",
-    "AskScience", "science", "neuroscience", "genetics",
-    # Conversation / Q&A
-    "AskReddit", "explainlikeimfive", "NoStupidQuestions", "answers",
-    "AskHistorians", "TrueReddit", "DepthHub", "changemyview",
-    "philosophy", "Philosophy", "Ethics",
-    # Left / politics / social justice
-    "socialism", "communism", "anarchism", "Marxism", "labour",
-    "politics", "PoliticalDiscussion", "progressive", "SocialJustice",
-    "feminism", "GenderCritical", "lgbt", "ainbow", "trans", "nonbinary",
-    "BlackLives", "antiracism", "labor",
-    # Culture / knowledge
-    "history", "Economics", "books", "writing", "literature", "worldnews",
-    "todayilearned", "Showerthoughts", "technology", "Futurology",
-}
-
-_BOT_PHRASES = re.compile(
-    r"(i am a bot|this action was performed automatically|"
-    r"beep boop|please contact the moderators|"
-    r"\^this|AutoModerator|I'm a bot)",
-    re.IGNORECASE,
-)
-_REPEATED_CHARS  = re.compile(r"(.)\1{6,}")
-_ALL_CAPS_RATIO  = 0.60
-
-def _reddit_safe_load(line: str) -> Optional[dict]:
-    try:
-        return json.loads(line)
-    except Exception:
-        return None
-
-
-def _reddit_clean(text: str) -> str:
-    text = re.sub(r"http\S+", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.encode("utf-8", "ignore").decode("utf-8").strip()
-
-
-def _reddit_is_quality(text: str) -> bool:
-    if not (_REDDIT_MIN_LEN <= len(text) <= _REDDIT_MAX_LEN):
-        return False
-    if len(text.split()) < 12:
-        return False
-    if text.count(" ") < 10:
-        return False
-    if _BOT_PHRASES.search(text):
-        return False
-    if _REPEATED_CHARS.search(text):
-        return False
-    letters = [c for c in text if c.isalpha()]
-    if letters and sum(c.isupper() for c in letters) / len(letters) > _ALL_CAPS_RATIO:
-        return False
-    return True
-
-
-def _reddit_fingerprint(text: str) -> int:
-    return hash(re.sub(r"\s+", " ", text.lower()))
-
-
-def _stream_reddit_comments(path: str, target: int) -> Iterator[str]:
-    kept = 0
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw in fh:
-            if kept >= target:
-                break
-            obj = _reddit_safe_load(raw)
-            if not obj:
-                continue
-            body  = obj.get("body", "")
-            sub   = obj.get("subreddit", "")
-            score = obj.get("score", 0)
-            if body in ("", "[deleted]", "[removed]"):
-                continue
-            if score < _REDDIT_MIN_SCORE_COMMENT:
-                continue
-            if sub not in _REDDIT_GOOD_SUBS and score < 6:
-                continue
-            text = _reddit_clean(body)
-            if _reddit_is_quality(text):
-                kept += 1
-                yield text
-
-
-def _stream_reddit_submissions(path: str, target: int) -> Iterator[str]:
-    kept = 0
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw in fh:
-            if kept >= target:
-                break
-            obj = _reddit_safe_load(raw)
-            if not obj:
-                continue
-            title = obj.get("title", "")
-            body  = obj.get("selftext") or obj.get("body", "")
-            sub   = obj.get("subreddit", "")
-            score = obj.get("score", 0)
-            if not body or body in ("[deleted]", "[removed]"):
-                continue
-            if score < _REDDIT_MIN_SCORE_SUBMISSION:
-                continue
-            if sub not in _REDDIT_GOOD_SUBS and score < 4:
-                continue
-            text = _reddit_clean(f"{title}\n{body}" if title else body)
-            if _reddit_is_quality(text):
-                kept += 1
-                yield text
-
-
-class _DedupWriter:
-    def __init__(self, fh, cache_size: int = _REDDIT_DEDUP_CACHE_SIZE):
-        self._fh    = fh
-        self._seen  = set()
-        self._queue = deque()
-        self._cap   = cache_size
-        self.written = 0
-
-    def try_write(self, text: str) -> bool:
-        fp = _reddit_fingerprint(text)
-        if fp in self._seen:
-            return False
-        self._seen.add(fp)
-        self._queue.append(fp)
-        if len(self._queue) > self._cap:
-            self._seen.discard(self._queue.popleft())
-        self._fh.write(text + "\n")
-        self.written += 1
-        return True
-
-
-def _build_reddit_dataset(
-    comments_file:    str,
-    submissions_file: str,
-    output_file:      str,
-    target_lines:     int,
-    comment_ratio:    float = 0.80,
-    no_submissions:   bool  = False,
-    resume:           bool  = False,
-) -> int:
-    target_comments    = int(target_lines * comment_ratio)
-    target_submissions = 0 if no_submissions else (target_lines - target_comments)
-
-    already = 0
-    if resume and os.path.exists(output_file):
-        with open(output_file, "r", encoding="utf-8") as f:
-            already = sum(1 for _ in f)
-        if already >= target_lines:
-            print(f"  [reddit] Already at {already:,} lines — nothing to do.")
-            return already
-        print(f"  [reddit] Resuming from {already:,} lines.")
-        target_comments    = max(0, target_comments    - already)
-        target_submissions = max(0, target_submissions - already)
-
-    mode = "a" if (resume and already > 0) else "w"
-
-    if _HAS_TQDM:
-        bar = tqdm(total=target_lines - already, unit="lines", desc="  reddit")
-    else:
-        bar = None
-
-    with open(output_file, mode, encoding="utf-8") as out:
-        writer = _DedupWriter(out)
-
-        if target_comments > 0:
-            if not os.path.exists(comments_file):
-                print(f"  [reddit] WARNING: {comments_file} not found — skipping comments.")
-            else:
-                for text in _stream_reddit_comments(comments_file, target_comments):
-                    if writer.try_write(text):
-                        if bar:
-                            bar.update(1)
-                        elif writer.written % 10_000 == 0 and writer.written > 0:
-                            print(f"  [reddit]   kept {writer.written:,}")
-
-        comments_written = writer.written
-
-        if target_submissions > 0:
-            if not os.path.exists(submissions_file):
-                print(f"  [reddit] WARNING: {submissions_file} not found — skipping submissions.")
-            else:
-                for text in _stream_reddit_submissions(submissions_file, target_submissions):
-                    if writer.try_write(text):
-                        if bar:
-                            bar.update(1)
-                        elif writer.written % 10_000 == 0:
-                            print(f"  [reddit]   kept {writer.written:,}")
-
-    if bar:
-        bar.close()
-
-    total = already + writer.written
-    print(f"  [reddit] Written: {writer.written:,}  "
-          f"(comments: {comments_written:,}  "
-          f"submissions: {writer.written - comments_written:,})")
-    return total
-
 
 # =============================================================================
 #  HTTP helpers
@@ -965,40 +751,209 @@ def fetch_reddit(
     target_chars:     int,
     comments_file:    str  = "Dumps/comments/RC_2016-01.jsonl",
     submissions_file: str  = "Dumps/submissions/RS_2016-01.jsonl",
-    reddit_output:    str  = "reddit_dataset.txt",
+    reddit_output:    str  = "Dumps/reddit_dataset.txt",
     no_submissions:   bool = False,
     resume:           bool = False,
     min_score:        int  = 4,
-) -> List[str]:
+) -> list[str]:
     print(f"\n[7/8] Reddit  (target {target_chars:,} chars)")
 
-    have_comments    = os.path.exists(comments_file)
-    have_submissions = os.path.exists(submissions_file)
-    if not have_comments and not have_submissions:
+    # ------------------------------------------------------------------ #
+    # Path Fix                                                             #
+    # ------------------------------------------------------------------ #
+    base = os.path.dirname(os.path.abspath(__file__))
+    def _rel(p): return p if os.path.isabs(p) else os.path.join(base, p)
+    comments_file    = _rel(comments_file)
+    submissions_file = _rel(submissions_file)
+    reddit_output    = _rel(reddit_output)
+
+    if not os.path.exists(comments_file) and not os.path.exists(submissions_file):
         print(f"  No dump files found — skipping.")
         print(f"  Expected: {comments_file}  /  {submissions_file}")
         return []
 
-    avg_chars_per_line = 200
-    target_lines = max(1000, target_chars // avg_chars_per_line)
+    # ------------------------------------------------------------------ #
+    # Constants                                                            #
+    # ------------------------------------------------------------------ #
+    MIN_SCORE_COMMENT    = min_score
+    MIN_SCORE_SUBMISSION = max(1, min_score - 1)
+    MIN_LEN, MAX_LEN     = 60, 3000
+    DEDUP_CACHE          = 200_000
+    COMMENT_RATIO        = 0.80          # 80% comments, 20% submissions
+    AVG_CHARS_PER_LINE   = 200           # rough estimate for target_lines
 
-    global _REDDIT_MIN_SCORE_COMMENT, _REDDIT_MIN_SCORE_SUBMISSION
-    _REDDIT_MIN_SCORE_COMMENT    = min_score
-    _REDDIT_MIN_SCORE_SUBMISSION = max(1, min_score - 1)
+    target_lines       = max(1000, target_chars // AVG_CHARS_PER_LINE)
+    target_comments    = int(target_lines * COMMENT_RATIO)
+    target_submissions = 0 if no_submissions else (target_lines - target_comments)
 
-    _build_reddit_dataset(
-        comments_file    = comments_file,
-        submissions_file = submissions_file,
-        output_file      = reddit_output,
-        target_lines     = target_lines,
-        no_submissions   = no_submissions,
-        resume           = resume,
+    # ------------------------------------------------------------------ #
+    # Allowed Subreddits                                                   #
+    # ------------------------------------------------------------------ #
+    GOOD_SUBS: set[str] = {
+        # Programming / CS / ML
+        "programming", "compsci", "softwareengineering", "learnprogramming",
+        "Python", "javascript", "cpp", "rust", "golang", "java", "haskell",
+        "MachineLearning", "learnmachinelearning", "deeplearning", "artificial",
+        "datascience", "algorithms", "computerscience", "coding", "webdev",
+        "gamedev", "devops", "sysadmin", "linux", "opensource", "commandline",
+        # Math / Science
+        "math", "askmath", "statistics", "physics", "chemistry", "biology",
+        "AskScience", "science", "neuroscience", "genetics",
+        # Conversation / Q&A
+        "AskReddit", "explainlikeimfive", "NoStupidQuestions", "answers",
+        "AskHistorians", "TrueReddit", "DepthHub", "changemyview",
+        "philosophy", "Philosophy", "Ethics",
+        # Left / Politics / Social Justice
+        "socialism", "communism", "anarchism", "Marxism", "labour",
+        "politics", "PoliticalDiscussion", "progressive", "SocialJustice",
+        "feminism", "GenderCritical", "lgbt", "ainbow", "trans", "nonbinary",
+        "BlackLives", "antiracism", "labor",
+        # Culture / Knowledge
+        "history", "Economics", "books", "writing", "literature", "worldnews",
+        "todayilearned", "Showerthoughts", "technology", "Futurology",
+    }
+
+    # ------------------------------------------------------------------ #
+    # Quality Filter Patterns                                              #
+    # ------------------------------------------------------------------ #
+    BOT_PHRASES = re.compile(
+        r"(i am a bot|this action was performed automatically|"
+        r"beep boop|please contact the moderators|"
+        r"\^this|AutoModerator|I'm a bot)",
+        re.IGNORECASE,
     )
+    REPEATED_CHARS = re.compile(r"(.)\1{6,}")
+    ALL_CAPS_RATIO = 0.60
 
-    if not os.path.exists(reddit_output):
-        print("  Output file not produced — skipping.")
-        return []
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+    def _clean(text: str) -> str:
+        text = re.sub(r"http\S+", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.encode("utf-8", "ignore").decode("utf-8").strip()
 
+    def _quality(text: str) -> bool:
+        if not (MIN_LEN <= len(text) <= MAX_LEN): return False
+        if len(text.split()) < 12:                return False
+        if text.count(" ") < 10:                  return False
+        if BOT_PHRASES.search(text):              return False
+        if REPEATED_CHARS.search(text):           return False
+        letters = [c for c in text if c.isalpha()]
+        if letters and sum(c.isupper() for c in letters) / len(letters) > ALL_CAPS_RATIO:
+            return False
+        return True
+
+    def _fingerprint(text: str) -> int:
+        return hash(re.sub(r"\s+", " ", text.lower()))
+
+    # ------------------------------------------------------------------ #
+    # Streaming Iterator                                                   #
+    # ------------------------------------------------------------------ #
+    def _stream_jsonl(path: str, target: int, is_submission: bool):
+        """Yield (text, total_skipped) for each accepted record in a JSONL dump."""
+        min_score_  = MIN_SCORE_SUBMISSION if is_submission else MIN_SCORE_COMMENT
+        boost_score = 4                    if is_submission else 6   # score needed to bypass GOOD_SUBS
+        kept = skipped = 0
+
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                if kept >= target:
+                    break
+                try:
+                    obj = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    skipped += 1
+                    continue
+
+                score = obj.get("score", 0)
+                sub   = obj.get("subreddit", "")
+
+                if is_submission:
+                    title = obj.get("title", "")
+                    body  = obj.get("selftext") or obj.get("body", "")
+                    if not body or body in ("[deleted]", "[removed]"):
+                        skipped += 1; continue
+                    raw_text = f"{title}\n{body}" if title else body
+                else:
+                    body = obj.get("body", "")
+                    if body in ("", "[deleted]", "[removed]"):
+                        skipped += 1; continue
+                    raw_text = body
+
+                if score < min_score_ or (sub not in GOOD_SUBS and score < boost_score):
+                    skipped += 1
+                    continue
+
+                text = _clean(raw_text)
+                if _quality(text):
+                    kept += 1
+                    yield text, skipped
+                else:
+                    skipped += 1
+
+    # ------------------------------------------------------------------ #
+    # Dedup Writer                                                         #
+    # ------------------------------------------------------------------ #
+    class _DedupWriter:
+        def __init__(self, fh):
+            self._fh     = fh
+            self._seen   = set()
+            self._queue  = deque()
+            self.written = 0
+
+        def try_write(self, text: str) -> bool:
+            fp = _fingerprint(text)
+            if fp in self._seen:
+                return False
+            self._seen.add(fp)
+            self._queue.append(fp)
+            if len(self._queue) > DEDUP_CACHE:
+                self._seen.discard(self._queue.popleft())
+            self._fh.write(text + "\n")
+            self.written += 1
+            return True
+
+    # ------------------------------------------------------------------ #
+    # Resume Logic                                                         #
+    # ------------------------------------------------------------------ #
+    already = 0
+    if resume and os.path.exists(reddit_output):
+        with open(reddit_output, "r", encoding="utf-8") as f:
+            already = sum(1 for _ in f)
+        if already >= target_lines:
+            print(f"  Already at {already:,} lines — nothing to do.")
+        else:
+            print(f"  Resuming from {already:,} lines.")
+            target_comments    = max(0, target_comments    - already)
+            target_submissions = max(0, target_submissions - already)
+
+    # ------------------------------------------------------------------ #
+    # Write                                                                #
+    # ------------------------------------------------------------------ #
+    mode = "a" if (resume and already > 0) else "w"
+    with open(reddit_output, mode, encoding="utf-8") as out:
+        writer = _DedupWriter(out)
+
+        if target_comments > 0 and os.path.exists(comments_file):
+            for text, skipped in _stream_jsonl(comments_file, target_comments, is_submission=False):
+                if writer.try_write(text) and writer.written % 10_000 == 0:
+                    print(f"  [{writer.written:,} comments | {skipped:,} skipped]")
+
+        comments_written = writer.written
+
+        if target_submissions > 0 and os.path.exists(submissions_file):
+            for text, skipped in _stream_jsonl(submissions_file, target_submissions, is_submission=True):
+                subs = writer.written - comments_written
+                if writer.try_write(text) and subs % 5_000 == 0 and subs > 0:
+                    print(f"  [{subs:,} submissions | {skipped:,} skipped]")
+
+    print(f"  Reddit done: {writer.written:,} chunks  "
+          f"(comments: {comments_written:,} | submissions: {writer.written - comments_written:,})")
+
+    # ------------------------------------------------------------------ #
+    # Read Back                                                            #
+    # ------------------------------------------------------------------ #
     chunks = []
     chars  = 0
     with open(reddit_output, "r", encoding="utf-8") as f:
@@ -1011,7 +966,7 @@ def fetch_reddit(
             if chars >= target_chars:
                 break
 
-    print(f"  Reddit done: {len(chunks):,} chunks  ({chars:,} chars)")
+    print(f"  Read back: {len(chunks):,} chunks  ({chars:,} chars)")
     return chunks
 
 def fetch_wiktionary(
@@ -1912,9 +1867,9 @@ def build_dataset(
     no_reddit:             bool = False,
     no_tools:              bool = False,
     phase:                 Optional[int] = None,
-    reddit_comments:       str  = "RC_2016-01.jsonl",
-    reddit_submissions:    str  = "RS_2016-01.jsonl",
-    reddit_output:         str  = "reddit_dataset.txt",
+    reddit_comments:       str = "Dumps/comments/RC_2016-01.jsonl",
+    reddit_submissions:    str = "Dumps/submissions/RS_2016-01.jsonl",
+    reddit_output:         str = "Dumps/reddit_dataset.txt",
     reddit_no_submissions: bool = False,
     reddit_resume:         bool = False,
     reddit_min_score:      int  = 4,
@@ -1924,15 +1879,17 @@ def build_dataset(
     tools_date_weight:     float = 0.15,
     tools_search_weight:   float = 0.35,
 ) -> None:
-    print("=" * 65)
-    print("miniGPT dataset builder  v5.0  (single-file edition)")
-    print(f"Target : {target_chars:,} chars  ->  {output_file}")
-    print("Sources: Gutenberg | Wikipedia (LGBTQ++Left+Diverse+Academic)")
-    print("         Simple Wikipedia | Wikiquote | Wikibooks | Wiktionary")
-    print("         Reddit | Tool training (phase 8)")
     phase_names = {1: "Gutenberg", 2: "Wikipedia", 3: "Simple Wikipedia",
                    4: "Wikiquote", 5: "Wikibooks", 6: "Wiktionary",
-                   7: "Reddit",    8: "Tool training"}
+                   7: "Reddit", 8: "Tool training"}
+    print("=" * 65)
+    print("  MiniGPT dataset builder  v5.0")
+    print(f"  Target: {target_chars:,} chars  →  {output_file}")
+    print(f"  Sources: Gutenberg · Wikipedia · Simple Wiki · Wikiquote")
+    print(f"           Wikibooks · Wiktionary · Reddit · Tools")
+    if phase is not None:
+        print(f"  Phase : {phase} — {phase_names.get(phase, '?')} only")
+    print("=" * 65)
     if phase is not None:
         print(f"Mode   : SINGLE PHASE {phase} ({phase_names.get(phase, '?')})")
         no_gutenberg   = (phase != 1)
@@ -2088,9 +2045,9 @@ if __name__ == "__main__":
                         help="Skip Reddit phase (requires local .jsonl dumps)")
     parser.add_argument("--no_tools",          action="store_true",
                         help="Skip tool training phase (phase 8)")
-    parser.add_argument("--reddit_comments",   type=str, default="RC_2016-01.jsonl")
-    parser.add_argument("--reddit_submissions",type=str, default="RS_2016-01.jsonl")
-    parser.add_argument("--reddit_output",     type=str, default="reddit_dataset.txt")
+    parser.add_argument("--reddit_comments",    type=str, default="Dumps/comments/RC_2016-01.jsonl")
+    parser.add_argument("--reddit_submissions", type=str, default="Dumps/submissions/RS_2016-01.jsonl")
+    parser.add_argument("--reddit_output",      type=str, default="Dumps/reddit_dataset.txt")
     parser.add_argument("--reddit_no_submissions", action="store_true")
     parser.add_argument("--reddit_resume",     action="store_true")
     parser.add_argument("--reddit_min_score",  type=int, default=4)
