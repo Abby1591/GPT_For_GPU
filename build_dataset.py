@@ -751,7 +751,7 @@ def fetch_reddit(
     target_chars:     int,
     comments_file:    str  = "Dumps/comments/RC_2016-01.jsonl",
     submissions_file: str  = "Dumps/submissions/RS_2016-01.jsonl",
-    reddit_output:    str  = "Dumps/reddit_dataset.txt",
+    reddit_output:    str  = "Dataset/Dataset part backup/phase_7_reddit.txt",
     no_submissions:   bool = False,
     resume:           bool = False,
     min_score:        int  = 4,
@@ -781,6 +781,7 @@ def fetch_reddit(
     DEDUP_CACHE          = 200_000
     COMMENT_RATIO        = 0.80          # 80% comments, 20% submissions
     AVG_CHARS_PER_LINE   = 200           # rough estimate for target_lines
+    MAX_THREAD_CHARS = 2000
 
     target_lines       = max(1000, target_chars // AVG_CHARS_PER_LINE)
     target_comments    = int(target_lines * COMMENT_RATIO)
@@ -805,13 +806,22 @@ def fetch_reddit(
         "philosophy", "Philosophy", "Ethics",
         # Left / Politics / Social Justice
         "socialism", "communism", "anarchism", "Marxism", "labour",
-        "politics", "PoliticalDiscussion", "progressive", "SocialJustice",
+        "PoliticalDiscussion", "progressive", "SocialJustice",
         "feminism", "GenderCritical", "lgbt", "ainbow", "trans", "nonbinary",
         "BlackLives", "antiracism", "labor",
         # Culture / Knowledge
-        "history", "Economics", "books", "writing", "literature", "worldnews",
-        "todayilearned", "Showerthoughts", "technology", "Futurology",
+        "history", "Economics", "books", "writing", "literature", "technology", "Futurology",
     }
+
+    LOW_EFFORT_PATTERNS = re.compile(
+        r"^(same|this|based|facts)[.!]*$",
+        re.I,
+    )
+
+    MEME_PATTERNS = re.compile(
+        r"(nobody:|me when|tfw|mfw|\bshitpost\b)",
+        re.I,
+    )
 
     # ------------------------------------------------------------------ #
     # Quality Filter Patterns                                              #
@@ -829,23 +839,108 @@ def fetch_reddit(
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
     def _clean(text: str) -> str:
+        text = html.unescape(text)
+
+        # URLs
         text = re.sub(r"http\S+", "", text)
-        text = re.sub(r"\s+", " ", text)
-        return text.encode("utf-8", "ignore").decode("utf-8").strip()
+
+        # Reddit refs
+        text = re.sub(r"/u/\w+", "", text)
+        text = re.sub(r"/r/\w+", "", text)
+
+        # Markdown links
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+        # Quotes
+        text = re.sub(r"(?m)^>\s?.*$", "", text)
+
+        # Inline/code blocks
+        text = re.sub(r"`{1,3}.*?`{1,3}", "", text, flags=re.S)
+
+        # Edit signatures
+        text = re.sub(r"(?i)\bedit\s*:\s*.*", "", text)
+
+        # normalize line endings
+        text = text.replace("\r\n", "\n")
+
+        # collapse excessive blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        # collapse spaces/tabs only
+        text = re.sub(r"[ \t]+", " ", text)
+
+        # trim lines
+        text = "\n".join(line.strip() for line in text.splitlines())
+
+        text = text.strip()
+
+        return text.strip()
 
     def _quality(text: str) -> bool:
-        if not (MIN_LEN <= len(text) <= MAX_LEN): return False
-        if len(text.split()) < 12:                return False
-        if text.count(" ") < 10:                  return False
-        if BOT_PHRASES.search(text):              return False
-        if REPEATED_CHARS.search(text):           return False
-        letters = [c for c in text if c.isalpha()]
-        if letters and sum(c.isupper() for c in letters) / len(letters) > ALL_CAPS_RATIO:
+        if not (MIN_LEN <= len(text) <= MAX_LEN):
             return False
+
+        words = text.split()
+
+        if len(words) < 12:
+            return False
+
+        if text.count(" ") < 10:
+            return False
+
+        if LOW_EFFORT_PATTERNS.match(text.strip()):
+            return False
+
+        if MEME_PATTERNS.search(text):
+            return False
+
+        if BOT_PHRASES.search(text):
+            return False
+
+        if REPEATED_CHARS.search(text):
+            return False
+
+        letters = [c for c in text if c.isalpha()]
+        if letters:
+            caps_ratio = sum(c.isupper() for c in letters) / len(letters)
+            if caps_ratio > ALL_CAPS_RATIO:
+                return False
+
+        # lexical diversity
+        unique_ratio = len(set(w.lower() for w in words)) / len(words)
+        if unique_ratio < 0.45:
+            return False
+
         return True
 
-    def _fingerprint(text: str) -> int:
-        return hash(re.sub(r"\s+", " ", text.lower()))
+    def _fingerprint(text: str) -> str:
+        norm = re.sub(r"\s+", " ", text.lower()).strip()
+
+        return hashlib.blake2b(
+            norm.encode("utf-8"),
+            digest_size=8,
+        ).hexdigest()
+
+    def _format_thread(parent_thread: str | None,parent_text: str | None,reply: str,) -> str:
+
+        reply = reply.strip()
+
+        if not parent_text:
+            return reply
+
+        if parent_thread:
+            if len(parent_thread) > MAX_THREAD_CHARS:
+                parent_thread = parent_thread[-MAX_THREAD_CHARS:]
+
+            return (
+                f"{parent_thread}\n\n"
+                f"Assistant: {reply}"
+            )
+
+        return (
+            f"User: {parent_text.strip()}\n\n"
+            f"Assistant: {reply}"
+        )
 
     # ------------------------------------------------------------------ #
     # Streaming Iterator                                                   #
@@ -853,8 +948,9 @@ def fetch_reddit(
     def _stream_jsonl(path: str, target: int, is_submission: bool):
         """Yield (text, total_skipped) for each accepted record in a JSONL dump."""
         min_score_  = MIN_SCORE_SUBMISSION if is_submission else MIN_SCORE_COMMENT
-        boost_score = 4                    if is_submission else 6   # score needed to bypass GOOD_SUBS
+        boost_score = max(min_score + 2, 6 if not is_submission else 4) # score needed to bypass GOOD_SUBS
         kept = skipped = 0
+        comment_cache: dict[str, dict[str, str]] = {}
 
         with open(path, "r", encoding="utf-8") as fh:
             for raw in fh:
@@ -885,9 +981,36 @@ def fetch_reddit(
                     skipped += 1
                     continue
 
-                text = _clean(raw_text)
+                cleaned = _clean(raw_text)
+
+                parent_text = None
+                parent_thread = None
+
+                if not is_submission:
+                    parent_id = obj.get("parent_id", "")
+
+                    if parent_id.startswith("t1_"):
+                        pid = parent_id[3:]
+
+                        parent = comment_cache.get(pid)
+
+                        if parent:
+                            parent_text = parent["text"]
+                            parent_thread = parent["thread"]
+
+                text = _format_thread(parent_thread,parent_text,cleaned,)
+
                 if _quality(text):
                     kept += 1
+                    if not is_submission:
+                        cid = obj.get("id")
+
+                        if cid:
+                            comment_cache[cid] = {"text": cleaned,"thread": text,}
+
+                            if len(comment_cache) > 200_000:
+                                comment_cache.pop(next(iter(comment_cache)))
+
                     yield text, skipped
                 else:
                     skipped += 1
@@ -925,8 +1048,11 @@ def fetch_reddit(
             print(f"  Already at {already:,} lines — nothing to do.")
         else:
             print(f"  Resuming from {already:,} lines.")
-            target_comments    = max(0, target_comments    - already)
-            target_submissions = max(0, target_submissions - already)
+            already_comments = int(already * COMMENT_RATIO)
+            already_subs = already - already_comments
+
+            target_comments = max(0, target_comments - already_comments)
+            target_submissions = max(0, target_submissions - already_subs)
 
     # ------------------------------------------------------------------ #
     # Write                                                                #
@@ -935,10 +1061,24 @@ def fetch_reddit(
     with open(reddit_output, mode, encoding="utf-8") as out:
         writer = _DedupWriter(out)
 
+        total_chars = 0
+        comment_chars = 0
+        submission_chars = 0
+
         if target_comments > 0 and os.path.exists(comments_file):
             for text, skipped in _stream_jsonl(comments_file, target_comments, is_submission=False):
-                if writer.try_write(text) and writer.written % 10_000 == 0:
-                    print(f"  [{writer.written:,} comments | {skipped:,} skipped]")
+                if writer.try_write(text):
+                    chars = len(text)
+
+                    total_chars += chars
+                    comment_chars += chars
+
+                    if writer.written % 10_000 == 0:
+                        print(
+                            f"  [{writer.written:,} comments | "
+                            f"{skipped:,} skipped | "
+                            f"{comment_chars:,} chars]"
+                        )
 
         comments_written = writer.written
 
@@ -1869,7 +2009,7 @@ def build_dataset(
     phase:                 Optional[int] = None,
     reddit_comments:       str = "Dumps/comments/RC_2016-01.jsonl",
     reddit_submissions:    str = "Dumps/submissions/RS_2016-01.jsonl",
-    reddit_output:         str = "Dumps/reddit_dataset.txt",
+    reddit_output:         str = "Dataset/Dataset part backup/phase_7_reddit.txt",
     reddit_no_submissions: bool = False,
     reddit_resume:         bool = False,
     reddit_min_score:      int  = 4,
@@ -2047,7 +2187,7 @@ if __name__ == "__main__":
                         help="Skip tool training phase (phase 8)")
     parser.add_argument("--reddit_comments",    type=str, default="Dumps/comments/RC_2016-01.jsonl")
     parser.add_argument("--reddit_submissions", type=str, default="Dumps/submissions/RS_2016-01.jsonl")
-    parser.add_argument("--reddit_output",      type=str, default="Dumps/reddit_dataset.txt")
+    parser.add_argument("--reddit_output",      type=str, default="Dataset/Dataset part backup/phase_7_reddit.txt")
     parser.add_argument("--reddit_no_submissions", action="store_true")
     parser.add_argument("--reddit_resume",     action="store_true")
     parser.add_argument("--reddit_min_score",  type=int, default=4)
