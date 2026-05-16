@@ -60,6 +60,10 @@ import urllib.parse
 import urllib.request
 import gzip
 import bz2
+import gc
+import html
+import mwparserfromhell
+
 from collections import Counter, deque
 from typing import Iterator, List, Optional, Dict
 
@@ -388,7 +392,6 @@ _BOT_PHRASES = re.compile(
 )
 _REPEATED_CHARS  = re.compile(r"(.)\1{6,}")
 _ALL_CAPS_RATIO  = 0.60
-
 
 def _reddit_safe_load(line: str) -> Optional[dict]:
     try:
@@ -1017,20 +1020,10 @@ def fetch_wiktionary(
     ascii_only: bool = False,
 ) -> list[str]:
 
-    import os
-    import re
-    import bz2
-    import gc
-    import html
-    from typing import Optional
-    import mwparserfromhell
-
     print(f'\n[6/8] Wiktionary Dump  (target {target_chars:,} chars)')
-
     if not os.path.exists(dump_file):
         print(f'  Dump not found: {dump_file}')
         return []
-
     os.makedirs('Dataset/Dataset part backup', exist_ok=True)
 
     # ------------------------------------------------------------------ #
@@ -1048,9 +1041,9 @@ def fetch_wiktionary(
 
     POS_SECTIONS = {
         'noun', 'verb', 'adjective', 'adverb', 'pronoun', 'preposition',
-        'conjunction', 'interjection', 'determiner', 'article','phrase',
-        'proper noun','abbreviation','initialism','numeral','symbol',
-        'prefix','suffix','idiom','proverb','particle',
+        'conjunction', 'interjection', 'determiner', 'article', 'phrase',
+        'proper noun', 'abbreviation', 'initialism', 'numeral', 'symbol',
+        'prefix', 'suffix', 'idiom', 'proverb', 'particle',
     }
 
     BAD_SENSE_LABELS = (
@@ -1071,8 +1064,7 @@ def fetch_wiktionary(
         r'in the plural|plural|singular|'
         r'oath\s+\w+|outside certain phrases|'
         r'sometimes\s+\w+\s+\w+|sometimes\s+\w+)\s+'
-        r'|\w+\s+outside certain phrases'
-        r'|outside certain phrases',
+        r'|\w+\s+outside certain phrases|outside certain phrases',
         re.IGNORECASE,
     )
 
@@ -1081,99 +1073,64 @@ def fetch_wiktionary(
         'cite-book', 'cite-web', 'isbn', 'retrieved from',
     )
 
-    # Templates whose first unnamed param is the display text
     DISPLAY_TEMPLATES = {
-        'w', 'l', 'm', 'mention', 'taxlink', 'vern', 'vernacular',
-        'link', 'pedlink',
+        'w', 'l', 'm', 'mention', 'taxlink', 'vern', 'vernacular', 'link', 'pedlink',
     }
 
-    # Templates to strip entirely (no useful text)
     DROP_TEMPLATES = {
         'ipa', 'audio', 'rhymes', 'homophones', 'hyphenation', 'hyph',
         'sense', 'senseid', 'sid', 'rfdef', 'rfquote', 'rfc', 'rfd',
         'attention', 'wikipedia', 'wikispecies', 'commons',
         'quote-book', 'quote-web', 'quote-journal', 'quote-text',
-        'cite-book', 'cite-web', 'rq', 'seeCites','defdate', 'syn',
-        'ant', 'hyper', 'hypo', 'cot','synonyms', 'antonyms',
-        'hypernyms', 'hyponyms','uxi', 'uxa', 'alti', 'senseno', '+obj',
+        'cite-book', 'cite-web', 'rq', 'seeCites', 'defdate', 'date',
+        'syn', 'ant', 'hyper', 'hypo', 'cot',
+        'synonyms', 'antonyms', 'hypernyms', 'hyponyms',
+        'uxi', 'uxa', 'alti', 'senseno', '+obj',
     }
 
-    # Label/context templates — emit their label args as plain text
     LABEL_TEMPLATES = {'lb', 'label', 'context', 'qualifier', 'q', 'qual', 'gloss'}
 
-    DIACRITIC_MAP = {
-        'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a','æ':'ae',
-        'ç':'c',
-        'è':'e','é':'e','ê':'e','ë':'e',
-        'ì':'i','í':'i','î':'i','ï':'i',
-        'ñ':'n',
-        'ò':'o','ó':'o','ô':'o','õ':'o','ö':'o','ø':'o',
-        'ù':'u','ú':'u','û':'u','ü':'u',
-        'ý':'y','ÿ':'y',
-        'À':'A','Á':'A','Â':'A','Ã':'A','Ä':'A','Å':'A','Æ':'AE',
-        'Ç':'C',
-        'È':'E','É':'E','Ê':'E','Ë':'E',
-        'Ì':'I','Í':'I','Î':'I','Ï':'I',
-        'Ñ':'N',
-        'Ò':'O','Ó':'O','Ô':'O','Õ':'O','Ö':'O','Ø':'O',
-        'Ù':'U','Ú':'U','Û':'U','Ü':'U',
-        'Ý':'Y',
-        'ß':'ss',
-        'œ':'oe','Œ':'OE',
-        'š':'s','Š':'S',
-        'ž':'z','Ž':'Z',
-        'č':'c','Č':'C',
-        'ř':'r','Ř':'R',
-    }
-
-    MATH_GREEK_CHARS = {
-        'α','β','γ','δ','ε','ζ','η','θ','ι','κ','λ','μ',
-        'ν','ξ','ο','π','ρ','σ','τ','υ','φ','χ','ψ','ω',
-        'Α','Β','Γ','Δ','Ε','Ζ','Η','Θ','Ι','Κ','Λ','Μ',
-        'Ν','Ξ','Ο','Π','Ρ','Σ','Τ','Υ','Φ','Χ','Ψ','Ω',
-        '∀','∂','∃','∅','∇','∈','∉','∋','∏','∑','√','∞',
-        '∧','∨','∩','∪','∫','∴','∼','≅','≈','≠','≡','≤',
-        '≥','⊂','⊃','⊆','⊇','⊕','⊗','⊥','⋅','±','×','÷',
-        '°','²','³','¹','½','¼','¾',
-    }
-
-    KNOWN_NON_ASCII = set(DIACRITIC_MAP.keys()) | MATH_GREEK_CHARS
-
-    WORD_MAP = {
-        'café':'cafe','naïve':'naive','résumé':'resume',
-        'Pokémon':'Pokemon','piñata':'pinata','père':'pere',
-        'fiancée':'fiance','fiancé':'fiance','née':'nee',
-        'rôle':'role','über':'uber','façade':'facade',
-        'protégé':'protege','cliché':'cliche','déjà':'deja',
-        'naïveté':'naivete','émigré':'emigre','attaché':'attache',
-        'exposé':'expose','communiqué':'communique','détente':'detente',
-        'soufflé':'souffle','rosé':'rose','touché':'touche',
-        'blasé':'blase','purée':'puree','entrée':'entree',
-        'sauté':'saute','maté':'mate','pâté':'pate',
-        'crêpe':'crepe','chalet':'chalet','rôtisserie':'rotisserie',
-        'hôtel':'hotel','naïf':'naif','Zürich':'Zurich',
-        'München':'Munich','Köln':'Cologne',
-    }
-
     INLINE_SUFFIX_TEMPLATES = {
-        's', 'es', 'ed', 'ing', 'er', 'est',
-        'ly', 'ness', 'ism', 'ist', 'tion', 'ize', 'ise',
+        's', 'es', 'ed', 'ing', 'er', 'est', 'ly', 'ness', 'ism', 'ist', 'tion', 'ize', 'ise',
     }
 
     INFLECTION_TAG_MAP = {
-        'spast': 'simple past',
-        'pastp': 'past participle',
-        'presp': 'present participle',
-        'pres': 'present',
-        'p': 'plural',
-        's': 'singular',
-        '1': 'first person',
-        '2': 'second person',
-        '3': 'third person',
+        'spast': 'simple past', 'pastp': 'past participle',
+        'presp': 'present participle', 'pres': 'present',
+        'p': 'plural', 's': 'singular',
+        '1': 'first person', '2': 'second person', '3': 'third person',
     }
 
+    DIACRITIC_MAP = {
+        'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a','æ':'ae','ç':'c',
+        'è':'e','é':'e','ê':'e','ë':'e','ì':'i','í':'i','î':'i','ï':'i',
+        'ñ':'n','ò':'o','ó':'o','ô':'o','õ':'o','ö':'o','ø':'o',
+        'ù':'u','ú':'u','û':'u','ü':'u','ý':'y','ÿ':'y',
+        'À':'A','Á':'A','Â':'A','Ã':'A','Ä':'A','Å':'A','Æ':'AE','Ç':'C',
+        'È':'E','É':'E','Ê':'E','Ë':'E','Ì':'I','Í':'I','Î':'I','Ï':'I',
+        'Ñ':'N','Ò':'O','Ó':'O','Ô':'O','Õ':'O','Ö':'O','Ø':'O',
+        'Ù':'U','Ú':'U','Û':'U','Ü':'U','Ý':'Y','ß':'ss',
+        'œ':'oe','Œ':'OE','š':'s','Š':'S','ž':'z','Ž':'Z',
+        'č':'c','Č':'C','ř':'r','Ř':'R',
+    }
+
+    WORD_MAP = {
+        'café':'cafe','naïve':'naive','résumé':'resume','Pokémon':'Pokemon',
+        'piñata':'pinata','père':'pere','fiancée':'fiance','fiancé':'fiance',
+        'née':'nee','rôle':'role','über':'uber','façade':'facade',
+        'protégé':'protege','cliché':'cliche','déjà':'deja','naïveté':'naivete',
+        'émigré':'emigre','attaché':'attache','exposé':'expose',
+        'communiqué':'communique','détente':'detente','soufflé':'souffle',
+        'rosé':'rose','touché':'touche','blasé':'blase','purée':'puree',
+        'entrée':'entree','sauté':'saute','maté':'mate','pâté':'pate',
+        'crêpe':'crepe','chalet':'chalet','rôtisserie':'rotisserie',
+        'hôtel':'hotel','naïf':'naif','Zürich':'Zurich','München':'Munich','Köln':'Cologne',
+    }
+
+    KNOWN_NON_ASCII = set(DIACRITIC_MAP.keys())
+
     # ------------------------------------------------------------------ #
-    # Diacritic / unicode normalization
+    # Helpers
     # ------------------------------------------------------------------ #
 
     def normalize_diacritics(text: str) -> str:
@@ -1188,89 +1145,62 @@ def fetch_wiktionary(
                 return WORD_MAP[word]
             lower = word.lower()
             if lower in WORD_MAP:
-                replacement = WORD_MAP[lower]
-                return replacement.capitalize() if word[0].isupper() else replacement
+                r = WORD_MAP[lower]
+                return r.capitalize() if word[0].isupper() else r
             for ch in word:
-                if ch.isascii():
-                    continue
-                if ch not in KNOWN_NON_ASCII:
+                if not ch.isascii() and ch not in KNOWN_NON_ASCII:
                     return None
             return ''.join(DIACRITIC_MAP.get(ch, ch) for ch in word)
 
-        result = [normalized for tok in tokens if (normalized := normalize_token(tok)) is not None]
+        result = [n for tok in tokens if (n := normalize_token(tok)) is not None]
         return ' '.join(result) if result else text
 
-    # ------------------------------------------------------------------ #
-    # mwparserfromhell-based wikitext cleaner
-    # ------------------------------------------------------------------ #
-
     def resolve_template(tpl) -> str:
-        """Convert a single mwparserfromhell Template to plain text."""
         name = tpl.name.strip().lower()
 
         if name in ('infl of', 'inflection of'):
             params = [p for p in tpl.params if not p.showkey]
             base = str(params[1].value).strip() if len(params) > 1 else ''
             tags = [str(p.value).strip() for p in params[3:] if str(p.value).strip()]
-            readable = ' '.join(INFLECTION_TAG_MAP.get(t, '') for t in tags)
-            readable = re.sub(r' +', ' ', readable).strip()
+            readable = re.sub(r' +', ' ', ' '.join(INFLECTION_TAG_MAP.get(t, '') for t in tags)).strip()
             return f'{readable} of {base}'.strip() if base else ''
 
-        # Drop entirely
         if name in DROP_TEMPLATES or name.startswith('quote-') or name.startswith('cite-'):
             return ''
 
-        # Display: use last unnamed param as display text
         if name in DISPLAY_TEMPLATES:
             params = [p for p in tpl.params if not p.showkey]
             if len(params) >= 2:
                 return str(params[-1].value).strip()
-            if len(params) == 1:
-                return str(params[0].value).strip()
-            return ''
+            return str(params[0].value).strip() if params else ''
 
-        # given name / surname
         if name in ('given name', 'surname'):
             return name
 
-        # Label templates — emit non-language label args
         if name in LABEL_TEMPLATES:
-            labels = []
-            for p in tpl.params:
-                if p.showkey:
-                    continue
-                v = str(p.value).strip()
-                if re.match(r'^[a-z]{2,3}$', v):  # skip lang codes
-                    continue
-                if re.match(r'^Q\d+$', v):  # skip Wikidata IDs
-                    continue
-                if len(v) >= 2:
-                    labels.append(v)
+            labels = [
+                str(p.value).strip() for p in tpl.params
+                if not p.showkey
+                and not re.match(r'^[a-z]{2,3}$', str(p.value).strip())
+                and not re.match(r'^Q\d+$', str(p.value).strip())
+                and len(str(p.value).strip()) >= 2
+            ]
             return ' '.join(labels)
 
-        # Taxlink: first unnamed param is species name
         if name == 'taxlink':
             params = [p for p in tpl.params if not p.showkey]
-            if params:
-                return str(params[0].value).strip()
-            return ''
+            return str(params[0].value).strip() if params else ''
 
-        # Non-gloss definition — drop
         if 'non-gloss' in name:
             return ''
 
-        # Default: collect unnamed params that look like real words
-        useful = []
-        for p in tpl.params:
-            if p.showkey:
-                continue
-            v = str(p.value).strip()
-            if re.match(r'^[a-z]{1,3}$', v):
-                continue
-            if re.match(r'^Q\d+$', v):
-                continue
-            if len(v) >= 2:
-                useful.append(v)
+        useful = [
+            str(p.value).strip() for p in tpl.params
+            if not p.showkey
+            and not re.match(r'^[a-z]{1,3}$', str(p.value).strip())
+            and not re.match(r'^Q\d+$', str(p.value).strip())
+            and len(str(p.value).strip()) >= 2
+        ]
         return ' '.join(useful[:2])
 
     def wikitext_to_plain(raw: str) -> str:
@@ -1278,6 +1208,18 @@ def fetch_wiktionary(
             wikicode = mwparserfromhell.parse(raw)
         except Exception:
             return raw
+
+        # Wikilinks first to avoid node tree corruption
+        for link in wikicode.filter_wikilinks():
+            try:
+                title_str = str(link.title).strip()
+                if re.match(r'^(File|Image|Category):', title_str, re.IGNORECASE):
+                    wikicode.replace(link, ' ')
+                else:
+                    text = str(link.text) if link.text else str(link.title)
+                    wikicode.replace(link, f' {text.strip()} ')
+            except Exception:
+                pass
 
         for tpl in wikicode.filter_templates(recursive=True):
             try:
@@ -1293,67 +1235,39 @@ def fetch_wiktionary(
                 except Exception:
                     pass
 
-        for link in wikicode.filter_wikilinks():
-            try:
-                title_str = str(link.title).strip()
-                if re.match(r'^(File|Image|Category):', title_str, re.IGNORECASE):
-                    wikicode.replace(link, ' ')
-                else:
-                    text = str(link.text) if link.text else str(link.title)
-                    wikicode.replace(link, f' {text.strip()} ')
-            except Exception:
-                pass
-
         text = wikicode.strip_code()
         text = html.unescape(text)
-        # The only merges that survive are lowercase+lowercase at ex-markup boundaries.
-        # Target known culprits: articles/preps merged into the following word.
         text = re.sub(r'\b(\w{2,}) (s|es|ed|ing|er|est|ly|d|ling|lling|tion|tions)\b', r'\1\2', text)
         text = re.sub(r'\b(the|a|an|and|or|to|of|in|on|at|by|as|is)\b(?=[a-z])', r'\1 ', text)
         text = re.sub(r'([.,;:!?])([A-Za-z])', r'\1 \2', text)
         text = re.sub(r' {2,}', ' ', text).strip()
         return text
 
-    # ------------------------------------------------------------------ #
-    # Line-level post-cleaning (after mwparserfromhell)
-    # ------------------------------------------------------------------ #
-
     def clean_line(line: str) -> str:
         line = html.unescape(line)
         stripped = line.strip()
         if not stripped:
             return ''
-
-        # Skip phonetic/media lines before parsing
         if re.match(r'^\*?\s*IPA', stripped) or '{{IPA' in stripped:
             return ''
-        if re.match(r'^\*?\s*(audio|File|Image|thumb)', stripped, re.IGNORECASE):
-            return ''
-        if re.match(r'^\*?\s*(rhymes|hyph|homophones?)', stripped, re.IGNORECASE):
+        if re.match(r'^\*?\s*(audio|File|Image|thumb|rhymes|hyph|homophones?)', stripped, re.IGNORECASE):
             return ''
         if stripped.startswith('[[Category') or stripped.startswith('C|'):
             return ''
         if 'non-gloss' in stripped.lower():
             return ''
 
-        # Use mwparserfromhell for template/link resolution
         line = wikitext_to_plain(line)
 
-        # Remove residual refs, comments, URLs
         line = re.sub(r'<ref[^>]*>.*?</ref>', ' ', line, flags=re.IGNORECASE | re.DOTALL)
         line = re.sub(r'<!--.*?-->', ' ', line, flags=re.DOTALL)
         line = re.sub(r'https?://\S+', ' ', line)
         line = re.sub(r'\[[^\]]*http[^\]]*\]', ' ', line)
-
-        # Remove residual wiki markup
         line = re.sub(r"'{2,}", '', line)
         line = re.sub(r'<[^>]+>', ' ', line)
         line = re.sub(r'\|', ' ', line)
-
-        # Leftover stray template artifacts
         line = re.sub(r'\{\{[^}]*\}\}', ' ', line)
         line = re.sub(r'\[\[[^\]]*\]\]', ' ', line)
-
         line = re.sub(r'\bQ\d+\b', ' ', line)
         line = re.sub(r'\b\d{9,13}\b', ' ', line)
         line = re.sub(r'\b[a-zA-Z_]+\s*=\s*\S+', ' ', line)
@@ -1361,7 +1275,7 @@ def fetch_wiktionary(
         line = re.sub(r'\bcontrast\s+([A-Za-z])', r'contrast: \1', line)
         line = re.sub(r'\bsee\s+([A-Z])', r'see: \1', line)
         line = re.sub(r':\s*(?:from|to|into|onto|upon)\s*$', '', line)
-        line = re.sub(r'\b\w+#\w+\b', '', line)
+        line = re.sub(r'\b\w+#\w+\b', ' ', line)
         line = re.sub(r'\b(ca\.|from|since)[\s\d,\.]+s?\b', '', line, flags=re.IGNORECASE)
         line = re.sub(r'\b\d+(?:st|nd|rd|th)\s+c\.?(?:\s+\d+)?\b', '', line, flags=re.IGNORECASE)
         line = re.sub(r'_\s*', ' ', line)
@@ -1385,53 +1299,38 @@ def fetch_wiktionary(
 
         if len(line) < 4 or re.match(r'^[^a-zA-Z]*$', line):
             return ''
-
         return line
 
     # ------------------------------------------------------------------ #
-    # Entry-level quality gate
-    # ------------------------------------------------------------------ #
-
-    def entry_looks_clean(text: str) -> bool:
-        # Any surviving template braces = incomplete parsing
-        if '{{' in text or '}}' in text:
-            return False
-        # Stray pipes suggest unparsed template remnants
-        if text.count('|') > 2:
-            return False
-        if not ascii_only:
-            stripped = text.replace('\u00b7', '')  # ignore syllable dots
-            letters = len(re.findall(r'[a-zA-Z]', stripped))
-            non_ascii = len(re.findall(r'[^\x00-\x7F]', stripped))
-            if letters > 0 and non_ascii / (letters + 1) > 0.6:
-                return False
-        return True
-
-    # ------------------------------------------------------------------ #
-    # Section-header detection
+    # Entry parsing
     # ------------------------------------------------------------------ #
 
     def parse_section_header(line: str) -> Optional[str]:
         m = re.match(r'^(={2,5})\s*(.+?)\s*\1$', line.strip())
         return m.group(2) if m else None
 
-    # ------------------------------------------------------------------ #
-    # Entry renderer
-    # ------------------------------------------------------------------ #
+    def entry_looks_clean(text: str) -> bool:
+        if '{{' in text or '}}' in text:
+            return False
+        if text.count('|') > 2:
+            return False
+        if not ascii_only:
+            stripped = text.replace('\u00b7', '')
+            letters = len(re.findall(r'[a-zA-Z]', stripped))
+            non_ascii = len(re.findall(r'[^\x00-\x7F]', stripped))
+            if letters > 0 and non_ascii / (letters + 1) > 0.6:
+                return False
+        return True
 
     def render_entry(title: str, raw_wikitext: str) -> str:
 
         def find_english_scope(lines: list[str]) -> list[str]:
-            eng_start: Optional[int] = None
-            eng_end = len(lines)
+            eng_start = eng_end = None
             for i, ln in enumerate(lines):
                 s = ln.strip()
                 if re.match(r'^==\s*English\s*==$', s, re.IGNORECASE):
                     eng_start = i
-                    continue
-                if eng_start is not None \
-                        and re.match(r'^==[^=].*==$', s) \
-                        and not re.match(r'^==\s*English\s*==$', s, re.IGNORECASE):
+                elif eng_start is not None and re.match(r'^==[^=].*==$', s):
                     eng_end = i
                     break
             return lines[eng_start:eng_end] if eng_start is not None else lines
@@ -1441,8 +1340,7 @@ def fetch_wiktionary(
                 m = re.search(r'\{\{hyph(?:enation)?\s*\|[^}]*\}\}', ln, re.IGNORECASE)
                 if not m:
                     continue
-                inner = m.group(0)
-                parts = re.sub(r'^\{\{[^|]+\|', '', inner).rstrip('}').split('|')
+                parts = re.sub(r'^\{\{[^|]+\|', '', m.group(0)).rstrip('}').split('|')
                 if parts and re.match(r'^[a-z]{2,3}$', parts[0].strip()):
                     parts = parts[1:]
                 syllables = [p.strip() for p in parts if p.strip()]
@@ -1455,10 +1353,10 @@ def fetch_wiktionary(
 
         def parse_pos_sections(scope: list[str]) -> list[tuple[str, list[tuple[str, list[str]]]]]:
             sections: dict[str, list[tuple[str, list[str]]]] = {}
-            current_pos: Optional[str] = None
+            current_pos = None
             in_skip = False
             pending_defs: list[tuple[str, list[str]]] = []
-            current_defn: Optional[str] = None
+            current_defn = None
             current_examples: list[str] = []
 
             def flush_definition():
@@ -1477,30 +1375,18 @@ def fetch_wiktionary(
 
             for ln in scope:
                 header = parse_section_header(ln)
-
                 if header is not None:
                     hl = re.sub(r'\s+', ' ', header.lower()).strip()
                     hl_base = re.sub(r'\s*\d+$', '', hl)
                     flush_definition()
                     if hl in SKIP_SECTIONS or hl_base in SKIP_SECTIONS:
-                        flush_pos()
-                        in_skip = True
-                        continue
-                    if hl.startswith('etymology') or hl.startswith('pronunciation'):
-                        flush_definition()
-                        flush_pos()
-                        in_skip = False
-                        current_pos = None
-                        continue
-                    if hl_base in POS_SECTIONS:
-                        flush_definition()
-                        flush_pos()
-                        current_pos = hl_base
-                        in_skip = False
-                        continue
-                    flush_definition()
-                    flush_pos()
-                    in_skip = True
+                        flush_pos(); in_skip = True
+                    elif hl.startswith(('etymology', 'pronunciation')):
+                        flush_pos(); in_skip = False; current_pos = None
+                    elif hl_base in POS_SECTIONS:
+                        flush_pos(); current_pos = hl_base; in_skip = False
+                    else:
+                        flush_pos(); in_skip = True
                     continue
 
                 if in_skip or current_pos is None:
@@ -1529,10 +1415,8 @@ def fetch_wiktionary(
                         continue
                     if re.match(r'^\d{4},', clean):
                         continue
-                    # Citation check - must be after clean is defined
-                    if re.search(
-                            r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\b',
-                            clean):
+                    if re.search(r'\b(January|February|March|April|May|June|July|August|'
+                                 r'September|October|November|December)\b', clean):
                         if re.search(r'\b\d{4}\b', clean):
                             continue
                     if re.search(r'\b(p\.|pp\.|vol\.|ibid|op\.cit)\b', clean, re.IGNORECASE):
@@ -1552,60 +1436,42 @@ def fetch_wiktionary(
 
             if ascii_only:
                 sections = {
-                    pos: [
-                        (d, [e for e in exs if not re.search(r'[^\x00-\x7F]', e)])
-                        for d, exs in defs
-                        if not re.search(r'[^\x00-\x7F]', d)
-                    ]
+                    pos: [(d, [e for e in exs if not re.search(r'[^\x00-\x7F]', e)])
+                          for d, exs in defs if not re.search(r'[^\x00-\x7F]', d)]
                     for pos, defs in sections.items()
                 }
                 sections = {k: v for k, v in sections.items() if v}
 
             return list(sections.items())
 
-        # --- render_entry body ---
         lines = raw_wikitext.replace('\r\n', '\n').splitlines()
         scope = find_english_scope(lines)
-
-        display_title = normalize_diacritics(title) or title
-        display_title = extract_syllable_title(display_title, scope)
+        display_title = extract_syllable_title(normalize_diacritics(title) or title, scope)
         sections = parse_pos_sections(scope)
 
-        total_defs = sum(len(defs) for _, defs in sections)
-        if not sections or total_defs == 0:
+        if not sections or not any(defs for _, defs in sections):
             return ''
 
         blocks = [display_title]
         for pos_label, defs in sections:
-            blocks.append('')
-            blocks.append(pos_label)
-            blocks.append('')
+            blocks.extend(['', pos_label, ''])
             for idx, (defn, examples) in enumerate(defs, 1):
-                defn_line = defn.rstrip('.:') + ':' if examples else defn
-                blocks.append(f'{idx}. {defn_line}')
+                blocks.append(f'{idx}. {defn.rstrip(".:")+":"}' if examples else f'{idx}. {defn}')
                 for ex in examples:
                     ex = ex.strip('"\'')
-                    if '#' in ex or len(ex.split()) <= 1:
-                        continue
-                    blocks.append(f'"{ex}"')
+                    if '#' not in ex and len(ex.split()) > 1:
+                        blocks.append(f'"{ex}"')
 
         rendered = '\n'.join(blocks)
         return rendered if entry_looks_clean(rendered) else ''
-
-    # ------------------------------------------------------------------ #
-    # Title normalization
-    # ------------------------------------------------------------------ #
 
     def normalize_title(raw: str) -> str:
         title = normalize_diacritics(raw.strip())
         if not title:
             return ''
-        if ascii_only:
-            if not re.match(r"^[A-Za-z0-9 _'\-]+$", title):
-                return ''
-        else:
-            if not re.match(r"^[\w\s'\-\.]+$", title, re.UNICODE):
-                return ''
+        pattern = r"^[A-Za-z0-9 _'\-]+$" if ascii_only else r"^[\w\s'\-\.]+$"
+        if not re.match(pattern, title, 0 if ascii_only else re.UNICODE):
+            return ''
         if ':' in title and not title[0].isupper():
             return ''
         return title
@@ -1615,18 +1481,13 @@ def fetch_wiktionary(
     # ------------------------------------------------------------------ #
 
     chunks: list[str] = []
-    total_chars = 0
-    entries_kept = 0
-    entries_skipped = 0
-
-    inside_page = False
-    inside_text = False
+    total_chars = entries_kept = entries_skipped = 0
+    inside_page = inside_text = False
     title = ''
     text_lines: list[str] = []
 
     with bz2.open(dump_file, 'rt', encoding='utf-8', errors='ignore') as fh:
         for raw_line in fh:
-
             if '<page>' in raw_line:
                 inside_page = True
                 inside_text = False
@@ -1644,7 +1505,6 @@ def fetch_wiktionary(
                             r'|Conjunction|Interjection|Determiner|Article)\s*===?',
                             raw_text, re.IGNORECASE,
                         ) is not None
-
                         if title.startswith('Reconstruction:'):
                             entries_skipped += 1
                         elif is_english and has_pos:
@@ -1654,19 +1514,14 @@ def fetch_wiktionary(
                                 total_chars += len(entry)
                                 entries_kept += 1
                                 if entries_kept % 5000 == 0:
-                                    print(
-                                        f'  [{entries_kept:,} entries | '
-                                        f'{entries_skipped:,} skipped]  '
-                                        f'{total_chars:,}/{target_chars:,} chars'
-                                    )
+                                    print(f'  [{entries_kept:,} entries | {entries_skipped:,} skipped]  '
+                                          f'{total_chars:,}/{target_chars:,} chars')
                                     gc.collect()
                                 if total_chars >= target_chars:
                                     break
                         else:
                             entries_skipped += 1
-
-                inside_page = False
-                inside_text = False
+                inside_page = inside_text = False
                 text_lines = []
                 continue
 
@@ -1674,8 +1529,7 @@ def fetch_wiktionary(
                 continue
 
             if '<title>' in raw_line and '</title>' in raw_line:
-                raw_title = re.sub(r'.*<title>(.*?)</title>.*', r'\1', raw_line).strip()
-                title = normalize_title(raw_title)
+                title = normalize_title(re.sub(r'.*<title>(.*?)</title>.*', r'\1', raw_line).strip())
                 continue
 
             if '<text' in raw_line:
@@ -1689,11 +1543,8 @@ def fetch_wiktionary(
                 if len(text_lines) < 6000:
                     text_lines.append(raw_line)
 
-    print(
-        f'  Wiktionary done: {entries_kept:,} entries  '
-        f'({total_chars:,} chars)  '
-        f'({entries_skipped:,} non-English skipped)'
-    )
+    print(f'  Wiktionary done: {entries_kept:,} entries  '
+          f'({total_chars:,} chars)  ({entries_skipped:,} non-English skipped)')
     return chunks
 
 # =============================================================================
