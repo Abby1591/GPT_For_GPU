@@ -1093,7 +1093,9 @@ def fetch_wiktionary(
         'sense', 'senseid', 'sid', 'rfdef', 'rfquote', 'rfc', 'rfd',
         'attention', 'wikipedia', 'wikispecies', 'commons',
         'quote-book', 'quote-web', 'quote-journal', 'quote-text',
-        'cite-book', 'cite-web', 'rq', 'seeCites',
+        'cite-book', 'cite-web', 'rq', 'seeCites','defdate', 'syn',
+        'ant', 'hyper', 'hypo', 'cot','synonyms', 'antonyms',
+        'hypernyms', 'hyponyms','uxi', 'uxa', 'alti', 'senseno', '+obj',
     }
 
     # Label/context templates — emit their label args as plain text
@@ -1153,6 +1155,23 @@ def fetch_wiktionary(
         'München':'Munich','Köln':'Cologne',
     }
 
+    INLINE_SUFFIX_TEMPLATES = {
+        's', 'es', 'ed', 'ing', 'er', 'est',
+        'ly', 'ness', 'ism', 'ist', 'tion', 'ize', 'ise',
+    }
+
+    INFLECTION_TAG_MAP = {
+        'spast': 'simple past',
+        'pastp': 'past participle',
+        'presp': 'present participle',
+        'pres': 'present',
+        'p': 'plural',
+        's': 'singular',
+        '1': 'first person',
+        '2': 'second person',
+        '3': 'third person',
+    }
+
     # ------------------------------------------------------------------ #
     # Diacritic / unicode normalization
     # ------------------------------------------------------------------ #
@@ -1188,6 +1207,14 @@ def fetch_wiktionary(
     def resolve_template(tpl) -> str:
         """Convert a single mwparserfromhell Template to plain text."""
         name = tpl.name.strip().lower()
+
+        if name in ('infl of', 'inflection of'):
+            params = [p for p in tpl.params if not p.showkey]
+            base = str(params[1].value).strip() if len(params) > 1 else ''
+            tags = [str(p.value).strip() for p in params[3:] if str(p.value).strip()]
+            readable = ' '.join(INFLECTION_TAG_MAP.get(t, '') for t in tags)
+            readable = re.sub(r' +', ' ', readable).strip()
+            return f'{readable} of {base}'.strip() if base else ''
 
         # Drop entirely
         if name in DROP_TEMPLATES or name.startswith('quote-') or name.startswith('cite-'):
@@ -1247,38 +1274,44 @@ def fetch_wiktionary(
         return ' '.join(useful[:2])
 
     def wikitext_to_plain(raw: str) -> str:
-        """Full wikitext → clean plain text using mwparserfromhell."""
         try:
             wikicode = mwparserfromhell.parse(raw)
         except Exception:
-            return raw  # fallback
+            return raw
 
-        # Replace each template with its resolved text
         for tpl in wikicode.filter_templates(recursive=True):
             try:
+                name = tpl.name.strip().lower()
                 replacement = resolve_template(tpl)
-                wikicode.replace(tpl, replacement)
+                if name in INLINE_SUFFIX_TEMPLATES or name in DISPLAY_TEMPLATES:
+                    wikicode.replace(tpl, replacement)
+                else:
+                    wikicode.replace(tpl, f' {replacement} ' if replacement else ' ')
             except Exception:
                 try:
-                    wikicode.replace(tpl, '')
+                    wikicode.replace(tpl, ' ')
                 except Exception:
                     pass
 
-        # Strip wikilinks: keep display text
         for link in wikicode.filter_wikilinks():
             try:
-                text = str(link.text) if link.text else str(link.title)
-                # Drop file/image links
                 title_str = str(link.title).strip()
                 if re.match(r'^(File|Image|Category):', title_str, re.IGNORECASE):
-                    wikicode.replace(link, '')
+                    wikicode.replace(link, ' ')
                 else:
-                    wikicode.replace(link, text.strip())
+                    text = str(link.text) if link.text else str(link.title)
+                    wikicode.replace(link, f' {text.strip()} ')
             except Exception:
                 pass
 
         text = wikicode.strip_code()
         text = html.unescape(text)
+        # The only merges that survive are lowercase+lowercase at ex-markup boundaries.
+        # Target known culprits: articles/preps merged into the following word.
+        text = re.sub(r'\b(\w{2,}) (s|es|ed|ing|er|est|ly|d|ling|lling|tion|tions)\b', r'\1\2', text)
+        text = re.sub(r'\b(the|a|an|and|or|to|of|in|on|at|by|as|is)\b(?=[a-z])', r'\1 ', text)
+        text = re.sub(r'([.,;:!?])([A-Za-z])', r'\1 \2', text)
+        text = re.sub(r' {2,}', ' ', text).strip()
         return text
 
     # ------------------------------------------------------------------ #
@@ -1322,14 +1355,14 @@ def fetch_wiktionary(
         line = re.sub(r'\[\[[^\]]*\]\]', ' ', line)
 
         line = re.sub(r'\bQ\d+\b', ' ', line)
+        line = re.sub(r'\b\d{9,13}\b', ' ', line)
         line = re.sub(r'\b[a-zA-Z_]+\s*=\s*\S+', ' ', line)
         line = re.sub(r'\(\s*\)', ' ', line)
         line = re.sub(r'\bcontrast\s+([A-Za-z])', r'contrast: \1', line)
         line = re.sub(r'\bsee\s+([A-Z])', r'see: \1', line)
         line = re.sub(r':\s*(?:from|to|into|onto|upon)\s*$', '', line)
-        line = re.sub(r"([\w']+(?:\s+[\w']+){0,2})\s+\1", r'\1', line, flags=re.IGNORECASE)
         line = re.sub(r'\b\w+#\w+\b', '', line)
-        line = re.sub(r'\b(ca\.|from|since|defdate)[\s\d,\.]+s?\b', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\b(ca\.|from|since)[\s\d,\.]+s?\b', '', line, flags=re.IGNORECASE)
         line = re.sub(r'\b\d+(?:st|nd|rd|th)\s+c\.?(?:\s+\d+)?\b', '', line, flags=re.IGNORECASE)
         line = re.sub(r'_\s*', ' ', line)
         line = line.replace('&emsp;', ' ').replace('&nbsp;', ' ')
@@ -1496,6 +1529,12 @@ def fetch_wiktionary(
                         continue
                     if re.match(r'^\d{4},', clean):
                         continue
+                    # Citation check - must be after clean is defined
+                    if re.search(
+                            r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\b',
+                            clean):
+                        if re.search(r'\b\d{4}\b', clean):
+                            continue
                     if re.search(r'\b(p\.|pp\.|vol\.|ibid|op\.cit)\b', clean, re.IGNORECASE):
                         continue
                     words = clean.split()
