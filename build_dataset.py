@@ -1997,7 +1997,7 @@ def _save_checkpoint(chunks: List[str], filename: str) -> None:
 
 def build_dataset(
     target_chars:          int  = 200_000_000,
-    output_file:           str  = "diverse_dataset.txt",
+    output_file:           str  = "Dataset.txt",
     no_gutenberg:          bool = False,
     no_wikipedia:          bool = False,
     no_simple_wiki:        bool = False,

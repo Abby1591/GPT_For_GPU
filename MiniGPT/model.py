@@ -57,14 +57,23 @@ from typing import List, Optional
 import numpy as np
 
 try:
-    from .Neural_Network import NeuralNetwork
+    from Neural_Network import NeuralNetwork
 except ImportError:
-    print("ERROR: Neural_Network.py not found.")
-    print("Place Neural_Network.py in the same folder as model.py.")
-    sys.exit(1)
+    try:
+        from .Neural_Network import NeuralNetwork
+    except ImportError:
+        print("ERROR: Neural_Network.py not found.")
+        print("Place Neural_Network.py in the same folder as model.py.")
+        sys.exit(1)
 
-from .tokenizer import CharTokenizer
-from .data import load_text, simplify_text, make_index_arrays
+try:
+    from tokenizer import CharTokenizer
+except ImportError:
+    from .tokenizer import CharTokenizer
+try:
+    from data import load_text, simplify_text, make_index_arrays
+except ImportError:
+    from .data import load_text, simplify_text, make_index_arrays
 
 
 class MiniGPT:
@@ -166,13 +175,9 @@ class MiniGPT:
         :type tokenizer: CharTokenizer
         """
         self.tokenizer = tokenizer
-        input_size     = self.context_size * tokenizer.size
 
         self.nn = NeuralNetwork(
-            input_size    = input_size,
-            hidden_layers = self.hidden_layers,
             output_size   = tokenizer.size,
-            activation    = self.activation,
             learning_rate = self.learning_rate,
             use_embedding = True,
             vocab_size    = tokenizer.size,
@@ -414,7 +419,10 @@ class MiniGPT:
                 tool_registry = {"convert": TOOL_REGISTRY["convert"]},
             ))
         """
-        from tool_definitions import TOOL_REGISTRY as _DEFAULT_REGISTRY  # type: ignore
+        try:
+            from tool_definitions import TOOL_REGISTRY as _DEFAULT_REGISTRY  # type: ignore
+        except ImportError:
+            from .tool_definitions import TOOL_REGISTRY as _DEFAULT_REGISTRY  # type: ignore
 
         if self.nn is None or self.tokenizer is None:
             raise RuntimeError(
@@ -435,8 +443,6 @@ class MiniGPT:
             ctx = [0] + ctx
 
         if tool_registry:
-            from Neural_Network import ensure_tool_vocab  # type: ignore
-            tok.ch2idx = ensure_tool_vocab(tok.ch2idx, silent=True)
             tok.idx2ch   = {v: k for k, v in tok.ch2idx.items()}
             for name, tdef in tool_registry.items():
                 self.nn.register_tool(name, tdef.executor)
@@ -569,12 +575,8 @@ class MiniGPT:
         )
         model.tokenizer = CharTokenizer.load(tok_path)
 
-        input_size = model.context_size * model.tokenizer.size
         model.nn   = NeuralNetwork(
-            input_size    = input_size,
-            hidden_layers = model.hidden_layers,
             output_size   = model.tokenizer.size,
-            activation    = model.activation,
             learning_rate = model.learning_rate,
             use_embedding = True,
             vocab_size    = model.tokenizer.size,

@@ -215,41 +215,6 @@ except Exception:
     _scatter_add = None
     print("CuPy not found -- falling back to CPU (NumPy)")
 
-
-# ==============================================================================
-#  Type aliases
-# ==============================================================================
-
-ActivationName = Literal["sigmoid", "tanh", "relu", "leaky_relu"]
-Sample         = Tuple[List[float], int]
-
-
-# ==============================================================================
-#  Activation functions and their derivatives
-# ==============================================================================
-# Each entry is (forward_fn, derivative_fn).
-# Derivatives receive the PRE-activation value z (not the output a).
-
-def _relu(x):                  return np.maximum(0.0, x)
-def _relu_d(x):                return (x > 0).astype(x.dtype)
-
-def _tanh(x):                  return np.tanh(x)
-def _tanh_d(x):                return 1.0 - np.tanh(x) ** 2
-
-def _sigmoid(x):               return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
-def _sigmoid_d(x):             s = _sigmoid(x); return s * (1.0 - s)
-
-def _leaky_relu(x, a=0.01):    return np.where(x > 0, x, a * x)
-def _leaky_relu_d(x, a=0.01):  return np.where(x > 0, 1.0, a)
-
-_ACTIVATIONS: Dict[str, tuple] = {
-    "relu":       (_relu,       _relu_d),
-    "tanh":       (_tanh,       _tanh_d),
-    "sigmoid":    (_sigmoid,    _sigmoid_d),
-    "leaky_relu": (_leaky_relu, _leaky_relu_d),
-}
-
-
 # ==============================================================================
 #  Adam optimiser step  (module-level so it can be used without a class instance)
 # ==============================================================================
@@ -1029,9 +994,7 @@ def _block_forward_gqa(self, x, blk, training: bool = False,
 
     # Apply RoPE if provided
     if cos is not None:
-        # RoPE on Q (H heads) and K (G heads) separately
-        Q, _ = _apply_rope(Q, Q, cos[:T], sin[:T])   # dummy K, only Q used
-        K, _ = _apply_rope(K, K, cos[:T], sin[:T])
+        Q, K = _apply_rope(Q, K, cos[:T], sin[:T])
 
     # Expand K and V from G -> H heads by repeating each G-head reps times
     # (B, G, T, d_h) -> (B, H, T, d_h)
@@ -1307,7 +1270,9 @@ def _block_backward_diff(self, d_out, cache, blk):
     d_ln1_1 = (dQKV1_r @ blk["Wqkv"].T)
 
     # Wqkv2 backward (V2 not used in forward attn output, but still project)
-    dV2     = np.zeros_like(V2)   # V2 unused in output; grad is zero
+    # V2 is the "noise" value head — the forward pass uses only V1 for output.
+    # V2 has no gradient path, so Wqkv2's V-slice trains only via K2/Q2.
+    dV2 = np.zeros_like(V2)
     dQ2r = dQ2.transpose((0,2,1,3)).reshape(BT,D)
     dK2r = dK2.transpose((0,2,1,3)).reshape(BT,D)
     dV2r = dV2.transpose((0,2,1,3)).reshape(BT,D)
@@ -1847,10 +1812,7 @@ class NeuralNetwork:
 
     def __init__(
         self,
-        input_size:    int,
-        hidden_layers: List[int],
         output_size:   int,
-        activation:    str   = "relu",
         learning_rate: float = 0.001,
         batch_size:    int   = 1024,
         use_embedding: bool  = True,
@@ -1868,17 +1830,6 @@ class NeuralNetwork:
         use_mod:       bool  = True,
         mod_capacity:  float = 0.5,
     ) -> None:
-        if activation not in _ACTIVATIONS:
-            raise ValueError(
-                f"Unknown activation '{activation}'. "
-                f"Choose from: {list(_ACTIVATIONS)}"
-            )
-        if not hidden_layers:
-            raise ValueError("hidden_layers must have at least one entry.")
-        if embed_dim % num_heads != 0:
-            raise ValueError(
-                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
-            )
 
         if pos_encoding not in ("learned", "rope", "alibi"):
             raise ValueError(f"pos_encoding must be 'learned', 'rope', or 'alibi'.")
@@ -1890,10 +1841,7 @@ class NeuralNetwork:
             )
 
         # Store all hyperparameters -- also written to save files.
-        self.input_size    = input_size
-        self.hidden_layers = hidden_layers
         self.output_size   = output_size
-        self.activation    = activation
         self.learning_rate = learning_rate
         self.batch_size    = batch_size
         self.use_embedding = use_embedding and vocab_size > 0
@@ -1911,7 +1859,6 @@ class NeuralNetwork:
         self.use_mod       = use_mod
         self.mod_capacity  = mod_capacity
         self.device        = _DEVICE
-        self._act_fn, self._act_d = _ACTIVATIONS[activation]
 
         # Head dimension: each head attends in a d_h-dimensional subspace.
         # Scale for attention scores: 1/sqrt(d_h) keeps dot products from
@@ -1997,19 +1944,6 @@ class NeuralNetwork:
         else:
             self.Wout = np.random.randn(D, output_size).astype(np.float32) * np.float32(0.02)
         self.bout = np.zeros(output_size, dtype=np.float32)
-
-        # ---- Legacy dense weights (backward compatibility only) -------------
-        # Old weight files contain these arrays. They are never trained or
-        # used in the transformer path -- only saved/loaded for compatibility.
-        actual_input = context_size * embed_dim if self.use_embedding else input_size
-        layer_sizes  = [actual_input] + hidden_layers + [output_size]
-        self.weights = []
-        self.biases  = []
-        for i in range(len(layer_sizes) - 1):
-            fan_in, fan_out = layer_sizes[i], layer_sizes[i + 1]
-            scale = np.sqrt(np.float32(2.0) / np.float32(fan_in + fan_out))
-            self.weights.append(np.random.randn(fan_out, fan_in).astype(np.float32) * scale)
-            self.biases.append(np.zeros((fan_out, 1), dtype=np.float32))
 
         # Adam not initialised until first train() or load_weights() call.
         self._adam_init = False
@@ -2515,18 +2449,6 @@ class NeuralNetwork:
                 probs = np.asnumpy(probs)
             return None, None, probs[0, -1, :]   # last position only
 
-        # Legacy MLP path (non-embedding models)
-        X = np.array(inputs, dtype=float).reshape(-1, 1)
-        a = X; zs = []; activations = [a]
-        for i in range(len(self.hidden_layers)):
-            z = self.weights[i] @ a + self.biases[i]
-            a = self._act_fn(z)
-            zs.append(z); activations.append(a)
-        z_out = self.weights[-1] @ a + self.biases[-1]
-        e     = np.exp(z_out - z_out.max(axis=0, keepdims=True))
-        p     = e / e.sum(axis=0, keepdims=True)
-        return zs, activations, p[:, 0]
-
     # ==========================================================================
     #  Training loop
     # ==========================================================================
@@ -2583,20 +2505,11 @@ class NeuralNetwork:
 
         # ---- Data ingestion -------------------------------------------------
         # Fast path: make_index_arrays() returns (T,N) int32 arrays directly.
-        # Legacy path: decode one-hot samples back to indices.
         if isinstance(data, tuple) and len(data) == 2 and hasattr(data[0], "shape"):
             X_idx_cpu, Y_idx_cpu = data
             n = X_idx_cpu.shape[1]
         else:
-            n = len(data)
-            X_idx_cpu = _np_cpu.zeros((ctx_size, n), dtype=_np_cpu.int32)
-            Y_idx_cpu = _np_cpu.zeros((ctx_size, n), dtype=_np_cpu.int32)
-            for j, (feat, label) in enumerate(data):
-                oh   = _np_cpu.array(feat).reshape(ctx_size, vs)
-                toks = oh.argmax(axis=1)
-                X_idx_cpu[:, j]    = toks
-                Y_idx_cpu[:-1, j]  = toks[1:]
-                Y_idx_cpu[-1,  j]  = label
+            raise TypeError("data must be a (X_idx, Y_idx) tuple from make_index_arrays()")
 
         # Move entire dataset to GPU once (no-op on CPU)
         X_idx = np.array(X_idx_cpu)
@@ -2962,8 +2875,12 @@ class NeuralNetwork:
 
     def summary(self) -> None:
         """Print a formatted table of model architecture and parameter counts."""
-        blk    = self.blocks[0]
-        attn_p = blk["Wqkv"].size
+        blk = self.blocks[0]
+        _attn_keys = {"Wqkv", "Wqkv2", "Wq", "Wkv", "lambda_", "router_w"}
+        attn_p = sum(
+            v.size if hasattr(v, "size") else 1
+            for k, v in blk.items() if k in _attn_keys
+        )
         ff_p   = (blk["W1"].size + blk["b1"].size +
                   blk["W2"].size + blk["b2"].size)
         ln_p   = (blk["ln1_g"].size + blk["ln1_b"].size +
@@ -3052,10 +2969,7 @@ class NeuralNetwork:
 
         data = {
             # ---- Hyperparameters ----------------------------------------
-            "input_size":    self.input_size,
-            "hidden_layers": self.hidden_layers,
             "output_size":   self.output_size,
-            "activation":    self.activation,
             "learning_rate": self.learning_rate,
             "batch_size":    self.batch_size,
             "use_embedding": self.use_embedding,
@@ -3067,10 +2981,12 @@ class NeuralNetwork:
             "dropout":       self.dropout,
             "weight_tying":  self.weight_tying,
             "grad_clip":     self.grad_clip,
+            "pos_encoding":  self.pos_encoding,
+            "num_kv_heads":  self.num_kv_heads,
+            "use_diff_attn": self.use_diff_attn,
+            "use_mod":       self.use_mod,
+            "mod_capacity":  self.mod_capacity,
             "device":        _DEVICE,
-            # ---- Legacy dense weights (compat) --------------------------
-            "weights": [to_list(w) for w in self.weights],
-            "biases":  [to_list(b) for b in self.biases],
             # ---- Embeddings ---------------------------------------------
             "embedding":     to_list(self.embedding)     if self.use_embedding else None,
             "pos_embedding": to_list(self.pos_embedding) if self.use_embedding else None,
@@ -3141,10 +3057,7 @@ class NeuralNetwork:
             data = json.load(f)
 
         # ---- Restore hyperparameters ----------------------------------------
-        self.input_size    = data["input_size"]
-        self.hidden_layers = data["hidden_layers"]
         self.output_size   = data["output_size"]
-        self.activation    = data["activation"]
         self.learning_rate = data["learning_rate"]
         self.batch_size    = data.get("batch_size",    1024)
         self.use_embedding = data.get("use_embedding", False)
@@ -3156,15 +3069,15 @@ class NeuralNetwork:
         self.dropout       = data.get("dropout",       0.0)
         self.weight_tying  = data.get("weight_tying",  False)
         self.grad_clip     = data.get("grad_clip",     1.0)
-        self._act_fn, self._act_d = _ACTIVATIONS[self.activation]
         self._head_dim     = self.embed_dim // self.num_heads
         self._scale_head   = 1.0 / (self._head_dim ** 0.5)
+        self.pos_encoding  = data.get("pos_encoding", "rope")
+        self.num_kv_heads  = data.get("num_kv_heads", self.num_heads)
+        self.use_diff_attn = data.get("use_diff_attn", False)
+        self.use_mod       = data.get("use_mod", False)
+        self.mod_capacity  = data.get("mod_capacity", 0.5)
 
         _f32 = np.float32
-
-        # ---- Legacy dense weights -------------------------------------------
-        self.weights = [np.array(w) for w in data["weights"]]
-        self.biases  = [np.array(b) for b in data["biases"]]
 
         # ---- Embeddings -----------------------------------------------------
         self.embedding     = np.array(data["embedding"],     dtype=_f32) if data.get("embedding")     else None
@@ -3191,13 +3104,6 @@ class NeuralNetwork:
             self.blocks = []
             for blk in data["blocks"]:
                 b = {k: np.array(v, dtype=_f32) for k, v in blk.items()}
-
-                # Upgrade old separate Wq/Wk/Wv -> fused Wqkv
-                if "Wq" in b and "Wqkv" not in b:
-                    Wq = _np_cpu.array(b.pop("Wq") if _DEVICE == "cpu" else np.asnumpy(b.pop("Wq")))
-                    Wk = _np_cpu.array(b.pop("Wk") if _DEVICE == "cpu" else np.asnumpy(b.pop("Wk")))
-                    Wv = _np_cpu.array(b.pop("Wv") if _DEVICE == "cpu" else np.asnumpy(b.pop("Wv")))
-                    b["Wqkv"] = np.array(_np_cpu.concatenate([Wq, Wk, Wv], axis=1), dtype=_f32)
 
                 # Add LN params if missing (old file without LayerNorm)
                 if "ln1_g" not in b:
@@ -3264,6 +3170,19 @@ class NeuralNetwork:
                     for k, v in mbuf.items():
                         if k in self._muon_bufs[i]:
                             self._muon_bufs[i][k] = np.array(v, dtype=_f32)
+
+        # Recompute positional encoding caches
+        if self.pos_encoding == "rope":
+            self._rope_cos, self._rope_sin = _rope_freqs(self._head_dim, self.context_size)
+        else:
+            self._rope_cos = self._rope_sin = None
+
+        if self.pos_encoding == "alibi":
+            self._alibi_slopes = _alibi_slopes(self.num_heads)
+            self._alibi_bias = _alibi_bias(self._alibi_slopes, self.context_size)
+        else:
+            self._alibi_slopes = None
+            self._alibi_bias = None
 
         print(f"Weights loaded from '{filename}'.")
 
@@ -3378,7 +3297,10 @@ class NeuralNetwork:
 
         if kv_cache is not None:
             kv_cache.reset()
-            self._kv_prefill(ids, kv_cache)
+            # Prefill all but the last token; the decode loop will process
+            # the last prompt token first and append its K/V then.
+            if len(ids) > 1:
+                self._kv_prefill(ids[:-1], kv_cache)
 
         for _ in range(max_new):
             # ---- Sample one token ----------------------------------------
@@ -3462,15 +3384,29 @@ class NeuralNetwork:
         toks    = np.array(toks_np)           # (T, 1)
         T       = len(ids)
 
-        x    = self.embedding[toks.T[0]] + self.pos_embedding[:T]  # (T, D)
-        x    = x[None]                                               # (1, T, D)
-        mask = self._causal_mask(T)
+        x = self.embedding[toks.T[0]]  # (T, D) -- token emb only
+        if self.pos_encoding == "learned" and self.pos_embedding is not None:
+            x = x + self.pos_embedding[:T]
+        x = x[None]  # (1, T, D)
+        if self._alibi_bias is not None:
+            mask = self._alibi_bias[:, :T, :T]  # (H, T, T) -- causal already baked in
+        else:
+            mask = self._causal_mask(T)
 
         for layer_idx, blk in enumerate(self.blocks):
             ln1_out, _ = self._ln_forward(x, blk["ln1_g"], blk["ln1_b"])
             QKV = (ln1_out.reshape(T, D) @ blk["Wqkv"]).reshape(T, 3, H, dh)
-            K = QKV[:, 1].transpose((1, 0, 2))   # (H, T, dh)
-            V = QKV[:, 2].transpose((1, 0, 2))   # (H, T, dh)
+            Q_pf = QKV[:, 0].transpose((1, 0, 2))  # (H, T, dh)
+            K = QKV[:, 1].transpose((1, 0, 2))
+            V = QKV[:, 2].transpose((1, 0, 2))
+            if self.pos_encoding == "rope":
+                cos = self._rope_cos[:T]
+                sin = self._rope_sin[:T]
+                # apply_rope expects (B, H, T, dh); add/remove batch dim
+                Q_pf, K = _apply_rope(
+                    Q_pf[None], K[None], cos, sin
+                )
+                Q_pf, K = Q_pf[0], K[0]
 
             if _DEVICE == "gpu":
                 K = np.asnumpy(K)
@@ -3501,7 +3437,9 @@ class NeuralNetwork:
         H  = self.num_heads
         dh = D // H
 
-        tok_emb = self.embedding[token_id] + self.pos_embedding[pos]  # (D,)
+        tok_emb = self.embedding[token_id]  # (D,)
+        if self.pos_encoding == "learned" and self.pos_embedding is not None:
+            tok_emb = tok_emb + self.pos_embedding[pos]
         x       = tok_emb[None, None]    # (1, 1, D)
 
         for layer_idx, blk in enumerate(self.blocks):
@@ -3510,6 +3448,17 @@ class NeuralNetwork:
             Q   = qkv[0]   # (H, dh)
             K_t = qkv[1]   # (H, dh)  -- new key
             V_t = qkv[2]   # (H, dh)  -- new value
+
+            if self.pos_encoding == "rope":
+                cos = self._rope_cos[pos:pos + 1]  # (1, dh)
+                sin = self._rope_sin[pos:pos + 1]
+
+                # _apply_rope expects (B, H, T, dh); Q/K_t are (H, dh)
+                Q_r = Q[None, :, None, :]  # (1, H, 1, dh)
+                K_r = K_t[None, :, None, :]
+                Q_r, K_r = _apply_rope(Q_r, K_r, cos, sin)
+                Q = Q_r[0, :, 0, :]  # back to (H, dh)
+                K_t = K_r[0, :, 0, :]
 
             if _DEVICE == "gpu":
                 K_t_cpu = np.asnumpy(K_t)
@@ -3531,6 +3480,9 @@ class NeuralNetwork:
             # Scaled dot-product attention: Q (H, dh) × K^T (H, dh, T)
             scale  = self._scale_head
             scores = (Q_gpu[:, None, :] * K_all).sum(axis=-1) * scale  # (H, T)
+            if self._alibi_bias is not None:
+                # query is at position `pos`; keys are 0..pos
+                scores += self._alibi_bias[:, pos, :scores.shape[-1]]
             scores -= scores.max(axis=-1, keepdims=True)
             exp_s  = np.exp(scores)
             A      = exp_s / exp_s.sum(axis=-1, keepdims=True)          # (H, T)
