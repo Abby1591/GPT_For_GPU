@@ -272,8 +272,6 @@ class MiniGPT:
         # Extend vocab with tool delimiter chars if the training data contains
         # tool patterns. Done here once so inference never needs to add them.
         if "[TOOL:" in text:
-            from Neural_Network import ensure_tool_vocab  # type: ignore
-            tokenizer.ch2idx = ensure_tool_vocab(tokenizer.ch2idx, silent=True)
             tokenizer.idx2ch   = {v: k for k, v in tokenizer.ch2idx.items()}
 
         if self.nn is None:

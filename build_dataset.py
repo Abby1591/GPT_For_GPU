@@ -65,7 +65,8 @@ import html
 import mwparserfromhell
 import hashlib
 
-from collections import Counter, deque
+
+from collections import Counter, deque, OrderedDict
 from typing import Iterator, List, Optional, Dict
 
 import unicodedata
@@ -760,9 +761,6 @@ def fetch_reddit(
 ) -> list[str]:
     print(f"\n[7/8] Reddit  (target {target_chars:,} chars)")
 
-    # ------------------------------------------------------------------ #
-    # Path Fix                                                             #
-    # ------------------------------------------------------------------ #
     base = os.path.dirname(os.path.abspath(__file__))
     def _rel(p): return p if os.path.isabs(p) else os.path.join(base, p)
     comments_file    = _rel(comments_file)
@@ -774,24 +772,18 @@ def fetch_reddit(
         print(f"  Expected: {comments_file}  /  {submissions_file}")
         return []
 
-    # ------------------------------------------------------------------ #
-    # Constants                                                            #
-    # ------------------------------------------------------------------ #
     MIN_SCORE_COMMENT    = min_score
     MIN_SCORE_SUBMISSION = max(1, min_score - 1)
     MIN_LEN, MAX_LEN     = 60, 3000
     DEDUP_CACHE          = 200_000
-    COMMENT_RATIO        = 0.80          # 80% comments, 20% submissions
-    AVG_CHARS_PER_LINE   = 200           # rough estimate for target_lines
-    MAX_THREAD_CHARS = 2000
+    COMMENT_RATIO        = 0.80
+    AVG_CHARS_PER_LINE   = 200
+    MAX_THREAD_CHARS     = 2000
 
     target_lines       = max(1000, target_chars // AVG_CHARS_PER_LINE)
     target_comments    = int(target_lines * COMMENT_RATIO)
     target_submissions = 0 if no_submissions else (target_lines - target_comments)
 
-    # ------------------------------------------------------------------ #
-    # Allowed Subreddits                                                   #
-    # ------------------------------------------------------------------ #
     GOOD_SUBS: set[str] = {
         # Programming / CS / ML
         "programming", "compsci", "softwareengineering", "learnprogramming",
@@ -799,35 +791,38 @@ def fetch_reddit(
         "MachineLearning", "learnmachinelearning", "deeplearning", "artificial",
         "datascience", "algorithms", "computerscience", "coding", "webdev",
         "gamedev", "devops", "sysadmin", "linux", "opensource", "commandline",
+        "netsec", "reverseengineering", "embedded", "FPGA", "vim", "emacs", "bash",
         # Math / Science
         "math", "askmath", "statistics", "physics", "chemistry", "biology",
         "AskScience", "science", "neuroscience", "genetics",
+        # Engineering
+        "AskEngineers", "econometrics",
         # Conversation / Q&A
         "AskReddit", "explainlikeimfive", "NoStupidQuestions", "answers",
-        "AskHistorians", "TrueReddit", "DepthHub", "changemyview",
-        "philosophy", "Philosophy", "Ethics",
+        "AskHistorians", "AskSocialScience", "TrueReddit", "DepthHub", "changemyview",
+        "philosophy", "Ethics", "skeptic", "rational",
+        "todayilearned", "HistoryOfIdeas", "slatestarcodex",
         # Left / Politics / Social Justice
         "socialism", "communism", "anarchism", "Marxism", "labour",
         "PoliticalDiscussion", "progressive", "SocialJustice",
         "feminism", "GenderCritical", "lgbt", "ainbow", "trans", "nonbinary",
-        "BlackLives", "antiracism", "labor",
+        "antiracism", "labor",
         # Culture / Knowledge
         "history", "Economics", "books", "writing", "literature", "technology", "Futurology",
     }
 
     LOW_EFFORT_PATTERNS = re.compile(
-        r"^(same|this|based|facts)[.!]*$",
+        r"^(same|this|based|facts|lol|lmao|kek|yes|no|ok|okay|agreed|exactly|true|false|"
+        r"wow|nice|cool|great|thanks|thank you|ty|np|yw)[.!?]*$",
         re.I,
     )
 
     MEME_PATTERNS = re.compile(
-        r"(nobody:|me when|tfw|mfw|\bshitpost\b)",
+        r"(nobody:|me when|tfw|mfw|\bshitpost\b|big if true|"
+        r"underrated comment|this guy \w+s|task failed|hold my beer)",
         re.I,
     )
 
-    # ------------------------------------------------------------------ #
-    # Quality Filter Patterns                                              #
-    # ------------------------------------------------------------------ #
     BOT_PHRASES = re.compile(
         r"(i am a bot|this action was performed automatically|"
         r"beep boop|please contact the moderators|"
@@ -837,134 +832,103 @@ def fetch_reddit(
     REPEATED_CHARS = re.compile(r"(.)\1{6,}")
     ALL_CAPS_RATIO = 0.60
 
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
+    PLACEHOLDER = re.compile(r"^\[(deleted|removed|unavailable)\]$", re.I)
+
     def _clean(text: str) -> str:
-
         text = html.unescape(text)
-
         text = unicodedata.normalize("NFKC", text)
-
         text = "".join(
             c for c in text
-            if unicodedata.category(c)[0] != "C"
-            or c in "\n\t"
+            if unicodedata.category(c)[0] != "C" or c in "\n\t"
         )
-
-        # URLs
         text = re.sub(r"http\S+", "", text)
-
-        # Reddit refs
         text = re.sub(r"/u/\w+", "", text)
         text = re.sub(r"/r/\w+", "", text)
-
-        # Markdown links
         text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-        # Quotes
-        text = re.sub(r"(?m)^>\s?.*$", "", text)
-
-        # Inline/code blocks
+        text = re.sub(r"(?m)^>\s?[A-Za-z].*$", "", text)
         text = re.sub(r"`{1,3}.*?`{1,3}", "", text, flags=re.S)
-
-        # Edit signatures
         text = re.sub(r"(?i)\bedit\s*:\s*.*", "", text)
-
-        # normalize line endings
         text = text.replace("\r\n", "\n")
-
-        # collapse excessive blank lines
         text = re.sub(r"\n{3,}", "\n\n", text)
-
-        # collapse spaces/tabs only
         text = re.sub(r"[ \t]+", " ", text)
-
-        # trim lines
         lines = [line.rstrip() for line in text.splitlines()]
         text = "\n".join(lines)
-
-        text = text.strip()
-
         return text.strip()
 
     def _quality(text: str) -> bool:
         if not (MIN_LEN <= len(text) <= MAX_LEN):
             return False
 
+        if PLACEHOLDER.search(text):
+            return False
+
         words = text.split()
 
-        if len(words) < 4:
+        # CHANGE: raised from 4 to 10
+        if len(words) < 10:
             return False
 
         if LOW_EFFORT_PATTERNS.match(text.strip()):
             return False
-
         if MEME_PATTERNS.search(text):
             return False
-
         if BOT_PHRASES.search(text):
             return False
-
         if REPEATED_CHARS.search(text):
             return False
 
         letters = [c for c in text if c.isalpha()]
-        if letters:
-            caps_ratio = sum(c.isupper() for c in letters) / len(letters)
-            if caps_ratio > ALL_CAPS_RATIO:
-                return False
+        if letters and sum(c.isupper() for c in letters) / len(letters) > ALL_CAPS_RATIO:
+            return False
 
         sentences = re.split(r"[.!?]+", text)
-
         if len(sentences) == 1 and len(words) > 80:
             return False
 
-        # lexical diversity
-        unique_ratio = len(set(w.lower() for w in words)) / len(words)
-        if unique_ratio < 0.35:
+        if len(set(w.lower() for w in words)) / len(words) < 0.35:
+            return False
+
+        non_alpha_words = sum(1 for w in words if not any(c.isalpha() for c in w))
+        if non_alpha_words / len(words) > 0.40:
+            return False
+
+        lines = [l for l in text.splitlines() if l.strip()]
+        if lines and len(words) / len(lines) < 3:
+            return False
+
+        bullet_lines = sum(1 for l in text.splitlines() if re.match(r"^\s*[-*•]|\s*\d+[.)]\s", l))
+        if bullet_lines > 3:
+            return False
+
+        symbol_ratio = sum(1 for c in text if not c.isalnum() and not c.isspace()) / len(text)
+        if symbol_ratio > 0.25:
             return False
 
         return True
 
     def _fingerprint(text: str) -> str:
         norm = re.sub(r"\s+", " ", text.lower()).strip()
+        return hashlib.blake2b(norm.encode("utf-8"), digest_size=8).hexdigest()
 
-        return hashlib.blake2b(
-            norm.encode("utf-8"),
-            digest_size=8,
-        ).hexdigest()
-
-    def _format_thread(parent_thread: str | None,parent_text: str | None,reply: str,) -> str:
-
+    def _format_thread(parent_thread: str | None, parent_text: str | None, reply: str) -> str:
         reply = reply.strip()
-
         if not parent_text:
             return reply
 
         if parent_thread:
-            if len(parent_thread) > MAX_THREAD_CHARS:
-                parent_thread = parent_thread[-MAX_THREAD_CHARS:]
+            turns = parent_thread.split("\n\n")
+            while turns and sum(len(t) for t in turns) + len(reply) > MAX_THREAD_CHARS:
+                turns.pop(0)
+            truncated = "\n\n".join(turns)
+            return f"{truncated}\n\n[reply]: {reply}"
 
-            return (
-                f"{parent_thread}\n\n"
-                f"Assistant: {reply}"
-            )
+        return f"[post]: {parent_text.strip()}\n\n[reply]: {reply}"
 
-        return (
-            f"User: {parent_text.strip()}\n\n"
-            f"Assistant: {reply}"
-        )
-
-    # ------------------------------------------------------------------ #
-    # Streaming Iterator                                                   #
-    # ------------------------------------------------------------------ #
     def _stream_jsonl(path: str, target: int, is_submission: bool):
-        """Yield (text, total_skipped) for each accepted record in a JSONL dump."""
         min_score_  = MIN_SCORE_SUBMISSION if is_submission else MIN_SCORE_COMMENT
-        boost_score = max(min_score + 2, 6 if not is_submission else 4) # score needed to bypass GOOD_SUBS
+        boost_score = max(min_score + 2, 6 if not is_submission else 4)
         kept = skipped = 0
-        comment_cache: dict[str, dict[str, str]] = {}
+        comment_cache: OrderedDict[str, dict[str, str]] = OrderedDict()
 
         with open(path, "r", encoding="utf-8") as fh:
             for raw in fh:
@@ -997,47 +961,41 @@ def fetch_reddit(
 
                 cleaned = _clean(raw_text)
 
-                parent_text = None
-                parent_thread = None
+                if not _quality(cleaned):
+                    skipped += 1
+                    continue
 
+                parent_text = parent_thread = None
                 if not is_submission:
                     parent_id = obj.get("parent_id", "")
-
                     if parent_id.startswith("t1_"):
-                        pid = parent_id[3:]
-
-                        parent = comment_cache.get(pid)
-
+                        parent = comment_cache.get(parent_id[3:])
                         if parent:
-                            parent_text = parent["text"]
+                            parent_text   = parent["text"]
                             parent_thread = parent["thread"]
 
-                text = _format_thread(parent_thread,parent_text,cleaned,)
+                text = _format_thread(parent_thread, parent_text, cleaned)
 
-                if _quality(text):
-                    kept += 1
-                    if not is_submission:
-                        cid = obj.get("id")
+                kept += 1
+                if not is_submission:
+                    cid = obj.get("id")
+                    if cid:
+                        comment_cache[cid] = {"text": cleaned, "thread": text}
+                        if len(comment_cache) > 200_000:
+                            comment_cache.popitem(last=False)
 
-                        if cid:
-                            comment_cache[cid] = {"text": cleaned,"thread": text,}
+                yield text
 
-                            if len(comment_cache) > 200_000:
-                                comment_cache.pop(next(iter(comment_cache)))
+        label = "Submissions" if is_submission else "Comments"
+        print(f"  {label}: kept {kept:,} / skipped {skipped:,}")
 
-                    yield text, skipped
-                else:
-                    skipped += 1
-
-    # ------------------------------------------------------------------ #
-    # Dedup Writer                                                         #
-    # ------------------------------------------------------------------ #
     class _DedupWriter:
-        def __init__(self, fh):
-            self._fh     = fh
-            self._seen   = set()
-            self._queue  = deque()
-            self.written = 0
+        def __init__(self, fh, cache_size=200_000):
+            self._fh         = fh
+            self._seen       = set()
+            self._queue      = deque()
+            self._cache_size = cache_size
+            self.written     = 0
 
         def try_write(self, text: str) -> bool:
             fp = _fingerprint(text)
@@ -1045,15 +1003,12 @@ def fetch_reddit(
                 return False
             self._seen.add(fp)
             self._queue.append(fp)
-            if len(self._queue) > DEDUP_CACHE:
+            if len(self._queue) > self._cache_size:
                 self._seen.discard(self._queue.popleft())
             self._fh.write(text + "\n")
             self.written += 1
             return True
 
-    # ------------------------------------------------------------------ #
-    # Resume Logic                                                         #
-    # ------------------------------------------------------------------ #
     already = 0
     if resume and os.path.exists(reddit_output):
         with open(reddit_output, "r", encoding="utf-8") as f:
@@ -1063,64 +1018,54 @@ def fetch_reddit(
         else:
             print(f"  Resuming from {already:,} lines.")
             already_comments = int(already * COMMENT_RATIO)
-            already_subs = already - already_comments
-
-            target_comments = max(0, target_comments - already_comments)
+            already_subs     = already - already_comments
+            target_comments    = max(0, target_comments - already_comments)
             target_submissions = max(0, target_submissions - already_subs)
 
-    # ------------------------------------------------------------------ #
-    # Write                                                                #
-    # ------------------------------------------------------------------ #
+    # CHANGE: write to .tmp first, rename after — atomic, no corrupt files on crash
+    tmp_path = reddit_output + ".tmp"
     mode = "a" if (resume and already > 0) else "w"
-    with open(reddit_output, mode, encoding="utf-8") as out:
-        writer = _DedupWriter(out)
 
-        total_chars = 0
+    # CHANGE: collect chunks during write — removes the read-back section entirely
+    chunks      = []
+    total_chars = 0
+
+    with open(tmp_path, mode, encoding="utf-8") as out:
+        writer = _DedupWriter(out, cache_size=DEDUP_CACHE)
         comment_chars = 0
-        submission_chars = 0
 
         if target_comments > 0 and os.path.exists(comments_file):
-            for text, skipped in _stream_jsonl(comments_file, target_comments, is_submission=False):
+            # CHANGE: was "for text, skipped in" — now just "for text in"
+            for text in _stream_jsonl(comments_file, target_comments, is_submission=False):
                 if writer.try_write(text):
                     chars = len(text)
-
-                    total_chars += chars
+                    total_chars  += chars
                     comment_chars += chars
-
+                    if total_chars < target_chars:
+                        chunks.append(text)
                     if writer.written % 10_000 == 0:
-                        print(
-                            f"  [{writer.written:,} comments | "
-                            f"{skipped:,} skipped | "
-                            f"{comment_chars:,} chars]"
-                        )
+                        print(f"  [{writer.written:,} comments | {comment_chars:,} chars]")
 
         comments_written = writer.written
 
         if target_submissions > 0 and os.path.exists(submissions_file):
-            for text, skipped in _stream_jsonl(submissions_file, target_submissions, is_submission=True):
+            for text in _stream_jsonl(submissions_file, target_submissions, is_submission=True):
                 subs = writer.written - comments_written
-                if writer.try_write(text) and subs % 5_000 == 0 and subs > 0:
-                    print(f"  [{subs:,} submissions | {skipped:,} skipped]")
+                if writer.try_write(text):
+                    if total_chars < target_chars:
+                        chunks.append(text)
+                        total_chars += len(text)
+                    if subs % 5_000 == 0 and subs > 0:
+                        print(f"  [{subs:,} submissions]")
+
+    # CHANGE: atomic rename replaces old file only after successful write
+    os.replace(tmp_path, reddit_output)
 
     print(f"  Reddit done: {writer.written:,} chunks  "
           f"(comments: {comments_written:,} | submissions: {writer.written - comments_written:,})")
+    print(f"  Collected: {len(chunks):,} chunks  ({total_chars:,} chars)")
 
-    # ------------------------------------------------------------------ #
-    # Read Back                                                            #
-    # ------------------------------------------------------------------ #
-    chunks = []
-    chars  = 0
-    with open(reddit_output, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            chunks.append(line)
-            chars += len(line)
-            if chars >= target_chars:
-                break
-
-    print(f"  Read back: {len(chunks):,} chunks  ({chars:,} chars)")
+    # CHANGE: read-back section removed — chunks already collected above
     return chunks
 
 def fetch_wiktionary(
@@ -2106,8 +2051,7 @@ def build_dataset(
         )
         if c:
             chunks.extend(c)
-            _save_checkpoint(c, "Dataset/Dataset part backup/phase_7_reddit.txt")
-            print("  ✓ Reddit checkpoint saved")
+            _save_checkpoint(c, reddit_output)
 
     if not no_tools:
         c = fetch_tool_training(
