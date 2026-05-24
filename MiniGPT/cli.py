@@ -103,7 +103,7 @@ def _build_parser() -> argparse.ArgumentParser:
     tg.add_argument("--batch_size", type=int,   default=1024,
                     help="Samples per gradient step. (default: 1024)")
     tg.add_argument("--num_blocks", type=int,   default=2,
-                    help="Number of transformer blocks. (default: 2)")
+                    help="Number of transformer blocks. (default: 4)")
     tg.add_argument("--num_heads",  type=int,   default=4,
                     help="Attention heads. embed_dim must be divisible by this. (default: 4)")
     tg.add_argument("--dropout",    type=float, default=0.0,

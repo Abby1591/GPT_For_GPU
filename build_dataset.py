@@ -68,6 +68,8 @@ import hashlib
 from collections import Counter, deque
 from typing import Iterator, List, Optional, Dict
 
+import unicodedata
+
 try:
     import requests
     _HAS_REQUESTS = True
@@ -839,7 +841,16 @@ def fetch_reddit(
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
     def _clean(text: str) -> str:
+
         text = html.unescape(text)
+
+        text = unicodedata.normalize("NFKC", text)
+
+        text = "".join(
+            c for c in text
+            if unicodedata.category(c)[0] != "C"
+            or c in "\n\t"
+        )
 
         # URLs
         text = re.sub(r"http\S+", "", text)
@@ -870,7 +881,8 @@ def fetch_reddit(
         text = re.sub(r"[ \t]+", " ", text)
 
         # trim lines
-        text = "\n".join(line.strip() for line in text.splitlines())
+        lines = [line.rstrip() for line in text.splitlines()]
+        text = "\n".join(lines)
 
         text = text.strip()
 
@@ -882,10 +894,7 @@ def fetch_reddit(
 
         words = text.split()
 
-        if len(words) < 12:
-            return False
-
-        if text.count(" ") < 10:
+        if len(words) < 4:
             return False
 
         if LOW_EFFORT_PATTERNS.match(text.strip()):
@@ -906,9 +915,14 @@ def fetch_reddit(
             if caps_ratio > ALL_CAPS_RATIO:
                 return False
 
+        sentences = re.split(r"[.!?]+", text)
+
+        if len(sentences) == 1 and len(words) > 80:
+            return False
+
         # lexical diversity
         unique_ratio = len(set(w.lower() for w in words)) / len(words)
-        if unique_ratio < 0.45:
+        if unique_ratio < 0.35:
             return False
 
         return True

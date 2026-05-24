@@ -970,7 +970,7 @@ def _block_forward_gqa(self, x, blk, training: bool = False,
         W1/b1/W2/b2/ln1_g/ln1_b/ln2_g/ln2_b : same as standard block
 
     Positional encoding can be RoPE (cos/sin provided) or ALiBi (alibi
-    matrix provided), or neither (absolute pos embedding, legacy).
+    matrix provided).
     """
     B, T, D = x.shape
     H       = self.num_heads
@@ -1758,15 +1758,8 @@ class NeuralNetwork:
 
     Parameters
     ----------
-    input_size : int
-        Legacy flat input size.  Ignored in the transformer path; kept only
-        for backward-compatibility with old save files.
-    hidden_layers : list[int]
-        Legacy dense widths.  Also kept for save/load compatibility only.
     output_size : int
         Vocabulary size -- number of softmax output classes.
-    activation : str
-        Legacy activation name (relu/tanh/sigmoid/leaky_relu).
     learning_rate : float
         Peak Adam/Muon learning rate.
     batch_size : int
@@ -2425,23 +2418,12 @@ class NeuralNetwork:
         indices (length == context_size), skip one-hot encode/decode entirely
         and pass directly to _transformer_forward.  This is ~vocab_size x
         faster per generate step.
-
-        Legacy path: flat float one-hot vector (context_size * vocab_size
-        elements) -- kept for backward compatibility with external callers.
         """
         if self.use_embedding:
             # Fast path: caller already has integer indices
             if (len(inputs) == self.context_size
                     and isinstance(inputs[0], (int, _np_cpu.integer))):
                 toks = np.array(inputs, dtype=int).reshape(
-                    self.context_size, 1
-                )
-            else:
-                # Legacy path: decode one-hot float vector back to indices
-                arr  = np.array(inputs, dtype=float).reshape(
-                    self.context_size, self.vocab_size
-                )
-                toks = np.array(arr.argmax(axis=1), dtype=int).reshape(
                     self.context_size, 1
                 )
             probs, _ = self._transformer_forward(toks, training=False)
@@ -2466,7 +2448,7 @@ class NeuralNetwork:
 
         Parameters
         ----------
-        data : tuple (X_idx, Y_idx) or legacy list of (features, label)
+        data : tuple (X_idx, Y_idx)
             Preferred format: index arrays from make_index_arrays() -- avoids
             allocating one-hot floats that would be decoded back anyway.
         epochs : int

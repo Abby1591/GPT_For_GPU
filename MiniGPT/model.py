@@ -116,9 +116,6 @@ class MiniGPT:
     :param context_size: Characters of history seen per prediction step.
         Larger = more coherent text but slower training (input grows linearly).
         Good values: 6 (fast demo) to 2048 (full quality).
-    :param hidden_layers: Dense widths for legacy compatibility (not used in
-        the transformer path). Default: [256, 128].
-    :param activation: Legacy activation name. Default: "relu".
     :param learning_rate: Peak Adam/Muon learning rate. Default: 0.005.
     :param embed_dim: Hidden dimension D. Must be divisible by num_heads.
     :param batch_size: Samples per gradient step.
