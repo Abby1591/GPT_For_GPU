@@ -836,6 +836,8 @@ def fetch_reddit(
 
     def _clean(text: str) -> str:
         text = html.unescape(text)
+        text = text.replace("&nbsp;", " ")
+        text = text.replace("\xa0", " ")
         text = unicodedata.normalize("NFKC", text)
         text = "".join(
             c for c in text
@@ -913,16 +915,18 @@ def fetch_reddit(
     def _format_thread(parent_thread: str | None, parent_text: str | None, reply: str) -> str:
         reply = reply.strip()
         if not parent_text:
-            return reply
+            return f"[thread]: {reply}"
 
         if parent_thread:
             turns = parent_thread.split("\n\n")
+            n = sum(1 for t in turns if t.startswith("[u/"))
             while turns and sum(len(t) for t in turns) + len(reply) > MAX_THREAD_CHARS:
                 turns.pop(0)
             truncated = "\n\n".join(turns)
-            return f"{truncated}\n\n[reply]: {reply}"
+            return f"{truncated}\n\n[u/{n + 1}]: {reply}"
 
-        return f"[post]: {parent_text.strip()}\n\n[reply]: {reply}"
+        # parent exists but no thread yet — start of a comment chain
+        return f"[chain]: {parent_text.strip()}\n\n[u/2]: {reply}"
 
     def _stream_jsonl(path: str, target: int, is_submission: bool):
         min_score_  = MIN_SCORE_SUBMISSION if is_submission else MIN_SCORE_COMMENT
@@ -1022,15 +1026,14 @@ def fetch_reddit(
             target_comments    = max(0, target_comments - already_comments)
             target_submissions = max(0, target_submissions - already_subs)
 
-    # CHANGE: write to .tmp first, rename after — atomic, no corrupt files on crash
-    tmp_path = reddit_output + ".tmp"
     mode = "a" if (resume and already > 0) else "w"
 
     # CHANGE: collect chunks during write — removes the read-back section entirely
     chunks      = []
     total_chars = 0
 
-    with open(tmp_path, mode, encoding="utf-8") as out:
+    # Replace the tmp_path logic with direct write
+    with open(reddit_output, mode, encoding="utf-8") as out:
         writer = _DedupWriter(out, cache_size=DEDUP_CACHE)
         comment_chars = 0
 
@@ -1057,9 +1060,6 @@ def fetch_reddit(
                         total_chars += len(text)
                     if subs % 5_000 == 0 and subs > 0:
                         print(f"  [{subs:,} submissions]")
-
-    # CHANGE: atomic rename replaces old file only after successful write
-    os.replace(tmp_path, reddit_output)
 
     print(f"  Reddit done: {writer.written:,} chunks  "
           f"(comments: {comments_written:,} | submissions: {writer.written - comments_written:,})")
